@@ -5,10 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 from abc import ABC, abstractmethod
+from typing import Union
 
 from torch import Tensor
 
-from flow_matching.path.path_sample import PathSample
+from flow_matching.path.path_sample import PathSample, DiscretePathSample
 
 
 class ProbPath(ABC):
@@ -37,7 +38,7 @@ class ProbPath(ABC):
     """
 
     @abstractmethod
-    def sample(self, x_0: Tensor, x_1: Tensor, t: Tensor) -> PathSample:
+    def sample(self, x_0: Tensor, x_1: Tensor, t: Tensor) -> Union[PathSample, DiscretePathSample]:
         r"""Sample from an abstract probability path:
 
         | given :math:`(X_0,X_1) \sim \pi(X_0,X_1)`.

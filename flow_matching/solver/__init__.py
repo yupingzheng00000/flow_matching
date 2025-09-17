@@ -8,11 +8,13 @@ from .discrete_solver import MixtureDiscreteEulerSolver
 from .ode_solver import ODESolver
 from .riemannian_ode_solver import RiemannianODESolver
 from .solver import Solver
+from .ko_discrete_solver import KODiscreteGibbsEulerSolver
 
 __all__ = [
     "ODESolver",
     "Solver",
     "ModelWrapper",
     "MixtureDiscreteEulerSolver",
+    "KODiscreteGibbsEulerSolver",
     "RiemannianODESolver",
 ]

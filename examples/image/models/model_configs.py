@@ -88,7 +88,7 @@ MODEL_CONFIGS = {
 
 
 def instantiate_model(
-    architechture: str, is_discrete: bool, use_ema: bool
+    architechture: str, is_discrete: bool, ko: bool,use_ema: bool
 ) -> Union[UNetModel, DiscreteUNetModel]:
     assert (
         architechture in MODEL_CONFIGS
@@ -99,7 +99,13 @@ def instantiate_model(
             config = MODEL_CONFIGS[architechture + "_discrete"]
         else:
             config = MODEL_CONFIGS[architechture]
-        model = DiscreteUNetModel(
+        if ko:
+            model = DiscreteUNetModel(
+                vocab_size=256,
+                **config,
+            )
+        else:
+            model = DiscreteUNetModel(
             vocab_size=257,
             **config,
         )

@@ -6,7 +6,7 @@
 
 from .affine import AffineProbPath, CondOTProbPath
 from .geodesic import GeodesicProbPath
-from .mixture import MixtureDiscreteProbPath
+from .mixture import MixtureDiscreteProbPath, MetricInducedGibbsProbPath
 from .path import ProbPath
 from .path_sample import DiscretePathSample, PathSample
 
@@ -16,6 +16,7 @@ __all__ = [
     "AffineProbPath",
     "CondOTProbPath",
     "MixtureDiscreteProbPath",
+    "MetricInducedGibbsProbPath",
     "GeodesicProbPath",
     "PathSample",
     "DiscretePathSample",

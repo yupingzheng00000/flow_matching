@@ -81,7 +81,7 @@ class DiscreteUNetModel(nn.Module):
             resblock_updown=self.resblock_updown,
             use_new_attention_order=self.use_new_attention_order,
             with_fourier_features=self.with_fourier_features,
-            ignore_time=True,
+            ignore_time=False, # enable this for doing metric-induced prob paths
             input_projection=False,
         )
 

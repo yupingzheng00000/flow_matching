@@ -6,6 +6,8 @@
 
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
+from typing import Optional, Union
 
 from torch import Tensor
 
@@ -115,3 +117,198 @@ class MixtureDiscreteProbPath(ProbPath):
         d_kappa_t = scheduler_output.d_alpha_t
 
         return (d_kappa_t / (1 - kappa_t)) * (posterior - x_t)
+    
+class MetricInducedGibbsProbPath(ProbPath):
+    """
+    Conditional (factorized) discrete path:
+        p_t(x_i | x1_i) ∝ exp{-beta(t) * d(E[x_i], E[x1_i])}
+    with a Euclidean (default) or cosine distance over a *fixed* embedding table E.
+
+    Notes:
+    - Use this to SAMPLE X_t during training. The generalized KL loss in Meta FM
+      only uses the scheduler from the path; it expects model logits shaped (B, d, K)
+      and integer tokens for (x_t, x_1).
+    - Meta’s MixtureDiscreteEulerSolver is tied to the mixture path’s velocity
+      (not this metric-induced path), so `posterior_to_velocity`
+      is intentionally left unimplemented here.
+    """
+
+    def __init__(
+        self,
+        embedding_path_or_weight: Optional[Union[str, Tensor, nn.Embedding]] = None,
+        vocab_size: int = 256,
+        emb_dim: int = 1,
+        metric: str = "euclidean",  # "euclidean" | "cosine" | "lp"
+        lp_order: float = 3.0,       # used when metric == "lp" (KO: lp=3)
+        embed_range: str = "unit",  # "unit" -> [0,1], "pm1" -> [-1,1] (KO)
+        a: float = 5.0,              # β(t) = c * (t/(1-t))**a (KO: a=5)
+        c: float = 1.0,              # (KO: c=1)
+        eps_t: float = 1e-6,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.metric_name = metric
+        self.lp_order = float(lp_order)
+        assert embed_range in {"unit", "pm1"}, "embed_range must be 'unit' or 'pm1'"
+        self.embed_range = embed_range
+        self.a = float(a)
+        self.c = float(c)
+        self.eps_t = float(eps_t)
+        self.dtype = dtype
+
+        self.embedding = self._build_embedding(
+            embedding_path_or_weight, vocab_size, emb_dim, device, dtype
+        )
+        # Freeze: this table is only for defining the *metric*, not a learnable model stem.
+        for p in self.embedding.parameters():
+            p.requires_grad_(False)
+
+    # ---------- Embedding handling ----------
+    def _build_embedding(
+        self,
+        src: Optional[Union[str, Tensor, nn.Embedding]],
+        vocab_size: int,
+        emb_dim: int,
+        device: Optional[torch.device],
+        dtype: torch.dtype,
+    ) -> nn.Embedding:
+        def from_weight(w: Tensor) -> nn.Embedding:
+            emb = nn.Embedding(w.size(0), w.size(1), _weight=w.to(device=device, dtype=dtype))
+            emb.weight.requires_grad_(False)
+            return emb
+
+        if isinstance(src, nn.Embedding):
+            return src.to(device=device, dtype=dtype)
+        if isinstance(src, Tensor):
+            assert src.ndim == 2 and src.size(0) == vocab_size, "Bad embedding weight shape"
+            return from_weight(src)
+
+        if isinstance(src, str):
+            obj = torch.load(src, map_location="cpu")
+            if isinstance(obj, nn.Embedding):
+                return obj.to(device=device, dtype=dtype)
+            if isinstance(obj, dict) and "weight" in obj:
+                return from_weight(obj["weight"])
+            if isinstance(obj, Tensor):
+                return from_weight(obj)
+            raise ValueError(f"Unsupported object loaded from {src}")
+
+        # Default deterministic embedding table.
+        # For KO CIFAR-10: map tokens to [-1,1] via emb(x) = 2*x/255 - 1
+        if self.embed_range == "pm1":
+            w = torch.linspace(-1.0, 1.0, steps=vocab_size).unsqueeze(1)  # [K,1]
+        else:
+            w = torch.linspace(0.0, 1.0, steps=vocab_size).unsqueeze(1)   # [K,1]
+        if emb_dim > 1:
+            w = w.repeat(1, emb_dim)  # trivial tiling if a wider dim is desired
+        return from_weight(w)
+
+    @property
+    def vocab_size(self) -> int:
+        return self.embedding.num_embeddings
+
+    @property
+    def emb_dim(self) -> int:
+        return self.embedding.embedding_dim
+
+    # ---------- Scheduler β(t) and its derivative (useful later for KO velocities) ----------
+    def beta(self, t: Tensor):
+        """
+        β(t) = c * (t / (1 - t))**a, with clamping for stability.
+        Returns (beta_t, d_beta_t) broadcasting over batch.
+        """
+        eps = self.eps_t
+        t = t.clamp(min=eps, max=1.0 - eps)  # (B,)
+        u = 1.0 - t + eps                     # avoid /0
+        y = t / u                              # t/(1-t+eps)
+        beta_t = self.c * (y ** self.a)
+        # KO exact derivative (with clamp): dy/dt = 1 / (1 - t + eps)^2
+        dy_dt = 1.0 / (u * u)
+        d_beta_t = self.c * self.a * (y ** (self.a - 1.0)) * dy_dt
+        return beta_t, d_beta_t
+
+    # ---------- Distance on the embedding space ----------
+    def _pairwise_dist(self, z_flat: Tensor, E: Tensor) -> Tensor:
+        """
+        z_flat: [B*S, D], E: [K, D] -> distances [B*S, K]
+        """
+        if self.metric_name == "euclidean":
+            # cdist is stable and vectorized; returns L2 distance
+            return torch.cdist(z_flat, E, p=2.0)
+        elif self.metric_name == "lp":
+            # General L_p. torch.cdist supports generic p>0.
+            return torch.cdist(z_flat, E, p=self.lp_order)
+        elif self.metric_name == "cosine":
+            z_n = F.normalize(z_flat, p=2, dim=-1)
+            E_n = F.normalize(E, p=2, dim=-1)
+            # Cosine distance = 1 - cosine similarity
+            return 1.0 - (z_n @ E_n.T)
+        else:
+            raise ValueError(f"Unsupported metric: {self.metric_name}")
+
+    def metric(self, z: Tensor) -> Tensor:
+        """
+        z: [B, S, D] = E[x1] per site. Returns distances d to all tokens: [B, S, K].
+        """
+        B, S, D = z.shape
+        E = self.embedding.weight.to(device=z.device, dtype=z.dtype)  # [K, D]
+        d_flat = self._pairwise_dist(z.view(B * S, D), E)             # [B*S, K]
+        return d_flat.view(B, S, self.vocab_size)
+
+    # ---------- Conditional distribution p_t(· | x1) ----------
+    def get_prob_distribution(self, emb_x1: Tensor, t: Tensor) -> Tensor:
+        """
+        emb_x1: E[x1] per site, shape [B, S, D]
+        t: shape [B]
+        returns probs [B, S, K] with last-dim softmax (vocab).
+        """
+        B, S, _ = emb_x1.shape
+        d = self.metric(emb_x1)  # [B, S, K]
+        beta_t, _ = self.beta(t)  # [B]
+        beta_t = beta_t.view(B, 1, 1)
+        logits = -beta_t * d
+        return torch.softmax(logits, dim=-1)
+
+    # ---------- API: sample() ----------
+    def sample(self, x_0: Tensor, x_1: Tensor, t: Tensor) -> DiscretePathSample:
+        """
+        x_0: (B, ...) ints, not used by this path (metric-induced depends only on x1)
+        x_1: (B, ...) ints (e.g., (B, C, H, W))
+        t:   (B,) in [0,1]
+        returns X_t as integers (B, S)
+        """
+        assert x_1.dtype in (torch.int32, torch.int64), "x_1 must be integer tokens"
+        device = x_1.device
+        B = x_1.shape[0]
+        orig_shape = x_1.shape  # (B, ...)
+        # Flatten spatial/site dims to S
+        x1_flat = x_1.view(B, -1)                                     # [B,S]
+        # Ensure embedding lives on the same device/dtype as inputs
+        if self.embedding.weight.device != device or self.embedding.weight.dtype != self.dtype:
+            self.embedding = self.embedding.to(device=device, dtype=self.dtype)
+        # Embed and reshape to [B,S,D]
+        emb_x1 = self.embedding(x1_flat)                              # [B*S,D]
+        emb_x1 = emb_x1.view(B, -1, self.emb_dim)                     # [B,S,D]
+        # Compute conditional probs and sample per-site token
+        probs = self.get_prob_distribution(emb_x1, t)                 # [B,S,K]
+        S = probs.shape[1]
+        x_t_flat = torch.multinomial(
+            probs.view(B * S, self.vocab_size), num_samples=1, replacement=True
+        ).view(B, S)
+        x_t = x_t_flat.view(orig_shape).to(device=device, dtype=x_1.dtype)
+        return DiscretePathSample(x_t=x_t, x_1=x_1, x_0=x_0, t=t)
+
+    # ---------- API: posterior_to_velocity() ----------
+    def posterior_to_velocity(self, posterior_logits: Tensor, x_t: Tensor, t: Tensor) -> Tensor:
+        """
+        This path is *not* the mixture path, so the mixture closed-form velocity used by
+        Meta's MixtureDiscreteEulerSolver does not apply.
+        Implementing KO velocities for this general path requires either:
+          - the KO closed-form (sec. 4.1) or
+          - solving the Laplacian (eq. 21) once per t/path (costly).
+
+        For pretraining you don't need this; the loss only needs scheduler(t).
+        """
+        raise NotImplementedError("Use MixtureDiscreteEulerSolver only with MixtureDiscreteProbPath.")
+

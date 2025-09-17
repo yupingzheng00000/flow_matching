@@ -40,7 +40,7 @@ def get_args_parser():
         "--optimizer_betas",
         nargs="+",
         type=float,
-        default=[0.9, 0.95],
+        default=[0.9, 0.999],
         help="learning rate (absolute lr)",
     )
     parser.add_argument(
@@ -133,7 +133,7 @@ def get_args_parser():
     )
     parser.add_argument(
         "--fid_samples",
-        default=50000,
+        default=5000,
         type=int,
         help="number of synthetic samples for FID evaluations",
     )
@@ -196,11 +196,82 @@ def get_args_parser():
         action="store_true",
         help="Train discrete flow matching model.",
     )
+
     parser.add_argument(
         "--discrete_fm_steps",
         default=1024,
         type=int,
         help="Number of sampling steps for discrete FM.",
+    )
+
+    # Metric-induced (KO) discrete path options for evaluation/sampling
+    parser.add_argument(
+        "--metric_induced", "--ko_metric_induced",
+        action="store_true",
+        dest="metric_induced",
+        help="Use metric-induced Gibbs path (KO Appendix E.3) for discrete sampling.",
+    )
+    parser.add_argument(
+        "--mi_metric",
+        default="lp",
+        choices=["lp", "cosine"],
+        type=str,
+        help="Metric to use for the metric-induced path.",
+    )
+    parser.add_argument(
+        "--mi_lp",
+        default=3.0,
+        type=float,
+        help="Lp order when using --mi_metric=lp.",
+    )
+    parser.add_argument(
+        "--mi_a",
+        default=5.0,
+        type=float,
+        help="Exponent 'a' in beta(t) = c * (t/(1-t))^a.",
+    )
+    parser.add_argument(
+        "--mi_c",
+        default=1.0,
+        type=float,
+        help="Scale 'c' in beta(t) = c * (t/(1-t))^a.",
+    )
+    parser.add_argument(
+        "--mi_embed_range",
+        default="pm1",
+        choices=["pm1", "01"],
+        type=str,
+        help="Embedding range for tokens: 'pm1' maps to [-1,1], '01' maps to [0,1]",
+    )
+
+    # Optional Weights & Biases logging
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging (main process only).",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        default="flow_matching",
+        type=str,
+        help="Weights & Biases project name.",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        default="",
+        type=str,
+        help="Weights & Biases run name (optional).",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        default="",
+        type=str,
+        help="Weights & Biases entity (optional).",
+    )
+    parser.add_argument(
+        "--wandb_offline",
+        action="store_true",
+        help="Run Weights & Biases in offline mode.",
     )
 
     return parser

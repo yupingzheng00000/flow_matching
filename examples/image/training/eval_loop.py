@@ -1,3 +1,17 @@
+"""
+Path bootstrap
+Ensures the top-level 'flow_matching' package is importable when running
+this module from within 'examples/image' (e.g., via torchrun).
+"""
+import sys as _sys
+from pathlib import Path as _Path
+
+_this_dir = _Path(__file__).resolve().parent
+# Go up three levels: .../flow_matching/examples/image/training -> .../flow_matching
+_pkg_root = _this_dir.parents[3]
+if str(_pkg_root) not in _sys.path:
+    _sys.path.insert(0, str(_pkg_root))
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -5,17 +19,18 @@
 # LICENSE file in the root directory of this source tree.
 import gc
 import logging
+import math
 import os
 from argparse import Namespace
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, cast
 
 import PIL.Image
 
 import torch
-from flow_matching.path import MixtureDiscreteProbPath
+from flow_matching.path import MixtureDiscreteProbPath, MetricInducedGibbsProbPath
 from flow_matching.path.scheduler import PolynomialConvexScheduler
-from flow_matching.solver import MixtureDiscreteEulerSolver
+from flow_matching.solver import MixtureDiscreteEulerSolver, KODiscreteGibbsEulerSolver
 from flow_matching.solver.ode_solver import ODESolver
 from flow_matching.utils import ModelWrapper
 from models.discrete_unet import DiscreteUNetModel
@@ -34,11 +49,13 @@ PRINT_FREQUENCY = 50
 
 
 class CFGScaledModel(ModelWrapper):
-    def __init__(self, model: Module):
+    def __init__(self, model: Module, return_logits: bool = False):
         super().__init__(model)
         self.nfe_counter = 0
+        # If True and model is discrete, return raw logits instead of softmax probabilities
+        self.return_logits = return_logits
 
-    def forward(
+    def forward(  # type: ignore[override]
         self, x: torch.Tensor, t: torch.Tensor, cfg_scale: float, label: torch.Tensor
     ):
         module = (
@@ -66,7 +83,8 @@ class CFGScaledModel(ModelWrapper):
 
         self.nfe_counter += 1
         if is_discrete:
-            return torch.softmax(result.to(dtype=torch.float32), dim=-1)
+            out = result.to(dtype=torch.float32)
+            return out if self.return_logits else torch.softmax(out, dim=-1)
         else:
             return result.to(dtype=torch.float32)
 
@@ -87,22 +105,31 @@ def eval_model(
 ):
     gc.collect()
     cfg_scaled_model = CFGScaledModel(model=model)
+    # For KO solver we need logits; instantiate a logits-returning view lazily
+    cfg_scaled_logits_model = None
     cfg_scaled_model.train(False)
 
     if args.discrete_flow_matching:
-        scheduler = PolynomialConvexScheduler(n=3.0)
-        path = MixtureDiscreteProbPath(scheduler=scheduler)
-        p = torch.zeros(size=[257], dtype=torch.float32, device=device)
-        p[256] = 1.0
-        solver = MixtureDiscreteEulerSolver(
-            model=cfg_scaled_model,
-            path=path,
-            vocabulary_size=257,
-            source_distribution_p=p,
-        )
+        # Branch between mixture path (Meta) and metric-induced path (KO-style)
+        if getattr(args, "metric_induced", False):
+            disc_solver = None  # KO solver set up lazily below
+        else:
+            scheduler = PolynomialConvexScheduler(n=3.0)
+            path = MixtureDiscreteProbPath(scheduler=scheduler)
+            p = torch.zeros(size=[257], dtype=torch.float32, device=device)
+            p[256] = 1.0
+            disc_solver = MixtureDiscreteEulerSolver(
+                model=cfg_scaled_model,
+                path=path,
+                vocabulary_size=257,
+                source_distribution_p=p,
+            )
+        cont_solver = None
+        cont_ode_opts = None
     else:
-        solver = ODESolver(velocity_model=cfg_scaled_model)
-        ode_opts = args.ode_options
+        disc_solver = None
+        cont_solver = ODESolver(velocity_model=cfg_scaled_model)
+        cont_ode_opts = args.ode_options
 
     fid_metric = FrechetInceptionDistance(normalize=True).to(
         device=device, non_blocking=True
@@ -113,6 +140,16 @@ def eval_model(
     if args.output_dir:
         (Path(args.output_dir) / "snapshots").mkdir(parents=True, exist_ok=True)
 
+    # Try to get the length for logging; fall back gracefully if unknown
+    try:
+        _data_loader_len_for_log = len(data_loader)  # type: ignore[arg-type]
+    except Exception:
+        _data_loader_len_for_log = None
+
+    # Lazily constructed KO solver and path (once K is known)
+    ko_solver = None
+    ko_path = None
+
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -122,52 +159,116 @@ def eval_model(
             cfg_scaled_model.reset_nfe_counter()
             if args.discrete_flow_matching:
                 # Discrete sampling
-                x_0 = (
-                    torch.zeros(samples.shape, dtype=torch.long, device=device)
-                    + MASK_TOKEN
-                )
-                if args.sym_func:
-                    sym = lambda t: 12.0 * torch.pow(t, 2.0) * torch.pow(1.0 - t, 0.25)
+                if getattr(args, "metric_induced", False):
+                    # Metric-induced Gibbs path using dedicated KO solver
+                    # Lazily build logits-wrapper and KO solver with correct vocab size K
+                    if cfg_scaled_logits_model is None:
+                        cfg_scaled_logits_model = CFGScaledModel(model=model, return_logits=True)
+                    if ko_solver is None or ko_path is None:
+                        # infer K by one forward pass at t=0
+                        x_dummy = torch.zeros(samples.shape, dtype=torch.long, device=device)
+                        logits_dummy = cfg_scaled_logits_model(x=x_dummy, t=torch.tensor(0.0, device=device), cfg_scale=args.cfg_scale, label=labels)
+                        K = int(logits_dummy.shape[-1])
+                        # Build path
+                        mi_metric = getattr(args, "mi_metric", "lp")
+                        mi_lp = float(getattr(args, "mi_lp", 3.0))
+                        mi_a = float(getattr(args, "mi_a", 5.0))
+                        mi_c = float(getattr(args, "mi_c", 1.0))
+                        mi_embed_range = getattr(args, "mi_embed_range", "pm1")
+                        ko_path = MetricInducedGibbsProbPath(
+                            embedding_path_or_weight=None,
+                            vocab_size=K,
+                            emb_dim=1,
+                            metric=mi_metric,
+                            lp_order=mi_lp,
+                            embed_range=mi_embed_range,
+                            a=mi_a,
+                            c=mi_c,
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        ko_solver = KODiscreteGibbsEulerSolver(
+                            model=cfg_scaled_logits_model,
+                            path=ko_path,
+                            vocabulary_size=K,
+                        )
+                    # Start tokens: zeros (any fixed token is acceptable since β(0)=0 → near-uniform)
+                    x_0 = torch.zeros(samples.shape, dtype=torch.long, device=device)
+                    dtype_cat = torch.float32 if args.sampling_dtype == "float32" else torch.float64
+                    synthetic_samples = ko_solver.sample(
+                        x_init=x_0,
+                        step_size=1.0 / args.discrete_fm_steps,
+                        dtype_categorical=dtype_cat,
+                        label=labels,
+                        cfg_scale=args.cfg_scale,
+                    )
                 else:
-                    sym = args.sym
-                if args.sampling_dtype == "float32":
-                    dtype = torch.float32
-                elif args.sampling_dtype == "float64":
-                    dtype = torch.float64
+                    x_0 = (
+                        torch.zeros(samples.shape, dtype=torch.long, device=device)
+                        + MASK_TOKEN
+                    )
+                    if args.sym_func:
+                        # Ensure a pure-Python function returning float for div_free
+                        def sym(tau: float) -> float:
+                            return 12.0 * (tau ** 2.0) * ((1.0 - tau) ** 0.25)
+                    else:
+                        sym = args.sym
+                    dtype = torch.float32 if args.sampling_dtype == "float32" else torch.float64
 
-                synthetic_samples = solver.sample(
-                    x_init=x_0,
-                    step_size=1.0 / args.discrete_fm_steps,
-                    verbose=False,
-                    div_free=sym,
-                    dtype_categorical=dtype,
-                    label=labels,
-                    cfg_scale=args.cfg_scale,
-                )
+                    # Guard against missing solver (should never be None in this branch)
+                    assert disc_solver is not None, "Discrete solver not initialized"
+                    synthetic_samples = disc_solver.sample(
+                        x_init=x_0,
+                        step_size=1.0 / args.discrete_fm_steps,
+                        verbose=False,
+                        div_free=sym,
+                        dtype_categorical=dtype,
+                        label=labels,
+                        cfg_scale=args.cfg_scale,
+                    )
             else:
                 # Continuous sampling
                 x_0 = torch.randn(samples.shape, dtype=torch.float32, device=device)
 
+                # Safe defaults for ODE options
+                nfe_default = 50
+                atol_default = 1e-5
+                rtol_default = 1e-5
+                step_default = None
+                if cont_ode_opts is not None:
+                    ode_nfe = int(cont_ode_opts.get("nfe", nfe_default))
+                    ode_atol = float(cont_ode_opts.get("atol", atol_default))
+                    ode_rtol = float(cont_ode_opts.get("rtol", rtol_default))
+                    ode_step = cont_ode_opts.get("step_size", step_default)
+                else:
+                    ode_nfe = nfe_default
+                    ode_atol = atol_default
+                    ode_rtol = rtol_default
+                    ode_step = step_default
+
                 if args.edm_schedule:
-                    time_grid = get_time_discretization(nfes=ode_opts["nfe"])
+                    time_grid = get_time_discretization(nfes=ode_nfe)
                 else:
                     time_grid = torch.tensor([0.0, 1.0], device=device)
 
-                synthetic_samples = solver.sample(
+                # Guard against missing solver
+                assert cont_solver is not None, "Continuous solver not initialized"
+                synthetic_samples = cont_solver.sample(
                     time_grid=time_grid,
                     x_init=x_0,
                     method=args.ode_method,
                     return_intermediates=False,
-                    atol=ode_opts["atol"] if "atol" in ode_opts else 1e-5,
-                    rtol=ode_opts["rtol"] if "atol" in ode_opts else 1e-5,
-                    step_size=ode_opts["step_size"]
-                    if "step_size" in ode_opts
-                    else None,
+                    atol=ode_atol,
+                    rtol=ode_rtol,
+                    step_size=ode_step,
                     label=labels,
                     cfg_scale=args.cfg_scale,
                 )
 
                 # Scaling to [0, 1] from [-1, 1]
+                if isinstance(synthetic_samples, (list, tuple)):
+                    synthetic_samples = synthetic_samples[-1]
+                synthetic_samples = cast(torch.Tensor, synthetic_samples)
                 synthetic_samples = torch.clamp(
                     synthetic_samples * 0.5 + 0.5, min=0.0, max=1.0
                 )
@@ -214,8 +315,12 @@ def eval_model(
             # Sync fid metric to ensure that the processes dont deviate much.
             gc.collect()
             running_fid = fid_metric.compute()
+            if _data_loader_len_for_log is not None:
+                _len_str = str(_data_loader_len_for_log)
+            else:
+                _len_str = "?"
             logger.info(
-                f"Evaluating [{data_iter_step}/{len(data_loader)}] samples generated [{num_synthetic}/{fid_samples}] running fid {running_fid}"
+                f"Evaluating [{data_iter_step}/{_len_str}] samples generated [{num_synthetic}/{fid_samples}] running fid {running_fid}"
             )
 
         if args.test_run:

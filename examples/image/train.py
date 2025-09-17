@@ -5,6 +5,21 @@
 # LICENSE file in the root directory of this source tree.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+"""
+Path bootstrap
+Ensures the top-level 'flow_matching' package is importable when running
+this script from within 'examples/image' (e.g., via torchrun).
+"""
+import os as _os
+import sys as _sys
+from pathlib import Path as _Path
+
+_this_dir = _Path(__file__).resolve().parent
+# Go up three levels: .../flow_matching/examples/image -> .../flow_matching
+_pkg_root = _this_dir.parents[2]
+if str(_pkg_root) not in _sys.path:
+    _sys.path.insert(0, str(_pkg_root))
+
 import datetime
 import json
 import logging
@@ -41,6 +56,19 @@ def main(args):
 
     logger.info("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
     logger.info("{}".format(args).replace(", ", ",\n"))
+    # Per-rank file logging
+    try:
+        rank = distributed_mode.get_rank()
+    except Exception:
+        rank = 0
+    log_dir = Path(args.output_dir)
+    if log_dir:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_dir / f"console_rank{rank}.log", mode="a")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logging.getLogger().addHandler(fh)
+
     if distributed_mode.is_main_process():
         args_filepath = Path(args.output_dir) / "args.json"
         logger.info(f"Saving args to {args_filepath}")
@@ -64,7 +92,7 @@ def main(args):
         dataset_train = datasets.CIFAR10(
             root=args.data_path,
             train=True,
-            download=True,
+            download=False,
             transform=transform_train,
         )
     else:
@@ -93,6 +121,7 @@ def main(args):
     model = instantiate_model(
         architechture=args.dataset,
         is_discrete=args.discrete_flow_matching,
+        ko=getattr(args, "ko_metric_induced", False),
         use_ema=args.use_ema,
     )
 
@@ -143,6 +172,25 @@ def main(args):
         loss_scaler=loss_scaler,
         lr_schedule=lr_schedule,
     )
+
+    # Optional Weights & Biases
+    wandb_run = None
+    if getattr(args, "wandb", False):
+        try:
+            import swanlab as wandb  # type: ignore
+            if distributed_mode.is_main_process():
+                wandb_kwargs = dict(
+                    project=getattr(args, "wandb_project", "flow_matching"),
+                    name=getattr(args, "wandb_run_name", None),
+                    entity=getattr(args, "wandb_entity", None),
+                    dir=args.output_dir,
+                    config=vars(args),
+                )
+                if getattr(args, "wandb_offline", False):
+                    os.environ.setdefault("WANDB_MODE", "offline")
+                wandb_run = wandb.init(**{k: v for k, v in wandb_kwargs.items() if v is not None})
+        except Exception as e:
+            logger.warning(f"wandb not enabled ({e})")
 
     logger.info(f"Start from {args.start_epoch} to {args.epochs} epochs")
     start_time = time.time()
@@ -202,6 +250,14 @@ def main(args):
             )
             log_stats.update({f"eval_{k}": v for k, v in eval_stats.items()})
 
+        # Log to wandb (only on main process)
+        if wandb_run is not None and distributed_mode.is_main_process():
+            try:
+                import swanlab as wandb  # type: ignore
+                wandb.log(log_stats, step=epoch)
+            except Exception as e:
+                logger.warning(f"wandb.log failed: {e}")
+
         if args.output_dir and distributed_mode.is_main_process():
             with open(
                 os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8"
@@ -215,10 +271,19 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info(f"Training time {total_time_str}")
 
+    if 'wandb' in globals() and wandb_run is not None and distributed_mode.is_main_process():
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
+    # Backward-compat: map consolidated flag to legacy alias expected elsewhere
+    if not hasattr(args, "ko_metric_induced"):
+        setattr(args, "ko_metric_induced", getattr(args, "metric_induced", False))
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
