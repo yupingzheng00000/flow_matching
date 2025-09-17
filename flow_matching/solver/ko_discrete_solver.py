@@ -16,6 +16,12 @@ from flow_matching.path.mixture import MetricInducedGibbsProbPath
 from flow_matching.solver.solver import Solver
 from flow_matching.utils import categorical, ModelWrapper
 
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:
+    def tqdm(*args, **kwargs):  # type: ignore
+        return nullcontext()
+
 
 class KODiscreteGibbsEulerSolver(Solver):
     """KO-style discrete CTMC solver for metric-induced Gibbs path on pixel space.
@@ -81,20 +87,17 @@ class KODiscreteGibbsEulerSolver(Solver):
         res = [x_t.clone()] if return_intermediates else []
         steps_counter = 0
 
-        ctx = (
-            torch.cuda.amp.autocast(enabled=False)  # keep ints & logits in float32
-            if not verbose
-            else nullcontext()
-        )
-
         with (tqdm(total=t_final, desc=f"NFE: {steps_counter}") if verbose else nullcontext()) as pbar:
             for i in range(n_steps):
                 t = t_discretization[i : i + 1]  # [1]
                 h = t_discretization[i + 1 : i + 2] - t
+                # repeat time to match batch size
+                B = x_t.shape[0]
+                t_batch = t.repeat(B)
 
                 # 1) model posterior p_{1|t}(· | x_t)
                 #    Expect logits with last dim K
-                logits = self.model(x=x_t, t=t.repeat(x_t.shape[0]), **model_extras)
+                logits = self.model(x=x_t, t=t_batch, **model_extras)
                 p_1t = torch.softmax(logits, dim=-1)
 
                 # Flatten to (B*S, K) for categorical sampler
@@ -114,29 +117,19 @@ class KODiscreteGibbsEulerSolver(Solver):
                 x_t_tokens = x_t.view(B, -1)
                 x_1_tokens = x_1.view(B, -1)
 
-                # emb[x1]
-                emb_x1 = self.path.embedding(x_1_tokens)  # [B, S, D]
-                probs_xt = self.path.get_prob_distribution(emb_x1, t)  # [B, S, K]
+                # Fast probs using token-indexed distances
+                probs_xt = self.path.get_prob_distribution_from_tokens(x_1_tokens, t_batch)  # [B, S, K]
 
                 # distances
-                emb_xt = self.path.embedding(x_t_tokens)  # [B, S, D]
-                # d(E[xt], E[x1]) per-site
-                if self.path.metric_name == "cosine":
-                    emb_xt_n = F.normalize(emb_xt, p=2, dim=-1)
-                    emb_x1_n = F.normalize(emb_x1, p=2, dim=-1)
-                    dist_xt_x1 = (1.0 - (emb_xt_n * emb_x1_n).sum(dim=-1)).unsqueeze(-1)  # [B,S,1]
-                elif self.path.metric_name in ("euclidean", "lp"):
-                    p = 2.0 if self.path.metric_name == "euclidean" else self.path.lp_order
-                    dist_xt_x1 = torch.norm(emb_xt - emb_x1, p=p, dim=-1, keepdim=True)
-                else:
-                    raise ValueError(f"Unsupported metric for KO solver: {self.path.metric_name}")
+                # d(E[xt], E[x1]) per-site via distance table
+                dist_xt_x1 = self.path.pair_distance_tokens(x_t_tokens, x_1_tokens)  # [B,S,1]
 
                 # d(E[x], E[x1]) for all x in vocab
-                dist_x1_to_all = self.path.metric(emb_x1)  # [B,S,K]
+                dist_x1_to_all = self.path.distances_from_tokens(x_1_tokens)  # [B,S,K]
                 delta_d = torch.relu(dist_xt_x1 - dist_x1_to_all)  # [B,S,K]
 
                 # dβ_t
-                _, d_beta_t = self.path.beta(t)  # [1] or [B]
+                _, d_beta_t = self.path.beta(t_batch)  # [B]
                 d_beta_t = d_beta_t.view(-1, 1, 1)  # [B,1,1] via broadcast
 
                 u = probs_xt * d_beta_t * delta_d  # [B,S,K]

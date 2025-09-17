@@ -28,6 +28,14 @@ from typing import Iterable, cast
 import PIL.Image
 
 import torch
+
+def _autocast_cuda():
+    """Return an autocast context manager for CUDA with torch.amp if available, else torch.cuda.amp."""
+    try:
+        from torch import amp as _amp  # type: ignore
+        return _amp.autocast("cuda")  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover
+        return torch.cuda.amp.autocast()
 from flow_matching.path import MixtureDiscreteProbPath, MetricInducedGibbsProbPath
 from flow_matching.path.scheduler import PolynomialConvexScheduler
 from flow_matching.solver import MixtureDiscreteEulerSolver, KODiscreteGibbsEulerSolver
@@ -72,13 +80,13 @@ class CFGScaledModel(ModelWrapper):
         t = torch.zeros(x.shape[0], device=x.device) + t
 
         if cfg_scale != 0.0:
-            with torch.cuda.amp.autocast(), torch.no_grad():
+            with _autocast_cuda(), torch.no_grad():
                 conditional = self.model(x, t, extra={"label": label})
                 condition_free = self.model(x, t, extra={})
             result = (1.0 + cfg_scale) * conditional - cfg_scale * condition_free
         else:
             # Model is fully conditional, no cfg weighting needed
-            with torch.cuda.amp.autocast(), torch.no_grad():
+            with _autocast_cuda(), torch.no_grad():
                 result = self.model(x, t, extra={"label": label})
 
         self.nfe_counter += 1
@@ -167,7 +175,13 @@ def eval_model(
                     if ko_solver is None or ko_path is None:
                         # infer K by one forward pass at t=0
                         x_dummy = torch.zeros(samples.shape, dtype=torch.long, device=device)
-                        logits_dummy = cfg_scaled_logits_model(x=x_dummy, t=torch.tensor(0.0, device=device), cfg_scale=args.cfg_scale, label=labels)
+                        # IMPORTANT: do not apply CFG scaling with discrete logits
+                        logits_dummy = cfg_scaled_logits_model(
+                            x=x_dummy,
+                            t=torch.tensor(0.0, device=device),
+                            cfg_scale=0.0,
+                            label=labels,
+                        )
                         K = int(logits_dummy.shape[-1])
                         # Build path
                         mi_metric = getattr(args, "mi_metric", "lp")
@@ -200,7 +214,8 @@ def eval_model(
                         step_size=1.0 / args.discrete_fm_steps,
                         dtype_categorical=dtype_cat,
                         label=labels,
-                        cfg_scale=args.cfg_scale,
+                        # IMPORTANT: disable CFG scaling when using discrete logits
+                        cfg_scale=0.0,
                     )
                 else:
                     x_0 = (
@@ -224,7 +239,8 @@ def eval_model(
                         div_free=sym,
                         dtype_categorical=dtype,
                         label=labels,
-                        cfg_scale=args.cfg_scale,
+                        # Disable CFG scaling for discrete models (logits)
+                        cfg_scale=0.0,
                     )
             else:
                 # Continuous sampling
@@ -274,8 +290,12 @@ def eval_model(
                 )
                 synthetic_samples = torch.floor(synthetic_samples * 255)
             synthetic_samples = synthetic_samples.to(torch.float32) / 255.0
+            # Report NFE from the active wrapper (metric-induced uses logits wrapper)
+            _nfe_model = (
+                cfg_scaled_logits_model if getattr(args, "metric_induced", False) and 'cfg_scaled_logits_model' in locals() and cfg_scaled_logits_model is not None else cfg_scaled_model
+            )
             logger.info(
-                f"{samples.shape[0]} samples generated in {cfg_scaled_model.get_nfe()} evaluations."
+                f"{samples.shape[0]} samples generated in {_nfe_model.get_nfe()} evaluations."
             )
             if num_synthetic + synthetic_samples.shape[0] > fid_samples:
                 synthetic_samples = synthetic_samples[: fid_samples - num_synthetic]

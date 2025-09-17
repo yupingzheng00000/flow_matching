@@ -164,6 +164,13 @@ class MetricInducedGibbsProbPath(ProbPath):
         for p in self.embedding.parameters():
             p.requires_grad_(False)
 
+        # Caches for speed: token distance table and norms for cosine
+        self._cached_dist_table: Optional[Tensor] = None  # [K,K]
+        self._cached_emb_weight: Optional[Tensor] = None  # reference to detect invalidation
+        self._cached_metric_name: Optional[str] = None
+        self._cached_lp_order: Optional[float] = None
+        self._cached_cos_norms: Optional[Tensor] = None   # [K]
+
     # ---------- Embedding handling ----------
     def _build_embedding(
         self,
@@ -256,6 +263,111 @@ class MetricInducedGibbsProbPath(ProbPath):
         d_flat = self._pairwise_dist(z.view(B * S, D), E)             # [B*S, K]
         return d_flat.view(B, S, self.vocab_size)
 
+    # ---------- Precompute and use fast token-indexed distances ----------
+    def _ensure_tables(self, device: torch.device, dtype: torch.dtype) -> None:
+        """Ensure the precomputed KxK distance table exists on the right device/dtype.
+
+        For Euclidean/Lp: dist[i,j] = ||E[i]-E[j]||_p
+        For Cosine: dist[i,j] = 1 - cos(E[i], E[j])
+        """
+        E = self.embedding.weight
+        metric_changed = (
+            self._cached_metric_name != self.metric_name
+            or (self.metric_name == "lp" and self._cached_lp_order != self.lp_order)
+        )
+        weight_changed = (self._cached_emb_weight is not E)
+
+        if self._cached_dist_table is None or metric_changed or weight_changed:
+            # Recompute on CPU (smaller peak memory), then move
+            Ew = E.detach().to("cpu", dtype=torch.float32)
+            if self.metric_name in ("euclidean", "lp"):
+                p = 2.0 if self.metric_name == "euclidean" else float(self.lp_order)
+                # cdist over all pairs: [K,K]
+                dist = torch.cdist(Ew, Ew, p=p)
+                self._cached_cos_norms = None
+            elif self.metric_name == "cosine":
+                Ew_n = F.normalize(Ew, p=2, dim=-1)
+                dist = 1.0 - (Ew_n @ Ew_n.T)
+                # Also cache norms for pair_distance_tokens fast path (if needed)
+                self._cached_cos_norms = Ew.norm(p=2, dim=-1)  # keep CPU copy
+            else:
+                raise ValueError(f"Unsupported metric: {self.metric_name}")
+
+            self._cached_dist_table = dist.to(device=device, dtype=dtype)
+            self._cached_emb_weight = E
+            self._cached_metric_name = self.metric_name
+            self._cached_lp_order = float(self.lp_order)
+        else:
+            # Ensure correct device/dtype
+            if self._cached_dist_table.device != device or self._cached_dist_table.dtype != dtype:
+                self._cached_dist_table = self._cached_dist_table.to(device=device, dtype=dtype)
+            if self._cached_cos_norms is not None and (
+                self._cached_cos_norms.device != device or self._cached_cos_norms.dtype != dtype
+            ):
+                self._cached_cos_norms = self._cached_cos_norms.to(device=device, dtype=dtype)
+
+    def distances_from_tokens(self, token_indices: Tensor) -> Tensor:
+        """Return distances to all vocab tokens for each provided token index.
+
+        Args:
+            token_indices: int tensor of shape [B,S]
+        Returns:
+            dist: [B,S,K] where dist[b,s,:] = d(E[token_indices[b,s]], E[:])
+        """
+        assert token_indices.dtype in (torch.int32, torch.int64)
+        device = token_indices.device
+        dtype = self.embedding.weight.dtype
+        self._ensure_tables(device=device, dtype=dtype)
+        # Gather rows for each token index
+        K = self.vocab_size
+        B, S = token_indices.shape[0], token_indices.view(token_indices.shape[0], -1).shape[1]
+        flat = token_indices.view(-1)  # [B*S]
+        dist_table = self._cached_dist_table
+        assert dist_table is not None, "Distance table cache not initialized"
+        dist_rows = dist_table.index_select(dim=0, index=flat)  # [B*S, K]
+        return dist_rows.view(token_indices.shape + (K,))
+
+    def get_prob_distribution_from_tokens(self, x1_tokens: Tensor, t: Tensor) -> Tensor:
+        """Fast probability path using token indices directly.
+
+        Args:
+            x1_tokens: int tensor [B,S]
+            t: [B]
+        Returns:
+            probs: [B,S,K]
+        """
+        B = x1_tokens.shape[0]
+        device = x1_tokens.device
+        dtype = self.embedding.weight.dtype
+        self._ensure_tables(device=device, dtype=dtype)
+        d = self.distances_from_tokens(x1_tokens)  # [B,S,K]
+        beta_t, _ = self.beta(t)
+        beta_t = beta_t.view(B, 1, 1)
+        logits = -beta_t * d
+        return torch.softmax(logits, dim=-1)
+
+    def pair_distance_tokens(self, x_tokens: Tensor, x1_tokens: Tensor) -> Tensor:
+        """Return per-site distance d(E[x], E[x1]) for current state x and target x1.
+
+        Args:
+            x_tokens: [B,S]
+            x1_tokens: [B,S]
+        Returns:
+            dist: [B,S,1]
+        """
+        assert x_tokens.shape == x1_tokens.shape
+        device = x_tokens.device
+        dtype = self.embedding.weight.dtype
+        self._ensure_tables(device=device, dtype=dtype)
+        flat = x_tokens.view(-1)             # [N]
+        flat1 = x1_tokens.view(-1)           # [N]
+        # Use precomputed dist table rows and gather diag elements by index-select then take matching columns
+        dist_table = self._cached_dist_table
+        assert dist_table is not None, "Distance table cache not initialized"
+        rows = dist_table.index_select(0, flat)  # [N,K]
+        dist = rows.gather(1, flat1.view(-1, 1))              # [N,1]
+        return dist.view(x_tokens.shape + (1,))
+
     # ---------- Conditional distribution p_t(· | x1) ----------
     def get_prob_distribution(self, emb_x1: Tensor, t: Tensor) -> Tensor:
         """
@@ -282,16 +394,9 @@ class MetricInducedGibbsProbPath(ProbPath):
         device = x_1.device
         B = x_1.shape[0]
         orig_shape = x_1.shape  # (B, ...)
-        # Flatten spatial/site dims to S
-        x1_flat = x_1.view(B, -1)                                     # [B,S]
-        # Ensure embedding lives on the same device/dtype as inputs
-        if self.embedding.weight.device != device or self.embedding.weight.dtype != self.dtype:
-            self.embedding = self.embedding.to(device=device, dtype=self.dtype)
-        # Embed and reshape to [B,S,D]
-        emb_x1 = self.embedding(x1_flat)                              # [B*S,D]
-        emb_x1 = emb_x1.view(B, -1, self.emb_dim)                     # [B,S,D]
-        # Compute conditional probs and sample per-site token
-        probs = self.get_prob_distribution(emb_x1, t)                 # [B,S,K]
+        x1_flat = x_1.view(B, -1)
+        # Fast path via precomputed table
+        probs = self.get_prob_distribution_from_tokens(x1_flat, t)
         S = probs.shape[1]
         x_t_flat = torch.multinomial(
             probs.view(B * S, self.vocab_size), num_samples=1, replacement=True

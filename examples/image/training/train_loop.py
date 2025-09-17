@@ -21,6 +21,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from torchmetrics.aggregation import MeanMetric
 from training.grad_scaler import NativeScalerWithGradNormCount
+from training import distributed_mode
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,12 @@ def train_one_epoch(
     else:
         path = CondOTProbPath()
 
+    # Try to get dataloader length for global step computation
+    try:
+        _dl_len = len(data_loader)  # type: ignore[arg-type]
+    except Exception:
+        _dl_len = None
+
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         if data_iter_step % accum_iter == 0:
             optimizer.zero_grad()
@@ -103,9 +110,13 @@ def train_one_epoch(
             path_sample = path.sample(t=t, x_0=x_0, x_1=samples)
 
             # Model should output logits with last dim = 256
-            logits = model(path_sample.x_t, t=t, extra=conditioning)
+            if getattr(args, "bf16", False):
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    logits = model(path_sample.x_t, t=t, extra=conditioning)
+            else:
+                logits = model(path_sample.x_t, t=t, extra=conditioning)
             loss = torch.nn.functional.cross_entropy(
-                logits.reshape([-1, 256]), samples.reshape([-1])
+                logits.float().reshape([-1, 256]), samples.reshape([-1])
             ).mean()
         elif args.discrete_flow_matching:
             samples = (samples * 255.0).to(torch.long)
@@ -118,9 +129,13 @@ def train_one_epoch(
             path_sample = path.sample(t=t, x_0=x_0, x_1=samples)
 
             # discrete flow matching loss (257-way: 256 tokens + MASK)
-            logits = model(path_sample.x_t, t=t, extra=conditioning)
+            if getattr(args, "bf16", False):
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    logits = model(path_sample.x_t, t=t, extra=conditioning)
+            else:
+                logits = model(path_sample.x_t, t=t, extra=conditioning)
             loss = torch.nn.functional.cross_entropy(
-                logits.reshape([-1, 257]), samples.reshape([-1])
+                logits.float().reshape([-1, 257]), samples.reshape([-1])
             ).mean()
         else:
             # Scaling to [-1, 1] from [0, 1]
@@ -166,9 +181,32 @@ def train_one_epoch(
 
         lr = optimizer.param_groups[0]["lr"]
         if data_iter_step % PRINT_FREQUENCY == 0:
+            # Console log
+            dl_len_str = str(_dl_len) if _dl_len is not None else "?"
             logger.info(
-                f"Epoch {epoch} [{data_iter_step}/{len(data_loader)}]: loss = {batch_loss.compute()}, lr = {lr}"
+                f"Epoch {epoch} [{data_iter_step}/{dl_len_str}]: loss = {batch_loss.compute()}, lr = {lr}"
             )
+
+            # Optional Weights & Biases step-level logging (main process only)
+            if getattr(args, "wandb", False) and distributed_mode.is_main_process():
+                try:
+                    import swanlab as wandb  # type: ignore
+                    if _dl_len is not None:
+                        global_step = epoch * _dl_len + data_iter_step
+                    else:
+                        global_step = None
+                    wandb.log(  # type: ignore[attr-defined]
+                        {
+                            "train/step_loss": float(batch_loss.compute().detach().cpu()),
+                            "train/inst_loss": float(loss_value),
+                            "train/lr": float(lr),
+                            "epoch": int(epoch),
+                            "step": int(data_iter_step),
+                        },
+                        step=global_step,
+                    )
+                except Exception:
+                    pass
 
     lr_schedule.step()
     return {"loss": float(epoch_loss.compute().detach().cpu())}

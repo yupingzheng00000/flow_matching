@@ -132,8 +132,13 @@ def get_args_parser():
         help="Classifier-free guidance scale for generating samples.",
     )
     parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Enable bfloat16 autocast during training/eval (disables GradScaler).",
+    )
+    parser.add_argument(
         "--fid_samples",
-        default=5000,
+        default=1000,
         type=int,
         help="number of synthetic samples for FID evaluations",
     )
@@ -275,3 +280,5 @@ def get_args_parser():
     )
 
     return parser
+
+
