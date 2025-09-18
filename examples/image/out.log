@@ -1,0 +1,1800 @@
+nohup: ignoring input
+W0918 03:34:36.840008 234482 site-packages/torch/distributed/run.py:793] 
+W0918 03:34:36.840008 234482 site-packages/torch/distributed/run.py:793] *****************************************
+W0918 03:34:36.840008 234482 site-packages/torch/distributed/run.py:793] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0918 03:34:36.840008 234482 site-packages/torch/distributed/run.py:793] *****************************************
+| distributed init (rank 0): env://, gpu 0
+| distributed init (rank 1): env://, gpu 1
+[rank0]:[W918 03:34:44.995387562 ProcessGroupNCCL.cpp:4115] [PG ID 0 PG GUID 0 Rank 0]  using GPU 0 to perform barrier as devices used by this process are currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect.Specify device_ids in barrier() to force use of a particular device,or call init_process_group() with a device_id.
+[rank1]:[W918 03:34:44.995880240 ProcessGroupNCCL.cpp:4115] [PG ID 0 PG GUID 0 Rank 1]  using GPU 1 to perform barrier as devices used by this process are currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect.Specify device_ids in barrier() to force use of a particular device,or call init_process_group() with a device_id.
+2025-09-18 03:34:45 INFO     job dir: /223040239/yuping/LLADA/flow_matching/examples/image
+2025-09-18 03:34:45 INFO     Namespace(batch_size=384,
+epochs=3000,
+accum_iter=1,
+lr=0.000125,
+optimizer_betas=[0.9,
+0.999],
+decay_lr=False,
+class_drop_prob=1.0,
+skewed_timesteps=False,
+edm_schedule=False,
+use_ema=False,
+dataset='cifar10',
+data_path='./data/image_generation',
+output_dir='./output_dir',
+ode_method='midpoint',
+ode_options={'step_size': 0.01},
+sym=0.0,
+temp=1.0,
+sym_func=True,
+sampling_dtype='float32',
+cfg_scale=0.0,
+bf16=True,
+fid_samples=1000,
+device='cuda',
+seed=0,
+resume='',
+start_epoch=0,
+eval_only=False,
+eval_frequency=50,
+compute_fid=True,
+save_fid_samples=False,
+num_workers=10,
+pin_mem=True,
+world_size=2,
+local_rank=-1,
+dist_on_itp=False,
+dist_url='env://',
+test_run=False,
+discrete_flow_matching=True,
+discrete_fm_steps=1024,
+metric_induced=False,
+mi_metric='lp',
+mi_lp=3.0,
+mi_a=5.0,
+mi_c=1.0,
+mi_embed_range='pm1',
+wandb=True,
+wandb_project='flow_matching',
+wandb_run_name='cifar10_dfm_bs384',
+wandb_entity='',
+wandb_offline=False,
+ko_metric_induced=False,
+rank=0,
+gpu=0,
+distributed=True,
+dist_backend='nccl')
+2025-09-18 03:34:45 INFO     job dir: /223040239/yuping/LLADA/flow_matching/examples/image
+2025-09-18 03:34:45 INFO     Namespace(batch_size=384,
+epochs=3000,
+accum_iter=1,
+lr=0.000125,
+optimizer_betas=[0.9,
+0.999],
+decay_lr=False,
+class_drop_prob=1.0,
+skewed_timesteps=False,
+edm_schedule=False,
+use_ema=False,
+dataset='cifar10',
+data_path='./data/image_generation',
+output_dir='./output_dir',
+ode_method='midpoint',
+ode_options={'step_size': 0.01},
+sym=0.0,
+temp=1.0,
+sym_func=True,
+sampling_dtype='float32',
+cfg_scale=0.0,
+bf16=True,
+fid_samples=1000,
+device='cuda',
+seed=0,
+resume='',
+start_epoch=0,
+eval_only=False,
+eval_frequency=50,
+compute_fid=True,
+save_fid_samples=False,
+num_workers=10,
+pin_mem=True,
+world_size=2,
+local_rank=-1,
+dist_on_itp=False,
+dist_url='env://',
+test_run=False,
+discrete_flow_matching=True,
+discrete_fm_steps=1024,
+metric_induced=False,
+mi_metric='lp',
+mi_lp=3.0,
+mi_a=5.0,
+mi_c=1.0,
+mi_embed_range='pm1',
+wandb=True,
+wandb_project='flow_matching',
+wandb_run_name='cifar10_dfm_bs384',
+wandb_entity='',
+wandb_offline=False,
+ko_metric_induced=False,
+rank=1,
+gpu=1,
+distributed=True,
+dist_backend='nccl')
+2025-09-18 03:34:45 INFO     Saving args to output_dir/args.json
+2025-09-18 03:34:45 INFO     Initializing Dataset: cifar10
+2025-09-18 03:34:45 INFO     Initializing Dataset: cifar10
+2025-09-18 03:34:46 INFO     Dataset CIFAR10
+    Number of datapoints: 50000
+    Root location: ./data/image_generation
+    Split: Train
+    StandardTransform
+Transform: Compose(
+                 ToImage()
+                 RandomHorizontalFlip(p=0.5)
+                 ToDtype(scale=True)
+           )
+2025-09-18 03:34:46 INFO     Dataset CIFAR10
+    Number of datapoints: 50000
+    Root location: ./data/image_generation
+    Split: Train
+    StandardTransform
+Transform: Compose(
+                 ToImage()
+                 RandomHorizontalFlip(p=0.5)
+                 ToDtype(scale=True)
+           )
+2025-09-18 03:34:46 INFO     Intializing DataLoader
+2025-09-18 03:34:46 INFO     Intializing DataLoader
+2025-09-18 03:34:46 INFO     <torch.utils.data.distributed.DistributedSampler object at 0x7f9c5dadb760>
+2025-09-18 03:34:46 INFO     <torch.utils.data.distributed.DistributedSampler object at 0x7f586f3ebcd0>
+2025-09-18 03:34:46 INFO     Initializing Model
+2025-09-18 03:34:46 INFO     Initializing Model
+2025-09-18 03:34:47 INFO     DiscreteUNetModel(vocab_size=257, in_channels=3, model_channels=96, out_channels=3, num_res_blocks=5, attention_resolutions=[2], dropout=0.4, channel_mult=[3, 4, 4], conv_resample=False, dims=2, num_classes=None, use_checkpoint=False, num_heads=-1, num_head_channels=64, num_heads_upsample=-1, use_scale_shift_norm=True, resblock_updown=False, use_new_attention_order=True, with_fourier_features=False)
+2025-09-18 03:34:47 INFO     Learning rate: 1.25e-04
+2025-09-18 03:34:47 INFO     Accumulate grad iterations: 1
+2025-09-18 03:34:47 INFO     Effective batch size: 768
+2025-09-18 03:34:47 INFO     DiscreteUNetModel(vocab_size=257, in_channels=3, model_channels=96, out_channels=3, num_res_blocks=5, attention_resolutions=[2], dropout=0.4, channel_mult=[3, 4, 4], conv_resample=False, dims=2, num_classes=None, use_checkpoint=False, num_heads=-1, num_head_channels=64, num_heads_upsample=-1, use_scale_shift_norm=True, resblock_updown=False, use_new_attention_order=True, with_fourier_features=False)
+2025-09-18 03:34:47 INFO     Learning rate: 1.25e-04
+2025-09-18 03:34:47 INFO     Accumulate grad iterations: 1
+2025-09-18 03:34:47 INFO     Effective batch size: 768
+2025-09-18 03:34:47 INFO     Optimizer: AdamW (
+Parameter Group 0
+    amsgrad: False
+    betas: [0.9, 0.999]
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    initial_lr: 0.000125
+    lr: 0.000125
+    maximize: False
+    weight_decay: 0.01
+)
+2025-09-18 03:34:47 INFO     Learning-Rate Schedule: <torch.optim.lr_scheduler.ConstantLR object at 0x7f58605d1f00>
+2025-09-18 03:34:47 INFO     Optimizer: AdamW (
+Parameter Group 0
+    amsgrad: False
+    betas: [0.9, 0.999]
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    initial_lr: 0.000125
+    lr: 0.000125
+    maximize: False
+    weight_decay: 0.01
+)
+2025-09-18 03:34:47 INFO     Learning-Rate Schedule: <torch.optim.lr_scheduler.ConstantLR object at 0x7f9c4c33df90>
+2025-09-18 03:34:49 INFO     Start from 0 to 3000 epochs
+/223040239/yuping/LLADA/flow_matching/examples/image/training/train_loop.py:133: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+swanlab: Tracking run with swanlab version 0.6.10
+swanlab: Run data will be saved locally in 
+/223040239/yuping/LLADA/flow_matching/examples/image/swanlog/run-20250918_033450
+-8r5wfu5p4vhryb1k4hx9e
+swanlab: 👋 Hi 00000051469,welcome to swanlab!
+swanlab: Syncing run cifar10_dfm_bs384 to the cloud
+swanlab: 🏠 View project at https://swanlab.cn/@00000051469/flow_matching
+swanlab: 🚀 View run at 
+https://swanlab.cn/@00000051469/flow_matching/runs/8r5wfu5p4vhryb1k4hx9e
+2025-09-18 03:34:50 INFO     Start from 0 to 3000 epochs
+/223040239/yuping/LLADA/flow_matching/examples/image/training/train_loop.py:133: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+2025-09-18 03:34:56 INFO     Epoch 0 [0/65]: loss = 5.54782772064209, lr = 0.000125
+2025-09-18 03:34:56 INFO     Epoch 0 [0/65]: loss = 5.54782772064209, lr = 0.000125
+2025-09-18 03:35:08 INFO     Epoch 0 [10/65]: loss = 5.4315338134765625, lr = 0.000125
+2025-09-18 03:35:08 INFO     Epoch 0 [10/65]: loss = 5.4315338134765625, lr = 0.000125
+2025-09-18 03:35:19 INFO     Epoch 0 [20/65]: loss = 5.355663776397705, lr = 0.000125
+2025-09-18 03:35:19 INFO     Epoch 0 [20/65]: loss = 5.355663776397705, lr = 0.000125
+2025-09-18 03:35:30 INFO     Epoch 0 [30/65]: loss = 5.396938800811768, lr = 0.000125
+2025-09-18 03:35:30 INFO     Epoch 0 [30/65]: loss = 5.396938800811768, lr = 0.000125
+2025-09-18 03:35:42 INFO     Epoch 0 [40/65]: loss = 5.164257526397705, lr = 0.000125
+2025-09-18 03:35:42 INFO     Epoch 0 [40/65]: loss = 5.164257526397705, lr = 0.000125
+2025-09-18 03:35:53 INFO     Epoch 0 [50/65]: loss = 5.118043422698975, lr = 0.000125
+2025-09-18 03:35:53 INFO     Epoch 0 [50/65]: loss = 5.118043422698975, lr = 0.000125
+2025-09-18 03:36:04 INFO     Epoch 0 [60/65]: loss = 5.115567684173584, lr = 0.000125
+2025-09-18 03:36:04 INFO     Epoch 0 [60/65]: loss = 5.115567684173584, lr = 0.000125
+2025-09-18 03:36:11 INFO     Epoch 1 [0/65]: loss = 5.008935451507568, lr = 0.000125
+2025-09-18 03:36:11 INFO     Epoch 1 [0/65]: loss = 5.008935451507568, lr = 0.000125
+2025-09-18 03:36:22 INFO     Epoch 1 [10/65]: loss = 5.068756103515625, lr = 0.000125
+2025-09-18 03:36:22 INFO     Epoch 1 [10/65]: loss = 5.068756103515625, lr = 0.000125
+2025-09-18 03:36:34 INFO     Epoch 1 [20/65]: loss = 4.917847633361816, lr = 0.000125
+2025-09-18 03:36:34 INFO     Epoch 1 [20/65]: loss = 4.917847633361816, lr = 0.000125
+2025-09-18 03:36:45 INFO     Epoch 1 [30/65]: loss = 4.910313606262207, lr = 0.000125
+2025-09-18 03:36:45 INFO     Epoch 1 [30/65]: loss = 4.910313606262207, lr = 0.000125
+2025-09-18 03:36:57 INFO     Epoch 1 [40/65]: loss = 4.817043304443359, lr = 0.000125
+2025-09-18 03:36:57 INFO     Epoch 1 [40/65]: loss = 4.817043304443359, lr = 0.000125
+2025-09-18 03:37:08 INFO     Epoch 1 [50/65]: loss = 4.760963439941406, lr = 0.000125
+2025-09-18 03:37:08 INFO     Epoch 1 [50/65]: loss = 4.760963439941406, lr = 0.000125
+2025-09-18 03:37:20 INFO     Epoch 1 [60/65]: loss = 4.670280456542969, lr = 0.000125
+2025-09-18 03:37:20 INFO     Epoch 1 [60/65]: loss = 4.670280456542969, lr = 0.000125
+2025-09-18 03:37:26 INFO     Epoch 2 [0/65]: loss = 4.672402381896973, lr = 0.000125
+2025-09-18 03:37:26 INFO     Epoch 2 [0/65]: loss = 4.672402381896973, lr = 0.000125
+2025-09-18 03:37:37 INFO     Epoch 2 [10/65]: loss = 4.662830352783203, lr = 0.000125
+2025-09-18 03:37:37 INFO     Epoch 2 [10/65]: loss = 4.662830352783203, lr = 0.000125
+2025-09-18 03:37:49 INFO     Epoch 2 [20/65]: loss = 4.678949356079102, lr = 0.000125
+2025-09-18 03:37:49 INFO     Epoch 2 [20/65]: loss = 4.678949356079102, lr = 0.000125
+2025-09-18 03:38:00 INFO     Epoch 2 [30/65]: loss = 4.574140548706055, lr = 0.000125
+2025-09-18 03:38:00 INFO     Epoch 2 [30/65]: loss = 4.574140548706055, lr = 0.000125
+2025-09-18 03:38:12 INFO     Epoch 2 [40/65]: loss = 4.722932815551758, lr = 0.000125
+2025-09-18 03:38:12 INFO     Epoch 2 [40/65]: loss = 4.722932815551758, lr = 0.000125
+2025-09-18 03:38:23 INFO     Epoch 2 [50/65]: loss = 4.67709493637085, lr = 0.000125
+2025-09-18 03:38:23 INFO     Epoch 2 [50/65]: loss = 4.67709493637085, lr = 0.000125
+2025-09-18 03:38:35 INFO     Epoch 2 [60/65]: loss = 4.48551082611084, lr = 0.000125
+2025-09-18 03:38:35 INFO     Epoch 2 [60/65]: loss = 4.48551082611084, lr = 0.000125
+2025-09-18 03:38:41 INFO     Epoch 3 [0/65]: loss = 4.5151166915893555, lr = 0.000125
+2025-09-18 03:38:41 INFO     Epoch 3 [0/65]: loss = 4.5151166915893555, lr = 0.000125
+2025-09-18 03:38:53 INFO     Epoch 3 [10/65]: loss = 4.389110565185547, lr = 0.000125
+2025-09-18 03:38:53 INFO     Epoch 3 [10/65]: loss = 4.389110565185547, lr = 0.000125
+2025-09-18 03:39:04 INFO     Epoch 3 [20/65]: loss = 4.3173723220825195, lr = 0.000125
+2025-09-18 03:39:04 INFO     Epoch 3 [20/65]: loss = 4.3173723220825195, lr = 0.000125
+2025-09-18 03:39:16 INFO     Epoch 3 [30/65]: loss = 4.31170654296875, lr = 0.000125
+2025-09-18 03:39:16 INFO     Epoch 3 [30/65]: loss = 4.31170654296875, lr = 0.000125
+2025-09-18 03:39:27 INFO     Epoch 3 [40/65]: loss = 4.275677680969238, lr = 0.000125
+2025-09-18 03:39:27 INFO     Epoch 3 [40/65]: loss = 4.275677680969238, lr = 0.000125
+2025-09-18 03:39:39 INFO     Epoch 3 [50/65]: loss = 4.215826034545898, lr = 0.000125
+2025-09-18 03:39:39 INFO     Epoch 3 [50/65]: loss = 4.215826034545898, lr = 0.000125
+2025-09-18 03:39:50 INFO     Epoch 3 [60/65]: loss = 4.210077285766602, lr = 0.000125
+2025-09-18 03:39:50 INFO     Epoch 3 [60/65]: loss = 4.210077285766602, lr = 0.000125
+2025-09-18 03:39:57 INFO     Epoch 4 [0/65]: loss = 4.25410270690918, lr = 0.000125
+2025-09-18 03:39:57 INFO     Epoch 4 [0/65]: loss = 4.25410270690918, lr = 0.000125
+2025-09-18 03:40:08 INFO     Epoch 4 [10/65]: loss = 4.196185111999512, lr = 0.000125
+2025-09-18 03:40:08 INFO     Epoch 4 [10/65]: loss = 4.196185111999512, lr = 0.000125
+2025-09-18 03:40:20 INFO     Epoch 4 [20/65]: loss = 4.063627243041992, lr = 0.000125
+2025-09-18 03:40:20 INFO     Epoch 4 [20/65]: loss = 4.063627243041992, lr = 0.000125
+2025-09-18 03:40:31 INFO     Epoch 4 [30/65]: loss = 4.04386568069458, lr = 0.000125
+2025-09-18 03:40:31 INFO     Epoch 4 [30/65]: loss = 4.04386568069458, lr = 0.000125
+2025-09-18 03:40:43 INFO     Epoch 4 [40/65]: loss = 4.023611545562744, lr = 0.000125
+2025-09-18 03:40:43 INFO     Epoch 4 [40/65]: loss = 4.023611545562744, lr = 0.000125
+2025-09-18 03:40:54 INFO     Epoch 4 [50/65]: loss = 4.015225410461426, lr = 0.000125
+2025-09-18 03:40:54 INFO     Epoch 4 [50/65]: loss = 4.015225410461426, lr = 0.000125
+2025-09-18 03:41:06 INFO     Epoch 4 [60/65]: loss = 4.069161891937256, lr = 0.000125
+2025-09-18 03:41:06 INFO     Epoch 4 [60/65]: loss = 4.069161891937256, lr = 0.000125
+2025-09-18 03:41:12 INFO     Epoch 5 [0/65]: loss = 4.0953497886657715, lr = 0.000125
+2025-09-18 03:41:12 INFO     Epoch 5 [0/65]: loss = 4.0953497886657715, lr = 0.000125
+2025-09-18 03:41:24 INFO     Epoch 5 [10/65]: loss = 3.963376998901367, lr = 0.000125
+2025-09-18 03:41:24 INFO     Epoch 5 [10/65]: loss = 3.963376998901367, lr = 0.000125
+2025-09-18 03:41:35 INFO     Epoch 5 [20/65]: loss = 3.892728090286255, lr = 0.000125
+2025-09-18 03:41:35 INFO     Epoch 5 [20/65]: loss = 3.892728090286255, lr = 0.000125
+2025-09-18 03:41:46 INFO     Epoch 5 [30/65]: loss = 4.018030643463135, lr = 0.000125
+2025-09-18 03:41:46 INFO     Epoch 5 [30/65]: loss = 4.018030643463135, lr = 0.000125
+2025-09-18 03:41:58 INFO     Epoch 5 [40/65]: loss = 3.923582077026367, lr = 0.000125
+2025-09-18 03:41:58 INFO     Epoch 5 [40/65]: loss = 3.923582077026367, lr = 0.000125
+2025-09-18 03:42:09 INFO     Epoch 5 [50/65]: loss = 3.98856782913208, lr = 0.000125
+2025-09-18 03:42:09 INFO     Epoch 5 [50/65]: loss = 3.98856782913208, lr = 0.000125
+2025-09-18 03:42:20 INFO     Epoch 5 [60/65]: loss = 3.8899965286254883, lr = 0.000125
+2025-09-18 03:42:20 INFO     Epoch 5 [60/65]: loss = 3.8899965286254883, lr = 0.000125
+2025-09-18 03:42:27 INFO     Epoch 6 [0/65]: loss = 3.750399112701416, lr = 0.000125
+2025-09-18 03:42:27 INFO     Epoch 6 [0/65]: loss = 3.750399112701416, lr = 0.000125
+2025-09-18 03:42:38 INFO     Epoch 6 [10/65]: loss = 3.798403263092041, lr = 0.000125
+2025-09-18 03:42:38 INFO     Epoch 6 [10/65]: loss = 3.798403263092041, lr = 0.000125
+2025-09-18 03:42:50 INFO     Epoch 6 [20/65]: loss = 3.752920150756836, lr = 0.000125
+2025-09-18 03:42:50 INFO     Epoch 6 [20/65]: loss = 3.752920150756836, lr = 0.000125
+2025-09-18 03:43:01 INFO     Epoch 6 [30/65]: loss = 3.8306682109832764, lr = 0.000125
+2025-09-18 03:43:01 INFO     Epoch 6 [30/65]: loss = 3.8306682109832764, lr = 0.000125
+2025-09-18 03:43:12 INFO     Epoch 6 [40/65]: loss = 3.827254295349121, lr = 0.000125
+2025-09-18 03:43:12 INFO     Epoch 6 [40/65]: loss = 3.827254295349121, lr = 0.000125
+2025-09-18 03:43:24 INFO     Epoch 6 [50/65]: loss = 3.743612289428711, lr = 0.000125
+2025-09-18 03:43:24 INFO     Epoch 6 [50/65]: loss = 3.743612289428711, lr = 0.000125
+2025-09-18 03:43:35 INFO     Epoch 6 [60/65]: loss = 3.674917697906494, lr = 0.000125
+2025-09-18 03:43:35 INFO     Epoch 6 [60/65]: loss = 3.674917697906494, lr = 0.000125
+2025-09-18 03:43:42 INFO     Epoch 7 [0/65]: loss = 3.6196393966674805, lr = 0.000125
+2025-09-18 03:43:42 INFO     Epoch 7 [0/65]: loss = 3.6196393966674805, lr = 0.000125
+2025-09-18 03:43:53 INFO     Epoch 7 [10/65]: loss = 3.741668701171875, lr = 0.000125
+2025-09-18 03:43:53 INFO     Epoch 7 [10/65]: loss = 3.741668701171875, lr = 0.000125
+2025-09-18 03:44:05 INFO     Epoch 7 [20/65]: loss = 3.787015438079834, lr = 0.000125
+2025-09-18 03:44:05 INFO     Epoch 7 [20/65]: loss = 3.787015438079834, lr = 0.000125
+2025-09-18 03:44:16 INFO     Epoch 7 [30/65]: loss = 3.6800060272216797, lr = 0.000125
+2025-09-18 03:44:16 INFO     Epoch 7 [30/65]: loss = 3.6800060272216797, lr = 0.000125
+2025-09-18 03:44:28 INFO     Epoch 7 [40/65]: loss = 3.721928834915161, lr = 0.000125
+2025-09-18 03:44:28 INFO     Epoch 7 [40/65]: loss = 3.721928834915161, lr = 0.000125
+2025-09-18 03:44:39 INFO     Epoch 7 [50/65]: loss = 3.7469606399536133, lr = 0.000125
+2025-09-18 03:44:39 INFO     Epoch 7 [50/65]: loss = 3.7469606399536133, lr = 0.000125
+2025-09-18 03:44:51 INFO     Epoch 7 [60/65]: loss = 3.6222305297851562, lr = 0.000125
+2025-09-18 03:44:51 INFO     Epoch 7 [60/65]: loss = 3.6222305297851562, lr = 0.000125
+2025-09-18 03:44:57 INFO     Epoch 8 [0/65]: loss = 3.6514172554016113, lr = 0.000125
+2025-09-18 03:44:57 INFO     Epoch 8 [0/65]: loss = 3.6514172554016113, lr = 0.000125
+2025-09-18 03:45:09 INFO     Epoch 8 [10/65]: loss = 3.7509965896606445, lr = 0.000125
+2025-09-18 03:45:09 INFO     Epoch 8 [10/65]: loss = 3.7509965896606445, lr = 0.000125
+2025-09-18 03:45:20 INFO     Epoch 8 [20/65]: loss = 3.583590507507324, lr = 0.000125
+2025-09-18 03:45:20 INFO     Epoch 8 [20/65]: loss = 3.583590507507324, lr = 0.000125
+2025-09-18 03:45:32 INFO     Epoch 8 [30/65]: loss = 3.6017560958862305, lr = 0.000125
+2025-09-18 03:45:32 INFO     Epoch 8 [30/65]: loss = 3.6017560958862305, lr = 0.000125
+2025-09-18 03:45:43 INFO     Epoch 8 [40/65]: loss = 3.6800103187561035, lr = 0.000125
+2025-09-18 03:45:43 INFO     Epoch 8 [40/65]: loss = 3.6800103187561035, lr = 0.000125
+2025-09-18 03:45:55 INFO     Epoch 8 [50/65]: loss = 3.5484213829040527, lr = 0.000125
+2025-09-18 03:45:55 INFO     Epoch 8 [50/65]: loss = 3.5484213829040527, lr = 0.000125
+2025-09-18 03:46:06 INFO     Epoch 8 [60/65]: loss = 3.624204635620117, lr = 0.000125
+2025-09-18 03:46:06 INFO     Epoch 8 [60/65]: loss = 3.624204635620117, lr = 0.000125
+2025-09-18 03:46:13 INFO     Epoch 9 [0/65]: loss = 3.6327061653137207, lr = 0.000125
+2025-09-18 03:46:13 INFO     Epoch 9 [0/65]: loss = 3.6327061653137207, lr = 0.000125
+2025-09-18 03:46:24 INFO     Epoch 9 [10/65]: loss = 3.658491611480713, lr = 0.000125
+2025-09-18 03:46:24 INFO     Epoch 9 [10/65]: loss = 3.658491611480713, lr = 0.000125
+2025-09-18 03:46:36 INFO     Epoch 9 [20/65]: loss = 3.6271705627441406, lr = 0.000125
+2025-09-18 03:46:36 INFO     Epoch 9 [20/65]: loss = 3.6271705627441406, lr = 0.000125
+2025-09-18 03:46:47 INFO     Epoch 9 [30/65]: loss = 3.6119542121887207, lr = 0.000125
+2025-09-18 03:46:47 INFO     Epoch 9 [30/65]: loss = 3.6119542121887207, lr = 0.000125
+2025-09-18 03:46:59 INFO     Epoch 9 [40/65]: loss = 3.641697406768799, lr = 0.000125
+2025-09-18 03:46:59 INFO     Epoch 9 [40/65]: loss = 3.641697406768799, lr = 0.000125
+2025-09-18 03:47:10 INFO     Epoch 9 [50/65]: loss = 3.6244091987609863, lr = 0.000125
+2025-09-18 03:47:10 INFO     Epoch 9 [50/65]: loss = 3.6244091987609863, lr = 0.000125
+2025-09-18 03:47:22 INFO     Epoch 9 [60/65]: loss = 3.558187484741211, lr = 0.000125
+2025-09-18 03:47:22 INFO     Epoch 9 [60/65]: loss = 3.558187484741211, lr = 0.000125
+2025-09-18 03:47:28 INFO     Epoch 10 [0/65]: loss = 3.603050708770752, lr = 0.000125
+2025-09-18 03:47:28 INFO     Epoch 10 [0/65]: loss = 3.603050708770752, lr = 0.000125
+2025-09-18 03:47:39 INFO     Epoch 10 [10/65]: loss = 3.5031514167785645, lr = 0.000125
+2025-09-18 03:47:39 INFO     Epoch 10 [10/65]: loss = 3.5031514167785645, lr = 0.000125
+2025-09-18 03:47:51 INFO     Epoch 10 [20/65]: loss = 3.5006563663482666, lr = 0.000125
+2025-09-18 03:47:51 INFO     Epoch 10 [20/65]: loss = 3.5006563663482666, lr = 0.000125
+2025-09-18 03:48:02 INFO     Epoch 10 [30/65]: loss = 3.570680618286133, lr = 0.000125
+2025-09-18 03:48:02 INFO     Epoch 10 [30/65]: loss = 3.570680618286133, lr = 0.000125
+2025-09-18 03:48:14 INFO     Epoch 10 [40/65]: loss = 3.5352063179016113, lr = 0.000125
+2025-09-18 03:48:14 INFO     Epoch 10 [40/65]: loss = 3.5352063179016113, lr = 0.000125
+2025-09-18 03:48:25 INFO     Epoch 10 [50/65]: loss = 3.534069538116455, lr = 0.000125
+2025-09-18 03:48:25 INFO     Epoch 10 [50/65]: loss = 3.534069538116455, lr = 0.000125
+2025-09-18 03:48:37 INFO     Epoch 10 [60/65]: loss = 3.4836008548736572, lr = 0.000125
+2025-09-18 03:48:37 INFO     Epoch 10 [60/65]: loss = 3.4836008548736572, lr = 0.000125
+2025-09-18 03:48:43 INFO     Epoch 11 [0/65]: loss = 3.562833547592163, lr = 0.000125
+2025-09-18 03:48:43 INFO     Epoch 11 [0/65]: loss = 3.562833547592163, lr = 0.000125
+2025-09-18 03:48:55 INFO     Epoch 11 [10/65]: loss = 3.4938225746154785, lr = 0.000125
+2025-09-18 03:48:55 INFO     Epoch 11 [10/65]: loss = 3.4938225746154785, lr = 0.000125
+2025-09-18 03:49:06 INFO     Epoch 11 [20/65]: loss = 3.472897529602051, lr = 0.000125
+2025-09-18 03:49:06 INFO     Epoch 11 [20/65]: loss = 3.472897529602051, lr = 0.000125
+2025-09-18 03:49:18 INFO     Epoch 11 [30/65]: loss = 3.486088752746582, lr = 0.000125
+2025-09-18 03:49:18 INFO     Epoch 11 [30/65]: loss = 3.486088752746582, lr = 0.000125
+2025-09-18 03:49:29 INFO     Epoch 11 [40/65]: loss = 3.5028114318847656, lr = 0.000125
+2025-09-18 03:49:29 INFO     Epoch 11 [40/65]: loss = 3.5028114318847656, lr = 0.000125
+2025-09-18 03:49:40 INFO     Epoch 11 [50/65]: loss = 3.4147024154663086, lr = 0.000125
+2025-09-18 03:49:40 INFO     Epoch 11 [50/65]: loss = 3.4147024154663086, lr = 0.000125
+2025-09-18 03:49:52 INFO     Epoch 11 [60/65]: loss = 3.425895929336548, lr = 0.000125
+2025-09-18 03:49:52 INFO     Epoch 11 [60/65]: loss = 3.425895929336548, lr = 0.000125
+2025-09-18 03:49:58 INFO     Epoch 12 [0/65]: loss = 3.4420177936553955, lr = 0.000125
+2025-09-18 03:49:58 INFO     Epoch 12 [0/65]: loss = 3.4420177936553955, lr = 0.000125
+2025-09-18 03:50:09 INFO     Epoch 12 [10/65]: loss = 3.37208890914917, lr = 0.000125
+2025-09-18 03:50:09 INFO     Epoch 12 [10/65]: loss = 3.37208890914917, lr = 0.000125
+2025-09-18 03:50:21 INFO     Epoch 12 [20/65]: loss = 3.4706335067749023, lr = 0.000125
+2025-09-18 03:50:21 INFO     Epoch 12 [20/65]: loss = 3.4706335067749023, lr = 0.000125
+2025-09-18 03:50:32 INFO     Epoch 12 [30/65]: loss = 3.3911914825439453, lr = 0.000125
+2025-09-18 03:50:32 INFO     Epoch 12 [30/65]: loss = 3.3911914825439453, lr = 0.000125
+2025-09-18 03:50:44 INFO     Epoch 12 [40/65]: loss = 3.514207124710083, lr = 0.000125
+2025-09-18 03:50:44 INFO     Epoch 12 [40/65]: loss = 3.514207124710083, lr = 0.000125
+2025-09-18 03:50:55 INFO     Epoch 12 [50/65]: loss = 3.4756662845611572, lr = 0.000125
+2025-09-18 03:50:55 INFO     Epoch 12 [50/65]: loss = 3.4756662845611572, lr = 0.000125
+2025-09-18 03:51:07 INFO     Epoch 12 [60/65]: loss = 3.483496904373169, lr = 0.000125
+2025-09-18 03:51:07 INFO     Epoch 12 [60/65]: loss = 3.483496904373169, lr = 0.000125
+2025-09-18 03:51:13 INFO     Epoch 13 [0/65]: loss = 3.483095169067383, lr = 0.000125
+2025-09-18 03:51:13 INFO     Epoch 13 [0/65]: loss = 3.483095169067383, lr = 0.000125
+2025-09-18 03:51:25 INFO     Epoch 13 [10/65]: loss = 3.4965763092041016, lr = 0.000125
+2025-09-18 03:51:25 INFO     Epoch 13 [10/65]: loss = 3.4965763092041016, lr = 0.000125
+2025-09-18 03:51:36 INFO     Epoch 13 [20/65]: loss = 3.4225893020629883, lr = 0.000125
+2025-09-18 03:51:36 INFO     Epoch 13 [20/65]: loss = 3.4225893020629883, lr = 0.000125
+2025-09-18 03:51:47 INFO     Epoch 13 [30/65]: loss = 3.495344400405884, lr = 0.000125
+2025-09-18 03:51:47 INFO     Epoch 13 [30/65]: loss = 3.495344400405884, lr = 0.000125
+2025-09-18 03:51:59 INFO     Epoch 13 [40/65]: loss = 3.45719575881958, lr = 0.000125
+2025-09-18 03:51:59 INFO     Epoch 13 [40/65]: loss = 3.45719575881958, lr = 0.000125
+2025-09-18 03:52:10 INFO     Epoch 13 [50/65]: loss = 3.488527774810791, lr = 0.000125
+2025-09-18 03:52:10 INFO     Epoch 13 [50/65]: loss = 3.488527774810791, lr = 0.000125
+2025-09-18 03:52:21 INFO     Epoch 13 [60/65]: loss = 3.4060211181640625, lr = 0.000125
+2025-09-18 03:52:21 INFO     Epoch 13 [60/65]: loss = 3.4060211181640625, lr = 0.000125
+2025-09-18 03:52:28 INFO     Epoch 14 [0/65]: loss = 3.507697343826294, lr = 0.000125
+2025-09-18 03:52:28 INFO     Epoch 14 [0/65]: loss = 3.507697343826294, lr = 0.000125
+2025-09-18 03:52:39 INFO     Epoch 14 [10/65]: loss = 3.3514528274536133, lr = 0.000125
+2025-09-18 03:52:39 INFO     Epoch 14 [10/65]: loss = 3.3514528274536133, lr = 0.000125
+2025-09-18 03:52:50 INFO     Epoch 14 [20/65]: loss = 3.3231287002563477, lr = 0.000125
+2025-09-18 03:52:50 INFO     Epoch 14 [20/65]: loss = 3.3231287002563477, lr = 0.000125
+2025-09-18 03:53:02 INFO     Epoch 14 [30/65]: loss = 3.4231817722320557, lr = 0.000125
+2025-09-18 03:53:02 INFO     Epoch 14 [30/65]: loss = 3.4231817722320557, lr = 0.000125
+2025-09-18 03:53:13 INFO     Epoch 14 [40/65]: loss = 3.371096611022949, lr = 0.000125
+2025-09-18 03:53:13 INFO     Epoch 14 [40/65]: loss = 3.371096611022949, lr = 0.000125
+2025-09-18 03:53:25 INFO     Epoch 14 [50/65]: loss = 3.444197416305542, lr = 0.000125
+2025-09-18 03:53:25 INFO     Epoch 14 [50/65]: loss = 3.444197416305542, lr = 0.000125
+2025-09-18 03:53:36 INFO     Epoch 14 [60/65]: loss = 3.4274098873138428, lr = 0.000125
+2025-09-18 03:53:36 INFO     Epoch 14 [60/65]: loss = 3.4274098873138428, lr = 0.000125
+2025-09-18 03:53:43 INFO     Epoch 15 [0/65]: loss = 3.4206743240356445, lr = 0.000125
+2025-09-18 03:53:43 INFO     Epoch 15 [0/65]: loss = 3.4206743240356445, lr = 0.000125
+2025-09-18 03:53:54 INFO     Epoch 15 [10/65]: loss = 3.336516857147217, lr = 0.000125
+2025-09-18 03:53:54 INFO     Epoch 15 [10/65]: loss = 3.336516857147217, lr = 0.000125
+2025-09-18 03:54:06 INFO     Epoch 15 [20/65]: loss = 3.3909335136413574, lr = 0.000125
+2025-09-18 03:54:06 INFO     Epoch 15 [20/65]: loss = 3.3909335136413574, lr = 0.000125
+2025-09-18 03:54:17 INFO     Epoch 15 [30/65]: loss = 3.370581865310669, lr = 0.000125
+2025-09-18 03:54:17 INFO     Epoch 15 [30/65]: loss = 3.370581865310669, lr = 0.000125
+2025-09-18 03:54:29 INFO     Epoch 15 [40/65]: loss = 3.3464765548706055, lr = 0.000125
+2025-09-18 03:54:29 INFO     Epoch 15 [40/65]: loss = 3.3464765548706055, lr = 0.000125
+2025-09-18 03:54:40 INFO     Epoch 15 [50/65]: loss = 3.2952542304992676, lr = 0.000125
+2025-09-18 03:54:40 INFO     Epoch 15 [50/65]: loss = 3.2952542304992676, lr = 0.000125
+2025-09-18 03:54:52 INFO     Epoch 15 [60/65]: loss = 3.399057626724243, lr = 0.000125
+2025-09-18 03:54:52 INFO     Epoch 15 [60/65]: loss = 3.399057626724243, lr = 0.000125
+2025-09-18 03:54:58 INFO     Epoch 16 [0/65]: loss = 3.422776699066162, lr = 0.000125
+2025-09-18 03:54:58 INFO     Epoch 16 [0/65]: loss = 3.422776699066162, lr = 0.000125
+2025-09-18 03:55:09 INFO     Epoch 16 [10/65]: loss = 3.3977980613708496, lr = 0.000125
+2025-09-18 03:55:09 INFO     Epoch 16 [10/65]: loss = 3.3977980613708496, lr = 0.000125
+2025-09-18 03:55:21 INFO     Epoch 16 [20/65]: loss = 3.3963489532470703, lr = 0.000125
+2025-09-18 03:55:21 INFO     Epoch 16 [20/65]: loss = 3.3963489532470703, lr = 0.000125
+2025-09-18 03:55:33 INFO     Epoch 16 [30/65]: loss = 3.3545031547546387, lr = 0.000125
+2025-09-18 03:55:33 INFO     Epoch 16 [30/65]: loss = 3.3545031547546387, lr = 0.000125
+2025-09-18 03:55:44 INFO     Epoch 16 [40/65]: loss = 3.43422269821167, lr = 0.000125
+2025-09-18 03:55:44 INFO     Epoch 16 [40/65]: loss = 3.43422269821167, lr = 0.000125
+2025-09-18 03:55:56 INFO     Epoch 16 [50/65]: loss = 3.3027777671813965, lr = 0.000125
+2025-09-18 03:55:56 INFO     Epoch 16 [50/65]: loss = 3.3027777671813965, lr = 0.000125
+2025-09-18 03:56:07 INFO     Epoch 16 [60/65]: loss = 3.423231601715088, lr = 0.000125
+2025-09-18 03:56:07 INFO     Epoch 16 [60/65]: loss = 3.423231601715088, lr = 0.000125
+2025-09-18 03:56:13 INFO     Epoch 17 [0/65]: loss = 3.461620807647705, lr = 0.000125
+2025-09-18 03:56:13 INFO     Epoch 17 [0/65]: loss = 3.461620807647705, lr = 0.000125
+2025-09-18 03:56:25 INFO     Epoch 17 [10/65]: loss = 3.361527919769287, lr = 0.000125
+2025-09-18 03:56:25 INFO     Epoch 17 [10/65]: loss = 3.361527919769287, lr = 0.000125
+2025-09-18 03:56:36 INFO     Epoch 17 [20/65]: loss = 3.3245413303375244, lr = 0.000125
+2025-09-18 03:56:36 INFO     Epoch 17 [20/65]: loss = 3.3245413303375244, lr = 0.000125
+2025-09-18 03:56:48 INFO     Epoch 17 [30/65]: loss = 3.264678716659546, lr = 0.000125
+2025-09-18 03:56:48 INFO     Epoch 17 [30/65]: loss = 3.264678716659546, lr = 0.000125
+2025-09-18 03:56:59 INFO     Epoch 17 [40/65]: loss = 3.3117709159851074, lr = 0.000125
+2025-09-18 03:56:59 INFO     Epoch 17 [40/65]: loss = 3.3117709159851074, lr = 0.000125
+2025-09-18 03:57:10 INFO     Epoch 17 [50/65]: loss = 3.404026508331299, lr = 0.000125
+2025-09-18 03:57:10 INFO     Epoch 17 [50/65]: loss = 3.404026508331299, lr = 0.000125
+2025-09-18 03:57:22 INFO     Epoch 17 [60/65]: loss = 3.3270955085754395, lr = 0.000125
+2025-09-18 03:57:22 INFO     Epoch 17 [60/65]: loss = 3.3270955085754395, lr = 0.000125
+2025-09-18 03:57:28 INFO     Epoch 18 [0/65]: loss = 3.2954702377319336, lr = 0.000125
+2025-09-18 03:57:28 INFO     Epoch 18 [0/65]: loss = 3.2954702377319336, lr = 0.000125
+2025-09-18 03:57:40 INFO     Epoch 18 [10/65]: loss = 3.3354411125183105, lr = 0.000125
+2025-09-18 03:57:40 INFO     Epoch 18 [10/65]: loss = 3.3354411125183105, lr = 0.000125
+2025-09-18 03:57:51 INFO     Epoch 18 [20/65]: loss = 3.232414960861206, lr = 0.000125
+2025-09-18 03:57:51 INFO     Epoch 18 [20/65]: loss = 3.232414960861206, lr = 0.000125
+2025-09-18 03:58:03 INFO     Epoch 18 [30/65]: loss = 3.3128814697265625, lr = 0.000125
+2025-09-18 03:58:03 INFO     Epoch 18 [30/65]: loss = 3.3128814697265625, lr = 0.000125
+2025-09-18 03:58:14 INFO     Epoch 18 [40/65]: loss = 3.3473031520843506, lr = 0.000125
+2025-09-18 03:58:14 INFO     Epoch 18 [40/65]: loss = 3.3473031520843506, lr = 0.000125
+2025-09-18 03:58:26 INFO     Epoch 18 [50/65]: loss = 3.3021786212921143, lr = 0.000125
+2025-09-18 03:58:26 INFO     Epoch 18 [50/65]: loss = 3.3021786212921143, lr = 0.000125
+2025-09-18 03:58:37 INFO     Epoch 18 [60/65]: loss = 3.2390689849853516, lr = 0.000125
+2025-09-18 03:58:37 INFO     Epoch 18 [60/65]: loss = 3.2390689849853516, lr = 0.000125
+2025-09-18 03:58:43 INFO     Epoch 19 [0/65]: loss = 3.3713274002075195, lr = 0.000125
+2025-09-18 03:58:43 INFO     Epoch 19 [0/65]: loss = 3.3713274002075195, lr = 0.000125
+2025-09-18 03:58:55 INFO     Epoch 19 [10/65]: loss = 3.398975372314453, lr = 0.000125
+2025-09-18 03:58:55 INFO     Epoch 19 [10/65]: loss = 3.398975372314453, lr = 0.000125
+2025-09-18 03:59:06 INFO     Epoch 19 [20/65]: loss = 3.254333972930908, lr = 0.000125
+2025-09-18 03:59:06 INFO     Epoch 19 [20/65]: loss = 3.254333972930908, lr = 0.000125
+2025-09-18 03:59:18 INFO     Epoch 19 [30/65]: loss = 3.291006088256836, lr = 0.000125
+2025-09-18 03:59:18 INFO     Epoch 19 [30/65]: loss = 3.291006088256836, lr = 0.000125
+2025-09-18 03:59:29 INFO     Epoch 19 [40/65]: loss = 3.32421875, lr = 0.000125
+2025-09-18 03:59:29 INFO     Epoch 19 [40/65]: loss = 3.32421875, lr = 0.000125
+2025-09-18 03:59:41 INFO     Epoch 19 [50/65]: loss = 3.333446502685547, lr = 0.000125
+2025-09-18 03:59:41 INFO     Epoch 19 [50/65]: loss = 3.333446502685547, lr = 0.000125
+2025-09-18 03:59:52 INFO     Epoch 19 [60/65]: loss = 3.2576870918273926, lr = 0.000125
+2025-09-18 03:59:52 INFO     Epoch 19 [60/65]: loss = 3.2576870918273926, lr = 0.000125
+2025-09-18 03:59:59 INFO     Epoch 20 [0/65]: loss = 3.342639207839966, lr = 0.000125
+2025-09-18 03:59:59 INFO     Epoch 20 [0/65]: loss = 3.342639207839966, lr = 0.000125
+2025-09-18 04:00:10 INFO     Epoch 20 [10/65]: loss = 3.316072940826416, lr = 0.000125
+2025-09-18 04:00:10 INFO     Epoch 20 [10/65]: loss = 3.316072940826416, lr = 0.000125
+2025-09-18 04:00:22 INFO     Epoch 20 [20/65]: loss = 3.34550142288208, lr = 0.000125
+2025-09-18 04:00:22 INFO     Epoch 20 [20/65]: loss = 3.34550142288208, lr = 0.000125
+2025-09-18 04:00:33 INFO     Epoch 20 [30/65]: loss = 3.3086748123168945, lr = 0.000125
+2025-09-18 04:00:33 INFO     Epoch 20 [30/65]: loss = 3.3086748123168945, lr = 0.000125
+2025-09-18 04:00:44 INFO     Epoch 20 [40/65]: loss = 3.1666922569274902, lr = 0.000125
+2025-09-18 04:00:44 INFO     Epoch 20 [40/65]: loss = 3.1666922569274902, lr = 0.000125
+2025-09-18 04:00:56 INFO     Epoch 20 [50/65]: loss = 3.2286081314086914, lr = 0.000125
+2025-09-18 04:00:56 INFO     Epoch 20 [50/65]: loss = 3.2286081314086914, lr = 0.000125
+2025-09-18 04:01:07 INFO     Epoch 20 [60/65]: loss = 3.313744068145752, lr = 0.000125
+2025-09-18 04:01:07 INFO     Epoch 20 [60/65]: loss = 3.313744068145752, lr = 0.000125
+2025-09-18 04:01:13 INFO     Epoch 21 [0/65]: loss = 3.3822505474090576, lr = 0.000125
+2025-09-18 04:01:13 INFO     Epoch 21 [0/65]: loss = 3.3822505474090576, lr = 0.000125
+2025-09-18 04:01:25 INFO     Epoch 21 [10/65]: loss = 3.3063974380493164, lr = 0.000125
+2025-09-18 04:01:25 INFO     Epoch 21 [10/65]: loss = 3.3063974380493164, lr = 0.000125
+2025-09-18 04:01:36 INFO     Epoch 21 [20/65]: loss = 3.266308307647705, lr = 0.000125
+2025-09-18 04:01:36 INFO     Epoch 21 [20/65]: loss = 3.266308307647705, lr = 0.000125
+2025-09-18 04:01:47 INFO     Epoch 21 [30/65]: loss = 3.2956433296203613, lr = 0.000125
+2025-09-18 04:01:47 INFO     Epoch 21 [30/65]: loss = 3.2956433296203613, lr = 0.000125
+2025-09-18 04:01:59 INFO     Epoch 21 [40/65]: loss = 3.324390411376953, lr = 0.000125
+2025-09-18 04:01:59 INFO     Epoch 21 [40/65]: loss = 3.324390411376953, lr = 0.000125
+2025-09-18 04:02:10 INFO     Epoch 21 [50/65]: loss = 3.337165355682373, lr = 0.000125
+2025-09-18 04:02:10 INFO     Epoch 21 [50/65]: loss = 3.337165355682373, lr = 0.000125
+2025-09-18 04:02:22 INFO     Epoch 21 [60/65]: loss = 3.333205223083496, lr = 0.000125
+2025-09-18 04:02:22 INFO     Epoch 21 [60/65]: loss = 3.333205223083496, lr = 0.000125
+2025-09-18 04:02:28 INFO     Epoch 22 [0/65]: loss = 3.3321285247802734, lr = 0.000125
+2025-09-18 04:02:28 INFO     Epoch 22 [0/65]: loss = 3.3321285247802734, lr = 0.000125
+2025-09-18 04:02:40 INFO     Epoch 22 [10/65]: loss = 3.2106757164001465, lr = 0.000125
+2025-09-18 04:02:40 INFO     Epoch 22 [10/65]: loss = 3.2106757164001465, lr = 0.000125
+2025-09-18 04:02:51 INFO     Epoch 22 [20/65]: loss = 3.3058974742889404, lr = 0.000125
+2025-09-18 04:02:51 INFO     Epoch 22 [20/65]: loss = 3.3058974742889404, lr = 0.000125
+2025-09-18 04:03:03 INFO     Epoch 22 [30/65]: loss = 3.295793056488037, lr = 0.000125
+2025-09-18 04:03:03 INFO     Epoch 22 [30/65]: loss = 3.295793056488037, lr = 0.000125
+2025-09-18 04:03:14 INFO     Epoch 22 [40/65]: loss = 3.3700971603393555, lr = 0.000125
+2025-09-18 04:03:14 INFO     Epoch 22 [40/65]: loss = 3.3700971603393555, lr = 0.000125
+2025-09-18 04:03:26 INFO     Epoch 22 [50/65]: loss = 3.2541017532348633, lr = 0.000125
+2025-09-18 04:03:26 INFO     Epoch 22 [50/65]: loss = 3.2541017532348633, lr = 0.000125
+2025-09-18 04:03:37 INFO     Epoch 22 [60/65]: loss = 3.2805633544921875, lr = 0.000125
+2025-09-18 04:03:37 INFO     Epoch 22 [60/65]: loss = 3.2805633544921875, lr = 0.000125
+2025-09-18 04:03:44 INFO     Epoch 23 [0/65]: loss = 3.3454623222351074, lr = 0.000125
+2025-09-18 04:03:44 INFO     Epoch 23 [0/65]: loss = 3.3454623222351074, lr = 0.000125
+2025-09-18 04:03:55 INFO     Epoch 23 [10/65]: loss = 3.1520912647247314, lr = 0.000125
+2025-09-18 04:03:55 INFO     Epoch 23 [10/65]: loss = 3.1520912647247314, lr = 0.000125
+2025-09-18 04:04:07 INFO     Epoch 23 [20/65]: loss = 3.336996555328369, lr = 0.000125
+2025-09-18 04:04:07 INFO     Epoch 23 [20/65]: loss = 3.336996555328369, lr = 0.000125
+2025-09-18 04:04:18 INFO     Epoch 23 [30/65]: loss = 3.3474183082580566, lr = 0.000125
+2025-09-18 04:04:18 INFO     Epoch 23 [30/65]: loss = 3.3474183082580566, lr = 0.000125
+2025-09-18 04:04:29 INFO     Epoch 23 [40/65]: loss = 3.403503656387329, lr = 0.000125
+2025-09-18 04:04:29 INFO     Epoch 23 [40/65]: loss = 3.403503656387329, lr = 0.000125
+2025-09-18 04:04:41 INFO     Epoch 23 [50/65]: loss = 3.2304811477661133, lr = 0.000125
+2025-09-18 04:04:41 INFO     Epoch 23 [50/65]: loss = 3.2304811477661133, lr = 0.000125
+2025-09-18 04:04:52 INFO     Epoch 23 [60/65]: loss = 3.2522201538085938, lr = 0.000125
+2025-09-18 04:04:52 INFO     Epoch 23 [60/65]: loss = 3.2522201538085938, lr = 0.000125
+2025-09-18 04:04:58 INFO     Epoch 24 [0/65]: loss = 3.29510498046875, lr = 0.000125
+2025-09-18 04:04:58 INFO     Epoch 24 [0/65]: loss = 3.29510498046875, lr = 0.000125
+2025-09-18 04:05:10 INFO     Epoch 24 [10/65]: loss = 3.26954984664917, lr = 0.000125
+2025-09-18 04:05:10 INFO     Epoch 24 [10/65]: loss = 3.26954984664917, lr = 0.000125
+2025-09-18 04:05:21 INFO     Epoch 24 [20/65]: loss = 3.3148193359375, lr = 0.000125
+2025-09-18 04:05:21 INFO     Epoch 24 [20/65]: loss = 3.3148193359375, lr = 0.000125
+2025-09-18 04:05:33 INFO     Epoch 24 [30/65]: loss = 3.228606939315796, lr = 0.000125
+2025-09-18 04:05:33 INFO     Epoch 24 [30/65]: loss = 3.228606939315796, lr = 0.000125
+2025-09-18 04:05:44 INFO     Epoch 24 [40/65]: loss = 3.350770950317383, lr = 0.000125
+2025-09-18 04:05:44 INFO     Epoch 24 [40/65]: loss = 3.350770950317383, lr = 0.000125
+2025-09-18 04:05:56 INFO     Epoch 24 [50/65]: loss = 3.3262486457824707, lr = 0.000125
+2025-09-18 04:05:56 INFO     Epoch 24 [50/65]: loss = 3.3262486457824707, lr = 0.000125
+2025-09-18 04:06:07 INFO     Epoch 24 [60/65]: loss = 3.224440574645996, lr = 0.000125
+2025-09-18 04:06:07 INFO     Epoch 24 [60/65]: loss = 3.224440574645996, lr = 0.000125
+2025-09-18 04:06:13 INFO     Epoch 25 [0/65]: loss = 3.22743558883667, lr = 0.000125
+2025-09-18 04:06:13 INFO     Epoch 25 [0/65]: loss = 3.22743558883667, lr = 0.000125
+2025-09-18 04:06:25 INFO     Epoch 25 [10/65]: loss = 3.377357244491577, lr = 0.000125
+2025-09-18 04:06:25 INFO     Epoch 25 [10/65]: loss = 3.377357244491577, lr = 0.000125
+2025-09-18 04:06:36 INFO     Epoch 25 [20/65]: loss = 3.240600109100342, lr = 0.000125
+2025-09-18 04:06:36 INFO     Epoch 25 [20/65]: loss = 3.240600109100342, lr = 0.000125
+2025-09-18 04:06:48 INFO     Epoch 25 [30/65]: loss = 3.2183032035827637, lr = 0.000125
+2025-09-18 04:06:48 INFO     Epoch 25 [30/65]: loss = 3.2183032035827637, lr = 0.000125
+2025-09-18 04:06:59 INFO     Epoch 25 [40/65]: loss = 3.253800868988037, lr = 0.000125
+2025-09-18 04:06:59 INFO     Epoch 25 [40/65]: loss = 3.253800868988037, lr = 0.000125
+2025-09-18 04:07:11 INFO     Epoch 25 [50/65]: loss = 3.306964874267578, lr = 0.000125
+2025-09-18 04:07:11 INFO     Epoch 25 [50/65]: loss = 3.306964874267578, lr = 0.000125
+2025-09-18 04:07:22 INFO     Epoch 25 [60/65]: loss = 3.2833235263824463, lr = 0.000125
+2025-09-18 04:07:22 INFO     Epoch 25 [60/65]: loss = 3.2833235263824463, lr = 0.000125
+2025-09-18 04:07:29 INFO     Epoch 26 [0/65]: loss = 3.2265677452087402, lr = 0.000125
+2025-09-18 04:07:29 INFO     Epoch 26 [0/65]: loss = 3.2265677452087402, lr = 0.000125
+2025-09-18 04:07:40 INFO     Epoch 26 [10/65]: loss = 3.3167684078216553, lr = 0.000125
+2025-09-18 04:07:40 INFO     Epoch 26 [10/65]: loss = 3.3167684078216553, lr = 0.000125
+2025-09-18 04:07:52 INFO     Epoch 26 [20/65]: loss = 3.244748115539551, lr = 0.000125
+2025-09-18 04:07:52 INFO     Epoch 26 [20/65]: loss = 3.244748115539551, lr = 0.000125
+2025-09-18 04:08:03 INFO     Epoch 26 [30/65]: loss = 3.1714959144592285, lr = 0.000125
+2025-09-18 04:08:03 INFO     Epoch 26 [30/65]: loss = 3.1714959144592285, lr = 0.000125
+2025-09-18 04:08:14 INFO     Epoch 26 [40/65]: loss = 3.1623895168304443, lr = 0.000125
+2025-09-18 04:08:14 INFO     Epoch 26 [40/65]: loss = 3.1623895168304443, lr = 0.000125
+2025-09-18 04:08:26 INFO     Epoch 26 [50/65]: loss = 3.247488021850586, lr = 0.000125
+2025-09-18 04:08:26 INFO     Epoch 26 [50/65]: loss = 3.247488021850586, lr = 0.000125
+2025-09-18 04:08:37 INFO     Epoch 26 [60/65]: loss = 3.3009142875671387, lr = 0.000125
+2025-09-18 04:08:37 INFO     Epoch 26 [60/65]: loss = 3.3009142875671387, lr = 0.000125
+2025-09-18 04:08:43 INFO     Epoch 27 [0/65]: loss = 3.26729679107666, lr = 0.000125
+2025-09-18 04:08:43 INFO     Epoch 27 [0/65]: loss = 3.26729679107666, lr = 0.000125
+2025-09-18 04:08:55 INFO     Epoch 27 [10/65]: loss = 3.3170318603515625, lr = 0.000125
+2025-09-18 04:08:55 INFO     Epoch 27 [10/65]: loss = 3.3170318603515625, lr = 0.000125
+2025-09-18 04:09:06 INFO     Epoch 27 [20/65]: loss = 3.252828598022461, lr = 0.000125
+2025-09-18 04:09:06 INFO     Epoch 27 [20/65]: loss = 3.252828598022461, lr = 0.000125
+2025-09-18 04:09:18 INFO     Epoch 27 [30/65]: loss = 3.2021353244781494, lr = 0.000125
+2025-09-18 04:09:18 INFO     Epoch 27 [30/65]: loss = 3.2021353244781494, lr = 0.000125
+2025-09-18 04:09:29 INFO     Epoch 27 [40/65]: loss = 3.3747940063476562, lr = 0.000125
+2025-09-18 04:09:29 INFO     Epoch 27 [40/65]: loss = 3.3747940063476562, lr = 0.000125
+2025-09-18 04:09:41 INFO     Epoch 27 [50/65]: loss = 3.177595376968384, lr = 0.000125
+2025-09-18 04:09:41 INFO     Epoch 27 [50/65]: loss = 3.177595376968384, lr = 0.000125
+2025-09-18 04:09:52 INFO     Epoch 27 [60/65]: loss = 3.3117470741271973, lr = 0.000125
+2025-09-18 04:09:52 INFO     Epoch 27 [60/65]: loss = 3.3117470741271973, lr = 0.000125
+2025-09-18 04:09:59 INFO     Epoch 28 [0/65]: loss = 3.2934579849243164, lr = 0.000125
+2025-09-18 04:09:59 INFO     Epoch 28 [0/65]: loss = 3.2934579849243164, lr = 0.000125
+2025-09-18 04:10:10 INFO     Epoch 28 [10/65]: loss = 3.2430622577667236, lr = 0.000125
+2025-09-18 04:10:10 INFO     Epoch 28 [10/65]: loss = 3.2430622577667236, lr = 0.000125
+2025-09-18 04:10:22 INFO     Epoch 28 [20/65]: loss = 3.2369251251220703, lr = 0.000125
+2025-09-18 04:10:22 INFO     Epoch 28 [20/65]: loss = 3.2369251251220703, lr = 0.000125
+2025-09-18 04:10:33 INFO     Epoch 28 [30/65]: loss = 3.231397867202759, lr = 0.000125
+2025-09-18 04:10:33 INFO     Epoch 28 [30/65]: loss = 3.231397867202759, lr = 0.000125
+2025-09-18 04:10:45 INFO     Epoch 28 [40/65]: loss = 3.2043216228485107, lr = 0.000125
+2025-09-18 04:10:45 INFO     Epoch 28 [40/65]: loss = 3.2043216228485107, lr = 0.000125
+2025-09-18 04:10:56 INFO     Epoch 28 [50/65]: loss = 3.269101619720459, lr = 0.000125
+2025-09-18 04:10:56 INFO     Epoch 28 [50/65]: loss = 3.269101619720459, lr = 0.000125
+2025-09-18 04:11:08 INFO     Epoch 28 [60/65]: loss = 3.2846932411193848, lr = 0.000125
+2025-09-18 04:11:08 INFO     Epoch 28 [60/65]: loss = 3.2846932411193848, lr = 0.000125
+2025-09-18 04:11:14 INFO     Epoch 29 [0/65]: loss = 3.122375965118408, lr = 0.000125
+2025-09-18 04:11:14 INFO     Epoch 29 [0/65]: loss = 3.122375965118408, lr = 0.000125
+2025-09-18 04:11:26 INFO     Epoch 29 [10/65]: loss = 3.408529281616211, lr = 0.000125
+2025-09-18 04:11:26 INFO     Epoch 29 [10/65]: loss = 3.408529281616211, lr = 0.000125
+2025-09-18 04:11:37 INFO     Epoch 29 [20/65]: loss = 3.2903892993927, lr = 0.000125
+2025-09-18 04:11:37 INFO     Epoch 29 [20/65]: loss = 3.2903892993927, lr = 0.000125
+2025-09-18 04:11:49 INFO     Epoch 29 [30/65]: loss = 3.257497787475586, lr = 0.000125
+2025-09-18 04:11:49 INFO     Epoch 29 [30/65]: loss = 3.257497787475586, lr = 0.000125
+2025-09-18 04:12:00 INFO     Epoch 29 [40/65]: loss = 3.2152271270751953, lr = 0.000125
+2025-09-18 04:12:00 INFO     Epoch 29 [40/65]: loss = 3.2152271270751953, lr = 0.000125
+2025-09-18 04:12:12 INFO     Epoch 29 [50/65]: loss = 3.2631173133850098, lr = 0.000125
+2025-09-18 04:12:12 INFO     Epoch 29 [50/65]: loss = 3.2631173133850098, lr = 0.000125
+2025-09-18 04:12:23 INFO     Epoch 29 [60/65]: loss = 3.283259391784668, lr = 0.000125
+2025-09-18 04:12:23 INFO     Epoch 29 [60/65]: loss = 3.283259391784668, lr = 0.000125
+2025-09-18 04:12:30 INFO     Epoch 30 [0/65]: loss = 3.1827757358551025, lr = 0.000125
+2025-09-18 04:12:30 INFO     Epoch 30 [0/65]: loss = 3.1827757358551025, lr = 0.000125
+2025-09-18 04:12:41 INFO     Epoch 30 [10/65]: loss = 3.3133182525634766, lr = 0.000125
+2025-09-18 04:12:41 INFO     Epoch 30 [10/65]: loss = 3.3133182525634766, lr = 0.000125
+2025-09-18 04:12:53 INFO     Epoch 30 [20/65]: loss = 3.184187173843384, lr = 0.000125
+2025-09-18 04:12:53 INFO     Epoch 30 [20/65]: loss = 3.184187173843384, lr = 0.000125
+2025-09-18 04:13:04 INFO     Epoch 30 [30/65]: loss = 3.165989398956299, lr = 0.000125
+2025-09-18 04:13:04 INFO     Epoch 30 [30/65]: loss = 3.165989398956299, lr = 0.000125
+2025-09-18 04:13:16 INFO     Epoch 30 [40/65]: loss = 3.1648402214050293, lr = 0.000125
+2025-09-18 04:13:16 INFO     Epoch 30 [40/65]: loss = 3.1648402214050293, lr = 0.000125
+2025-09-18 04:13:27 INFO     Epoch 30 [50/65]: loss = 3.3478317260742188, lr = 0.000125
+2025-09-18 04:13:27 INFO     Epoch 30 [50/65]: loss = 3.3478317260742188, lr = 0.000125
+2025-09-18 04:13:39 INFO     Epoch 30 [60/65]: loss = 3.147219181060791, lr = 0.000125
+2025-09-18 04:13:39 INFO     Epoch 30 [60/65]: loss = 3.147219181060791, lr = 0.000125
+2025-09-18 04:13:45 INFO     Epoch 31 [0/65]: loss = 3.2560501098632812, lr = 0.000125
+2025-09-18 04:13:45 INFO     Epoch 31 [0/65]: loss = 3.2560501098632812, lr = 0.000125
+2025-09-18 04:13:56 INFO     Epoch 31 [10/65]: loss = 3.215038776397705, lr = 0.000125
+2025-09-18 04:13:56 INFO     Epoch 31 [10/65]: loss = 3.215038776397705, lr = 0.000125
+2025-09-18 04:14:08 INFO     Epoch 31 [20/65]: loss = 3.256049633026123, lr = 0.000125
+2025-09-18 04:14:08 INFO     Epoch 31 [20/65]: loss = 3.256049633026123, lr = 0.000125
+2025-09-18 04:14:19 INFO     Epoch 31 [30/65]: loss = 3.2275588512420654, lr = 0.000125
+2025-09-18 04:14:19 INFO     Epoch 31 [30/65]: loss = 3.2275588512420654, lr = 0.000125
+2025-09-18 04:14:31 INFO     Epoch 31 [40/65]: loss = 3.2333290576934814, lr = 0.000125
+2025-09-18 04:14:31 INFO     Epoch 31 [40/65]: loss = 3.2333290576934814, lr = 0.000125
+2025-09-18 04:14:42 INFO     Epoch 31 [50/65]: loss = 3.1480093002319336, lr = 0.000125
+2025-09-18 04:14:42 INFO     Epoch 31 [50/65]: loss = 3.1480093002319336, lr = 0.000125
+2025-09-18 04:14:53 INFO     Epoch 31 [60/65]: loss = 3.268104076385498, lr = 0.000125
+2025-09-18 04:14:53 INFO     Epoch 31 [60/65]: loss = 3.268104076385498, lr = 0.000125
+2025-09-18 04:15:00 INFO     Epoch 32 [0/65]: loss = 3.128909111022949, lr = 0.000125
+2025-09-18 04:15:00 INFO     Epoch 32 [0/65]: loss = 3.128909111022949, lr = 0.000125
+2025-09-18 04:15:11 INFO     Epoch 32 [10/65]: loss = 3.181903839111328, lr = 0.000125
+2025-09-18 04:15:11 INFO     Epoch 32 [10/65]: loss = 3.181903839111328, lr = 0.000125
+2025-09-18 04:15:23 INFO     Epoch 32 [20/65]: loss = 3.3198862075805664, lr = 0.000125
+2025-09-18 04:15:23 INFO     Epoch 32 [20/65]: loss = 3.3198862075805664, lr = 0.000125
+2025-09-18 04:15:34 INFO     Epoch 32 [30/65]: loss = 3.18546462059021, lr = 0.000125
+2025-09-18 04:15:34 INFO     Epoch 32 [30/65]: loss = 3.18546462059021, lr = 0.000125
+2025-09-18 04:15:46 INFO     Epoch 32 [40/65]: loss = 3.2750136852264404, lr = 0.000125
+2025-09-18 04:15:46 INFO     Epoch 32 [40/65]: loss = 3.2750136852264404, lr = 0.000125
+2025-09-18 04:15:57 INFO     Epoch 32 [50/65]: loss = 3.293938159942627, lr = 0.000125
+2025-09-18 04:15:57 INFO     Epoch 32 [50/65]: loss = 3.293938159942627, lr = 0.000125
+2025-09-18 04:16:09 INFO     Epoch 32 [60/65]: loss = 3.1297059059143066, lr = 0.000125
+2025-09-18 04:16:09 INFO     Epoch 32 [60/65]: loss = 3.1297059059143066, lr = 0.000125
+2025-09-18 04:16:15 INFO     Epoch 33 [0/65]: loss = 3.222170352935791, lr = 0.000125
+2025-09-18 04:16:15 INFO     Epoch 33 [0/65]: loss = 3.222170352935791, lr = 0.000125
+2025-09-18 04:16:27 INFO     Epoch 33 [10/65]: loss = 3.2569198608398438, lr = 0.000125
+2025-09-18 04:16:27 INFO     Epoch 33 [10/65]: loss = 3.2569198608398438, lr = 0.000125
+2025-09-18 04:16:38 INFO     Epoch 33 [20/65]: loss = 3.270301342010498, lr = 0.000125
+2025-09-18 04:16:38 INFO     Epoch 33 [20/65]: loss = 3.270301342010498, lr = 0.000125
+2025-09-18 04:16:49 INFO     Epoch 33 [30/65]: loss = 3.1715428829193115, lr = 0.000125
+2025-09-18 04:16:49 INFO     Epoch 33 [30/65]: loss = 3.1715428829193115, lr = 0.000125
+2025-09-18 04:17:01 INFO     Epoch 33 [40/65]: loss = 3.2100412845611572, lr = 0.000125
+2025-09-18 04:17:01 INFO     Epoch 33 [40/65]: loss = 3.2100412845611572, lr = 0.000125
+2025-09-18 04:17:12 INFO     Epoch 33 [50/65]: loss = 3.263467311859131, lr = 0.000125
+2025-09-18 04:17:12 INFO     Epoch 33 [50/65]: loss = 3.263467311859131, lr = 0.000125
+2025-09-18 04:17:23 INFO     Epoch 33 [60/65]: loss = 3.1437935829162598, lr = 0.000125
+2025-09-18 04:17:23 INFO     Epoch 33 [60/65]: loss = 3.1437935829162598, lr = 0.000125
+2025-09-18 04:17:29 INFO     Epoch 34 [0/65]: loss = 3.240112781524658, lr = 0.000125
+2025-09-18 04:17:29 INFO     Epoch 34 [0/65]: loss = 3.240112781524658, lr = 0.000125
+2025-09-18 04:17:41 INFO     Epoch 34 [10/65]: loss = 3.2003936767578125, lr = 0.000125
+2025-09-18 04:17:41 INFO     Epoch 34 [10/65]: loss = 3.2003936767578125, lr = 0.000125
+2025-09-18 04:17:52 INFO     Epoch 34 [20/65]: loss = 3.2383227348327637, lr = 0.000125
+2025-09-18 04:17:52 INFO     Epoch 34 [20/65]: loss = 3.2383227348327637, lr = 0.000125
+2025-09-18 04:18:04 INFO     Epoch 34 [30/65]: loss = 3.2199816703796387, lr = 0.000125
+2025-09-18 04:18:04 INFO     Epoch 34 [30/65]: loss = 3.2199816703796387, lr = 0.000125
+2025-09-18 04:18:15 INFO     Epoch 34 [40/65]: loss = 3.1352035999298096, lr = 0.000125
+2025-09-18 04:18:15 INFO     Epoch 34 [40/65]: loss = 3.1352035999298096, lr = 0.000125
+2025-09-18 04:18:27 INFO     Epoch 34 [50/65]: loss = 3.145872116088867, lr = 0.000125
+2025-09-18 04:18:27 INFO     Epoch 34 [50/65]: loss = 3.145872116088867, lr = 0.000125
+2025-09-18 04:18:38 INFO     Epoch 34 [60/65]: loss = 3.1499500274658203, lr = 0.000125
+2025-09-18 04:18:38 INFO     Epoch 34 [60/65]: loss = 3.1499500274658203, lr = 0.000125
+2025-09-18 04:18:45 INFO     Epoch 35 [0/65]: loss = 3.1593639850616455, lr = 0.000125
+2025-09-18 04:18:45 INFO     Epoch 35 [0/65]: loss = 3.1593639850616455, lr = 0.000125
+2025-09-18 04:18:56 INFO     Epoch 35 [10/65]: loss = 3.116213798522949, lr = 0.000125
+2025-09-18 04:18:56 INFO     Epoch 35 [10/65]: loss = 3.116213798522949, lr = 0.000125
+2025-09-18 04:19:08 INFO     Epoch 35 [20/65]: loss = 3.207761287689209, lr = 0.000125
+2025-09-18 04:19:08 INFO     Epoch 35 [20/65]: loss = 3.207761287689209, lr = 0.000125
+2025-09-18 04:19:19 INFO     Epoch 35 [30/65]: loss = 3.187251567840576, lr = 0.000125
+2025-09-18 04:19:19 INFO     Epoch 35 [30/65]: loss = 3.187251567840576, lr = 0.000125
+2025-09-18 04:19:31 INFO     Epoch 35 [40/65]: loss = 3.3049535751342773, lr = 0.000125
+2025-09-18 04:19:31 INFO     Epoch 35 [40/65]: loss = 3.3049535751342773, lr = 0.000125
+2025-09-18 04:19:42 INFO     Epoch 35 [50/65]: loss = 3.169025421142578, lr = 0.000125
+2025-09-18 04:19:42 INFO     Epoch 35 [50/65]: loss = 3.169025421142578, lr = 0.000125
+2025-09-18 04:19:54 INFO     Epoch 35 [60/65]: loss = 3.1061763763427734, lr = 0.000125
+2025-09-18 04:19:54 INFO     Epoch 35 [60/65]: loss = 3.1061763763427734, lr = 0.000125
+2025-09-18 04:20:00 INFO     Epoch 36 [0/65]: loss = 3.2042431831359863, lr = 0.000125
+2025-09-18 04:20:00 INFO     Epoch 36 [0/65]: loss = 3.2042431831359863, lr = 0.000125
+2025-09-18 04:20:11 INFO     Epoch 36 [10/65]: loss = 3.200603485107422, lr = 0.000125
+2025-09-18 04:20:11 INFO     Epoch 36 [10/65]: loss = 3.200603485107422, lr = 0.000125
+2025-09-18 04:20:23 INFO     Epoch 36 [20/65]: loss = 3.266726493835449, lr = 0.000125
+2025-09-18 04:20:23 INFO     Epoch 36 [20/65]: loss = 3.266726493835449, lr = 0.000125
+2025-09-18 04:20:34 INFO     Epoch 36 [30/65]: loss = 3.133333206176758, lr = 0.000125
+2025-09-18 04:20:34 INFO     Epoch 36 [30/65]: loss = 3.133333206176758, lr = 0.000125
+2025-09-18 04:20:46 INFO     Epoch 36 [40/65]: loss = 3.227670907974243, lr = 0.000125
+2025-09-18 04:20:46 INFO     Epoch 36 [40/65]: loss = 3.227670907974243, lr = 0.000125
+2025-09-18 04:20:57 INFO     Epoch 36 [50/65]: loss = 3.2919254302978516, lr = 0.000125
+2025-09-18 04:20:57 INFO     Epoch 36 [50/65]: loss = 3.2919254302978516, lr = 0.000125
+2025-09-18 04:21:09 INFO     Epoch 36 [60/65]: loss = 3.211512327194214, lr = 0.000125
+2025-09-18 04:21:09 INFO     Epoch 36 [60/65]: loss = 3.211512327194214, lr = 0.000125
+2025-09-18 04:21:15 INFO     Epoch 37 [0/65]: loss = 3.208991289138794, lr = 0.000125
+2025-09-18 04:21:15 INFO     Epoch 37 [0/65]: loss = 3.208991289138794, lr = 0.000125
+2025-09-18 04:21:27 INFO     Epoch 37 [10/65]: loss = 3.157485008239746, lr = 0.000125
+2025-09-18 04:21:27 INFO     Epoch 37 [10/65]: loss = 3.157485008239746, lr = 0.000125
+2025-09-18 04:21:38 INFO     Epoch 37 [20/65]: loss = 3.2651143074035645, lr = 0.000125
+2025-09-18 04:21:38 INFO     Epoch 37 [20/65]: loss = 3.2651143074035645, lr = 0.000125
+2025-09-18 04:21:50 INFO     Epoch 37 [30/65]: loss = 3.1402359008789062, lr = 0.000125
+2025-09-18 04:21:50 INFO     Epoch 37 [30/65]: loss = 3.1402359008789062, lr = 0.000125
+2025-09-18 04:22:01 INFO     Epoch 37 [40/65]: loss = 3.122832775115967, lr = 0.000125
+2025-09-18 04:22:01 INFO     Epoch 37 [40/65]: loss = 3.122832775115967, lr = 0.000125
+2025-09-18 04:22:13 INFO     Epoch 37 [50/65]: loss = 3.1807141304016113, lr = 0.000125
+2025-09-18 04:22:13 INFO     Epoch 37 [50/65]: loss = 3.1807141304016113, lr = 0.000125
+2025-09-18 04:22:24 INFO     Epoch 37 [60/65]: loss = 3.043778896331787, lr = 0.000125
+2025-09-18 04:22:24 INFO     Epoch 37 [60/65]: loss = 3.043778896331787, lr = 0.000125
+2025-09-18 04:22:31 INFO     Epoch 38 [0/65]: loss = 3.265855312347412, lr = 0.000125
+2025-09-18 04:22:31 INFO     Epoch 38 [0/65]: loss = 3.265855312347412, lr = 0.000125
+2025-09-18 04:22:42 INFO     Epoch 38 [10/65]: loss = 3.2136359214782715, lr = 0.000125
+2025-09-18 04:22:42 INFO     Epoch 38 [10/65]: loss = 3.2136359214782715, lr = 0.000125
+2025-09-18 04:22:54 INFO     Epoch 38 [20/65]: loss = 3.216686725616455, lr = 0.000125
+2025-09-18 04:22:54 INFO     Epoch 38 [20/65]: loss = 3.216686725616455, lr = 0.000125
+2025-09-18 04:23:05 INFO     Epoch 38 [30/65]: loss = 3.2353389263153076, lr = 0.000125
+2025-09-18 04:23:05 INFO     Epoch 38 [30/65]: loss = 3.2353389263153076, lr = 0.000125
+2025-09-18 04:23:17 INFO     Epoch 38 [40/65]: loss = 3.1250555515289307, lr = 0.000125
+2025-09-18 04:23:17 INFO     Epoch 38 [40/65]: loss = 3.1250555515289307, lr = 0.000125
+2025-09-18 04:23:28 INFO     Epoch 38 [50/65]: loss = 3.1762704849243164, lr = 0.000125
+2025-09-18 04:23:28 INFO     Epoch 38 [50/65]: loss = 3.1762704849243164, lr = 0.000125
+2025-09-18 04:23:39 INFO     Epoch 38 [60/65]: loss = 3.207380771636963, lr = 0.000125
+2025-09-18 04:23:39 INFO     Epoch 38 [60/65]: loss = 3.207380771636963, lr = 0.000125
+2025-09-18 04:23:46 INFO     Epoch 39 [0/65]: loss = 3.0682337284088135, lr = 0.000125
+2025-09-18 04:23:46 INFO     Epoch 39 [0/65]: loss = 3.0682337284088135, lr = 0.000125
+2025-09-18 04:23:57 INFO     Epoch 39 [10/65]: loss = 3.16269588470459, lr = 0.000125
+2025-09-18 04:23:57 INFO     Epoch 39 [10/65]: loss = 3.16269588470459, lr = 0.000125
+2025-09-18 04:24:09 INFO     Epoch 39 [20/65]: loss = 3.184030055999756, lr = 0.000125
+2025-09-18 04:24:09 INFO     Epoch 39 [20/65]: loss = 3.184030055999756, lr = 0.000125
+2025-09-18 04:24:20 INFO     Epoch 39 [30/65]: loss = 3.15557861328125, lr = 0.000125
+2025-09-18 04:24:20 INFO     Epoch 39 [30/65]: loss = 3.15557861328125, lr = 0.000125
+2025-09-18 04:24:32 INFO     Epoch 39 [40/65]: loss = 3.099374294281006, lr = 0.000125
+2025-09-18 04:24:32 INFO     Epoch 39 [40/65]: loss = 3.099374294281006, lr = 0.000125
+2025-09-18 04:24:43 INFO     Epoch 39 [50/65]: loss = 3.155184745788574, lr = 0.000125
+2025-09-18 04:24:43 INFO     Epoch 39 [50/65]: loss = 3.155184745788574, lr = 0.000125
+2025-09-18 04:24:55 INFO     Epoch 39 [60/65]: loss = 3.146512031555176, lr = 0.000125
+2025-09-18 04:24:55 INFO     Epoch 39 [60/65]: loss = 3.146512031555176, lr = 0.000125
+2025-09-18 04:25:01 INFO     Epoch 40 [0/65]: loss = 3.1894283294677734, lr = 0.000125
+2025-09-18 04:25:01 INFO     Epoch 40 [0/65]: loss = 3.1894283294677734, lr = 0.000125
+2025-09-18 04:25:13 INFO     Epoch 40 [10/65]: loss = 3.1815571784973145, lr = 0.000125
+2025-09-18 04:25:13 INFO     Epoch 40 [10/65]: loss = 3.1815571784973145, lr = 0.000125
+2025-09-18 04:25:24 INFO     Epoch 40 [20/65]: loss = 3.1660404205322266, lr = 0.000125
+2025-09-18 04:25:24 INFO     Epoch 40 [20/65]: loss = 3.1660404205322266, lr = 0.000125
+2025-09-18 04:25:36 INFO     Epoch 40 [30/65]: loss = 3.1370108127593994, lr = 0.000125
+2025-09-18 04:25:36 INFO     Epoch 40 [30/65]: loss = 3.1370108127593994, lr = 0.000125
+2025-09-18 04:25:47 INFO     Epoch 40 [40/65]: loss = 3.1861143112182617, lr = 0.000125
+2025-09-18 04:25:47 INFO     Epoch 40 [40/65]: loss = 3.1861143112182617, lr = 0.000125
+2025-09-18 04:25:59 INFO     Epoch 40 [50/65]: loss = 3.132793426513672, lr = 0.000125
+2025-09-18 04:25:59 INFO     Epoch 40 [50/65]: loss = 3.132793426513672, lr = 0.000125
+2025-09-18 04:26:10 INFO     Epoch 40 [60/65]: loss = 3.2412285804748535, lr = 0.000125
+2025-09-18 04:26:10 INFO     Epoch 40 [60/65]: loss = 3.2412285804748535, lr = 0.000125
+2025-09-18 04:26:17 INFO     Epoch 41 [0/65]: loss = 3.177091121673584, lr = 0.000125
+2025-09-18 04:26:17 INFO     Epoch 41 [0/65]: loss = 3.177091121673584, lr = 0.000125
+2025-09-18 04:26:28 INFO     Epoch 41 [10/65]: loss = 3.152395248413086, lr = 0.000125
+2025-09-18 04:26:28 INFO     Epoch 41 [10/65]: loss = 3.152395248413086, lr = 0.000125
+2025-09-18 04:26:39 INFO     Epoch 41 [20/65]: loss = 3.2489936351776123, lr = 0.000125
+2025-09-18 04:26:39 INFO     Epoch 41 [20/65]: loss = 3.2489936351776123, lr = 0.000125
+2025-09-18 04:26:51 INFO     Epoch 41 [30/65]: loss = 3.189453125, lr = 0.000125
+2025-09-18 04:26:51 INFO     Epoch 41 [30/65]: loss = 3.189453125, lr = 0.000125
+2025-09-18 04:27:02 INFO     Epoch 41 [40/65]: loss = 3.08711576461792, lr = 0.000125
+2025-09-18 04:27:02 INFO     Epoch 41 [40/65]: loss = 3.08711576461792, lr = 0.000125
+2025-09-18 04:27:13 INFO     Epoch 41 [50/65]: loss = 3.1745247840881348, lr = 0.000125
+2025-09-18 04:27:13 INFO     Epoch 41 [50/65]: loss = 3.1745247840881348, lr = 0.000125
+2025-09-18 04:27:25 INFO     Epoch 41 [60/65]: loss = 3.2126359939575195, lr = 0.000125
+2025-09-18 04:27:25 INFO     Epoch 41 [60/65]: loss = 3.2126359939575195, lr = 0.000125
+2025-09-18 04:27:31 INFO     Epoch 42 [0/65]: loss = 3.160033702850342, lr = 0.000125
+2025-09-18 04:27:31 INFO     Epoch 42 [0/65]: loss = 3.160033702850342, lr = 0.000125
+2025-09-18 04:27:43 INFO     Epoch 42 [10/65]: loss = 3.0571465492248535, lr = 0.000125
+2025-09-18 04:27:43 INFO     Epoch 42 [10/65]: loss = 3.0571465492248535, lr = 0.000125
+2025-09-18 04:27:54 INFO     Epoch 42 [20/65]: loss = 3.2319464683532715, lr = 0.000125
+2025-09-18 04:27:54 INFO     Epoch 42 [20/65]: loss = 3.2319464683532715, lr = 0.000125
+2025-09-18 04:28:05 INFO     Epoch 42 [30/65]: loss = 3.2114484310150146, lr = 0.000125
+2025-09-18 04:28:05 INFO     Epoch 42 [30/65]: loss = 3.2114484310150146, lr = 0.000125
+2025-09-18 04:28:17 INFO     Epoch 42 [40/65]: loss = 3.155968189239502, lr = 0.000125
+2025-09-18 04:28:17 INFO     Epoch 42 [40/65]: loss = 3.155968189239502, lr = 0.000125
+2025-09-18 04:28:28 INFO     Epoch 42 [50/65]: loss = 3.1669492721557617, lr = 0.000125
+2025-09-18 04:28:28 INFO     Epoch 42 [50/65]: loss = 3.1669492721557617, lr = 0.000125
+2025-09-18 04:28:40 INFO     Epoch 42 [60/65]: loss = 3.196406841278076, lr = 0.000125
+2025-09-18 04:28:40 INFO     Epoch 42 [60/65]: loss = 3.196406841278076, lr = 0.000125
+2025-09-18 04:28:46 INFO     Epoch 43 [0/65]: loss = 3.2140555381774902, lr = 0.000125
+2025-09-18 04:28:46 INFO     Epoch 43 [0/65]: loss = 3.2140555381774902, lr = 0.000125
+2025-09-18 04:28:58 INFO     Epoch 43 [10/65]: loss = 3.157799243927002, lr = 0.000125
+2025-09-18 04:28:58 INFO     Epoch 43 [10/65]: loss = 3.157799243927002, lr = 0.000125
+2025-09-18 04:29:09 INFO     Epoch 43 [20/65]: loss = 3.232370615005493, lr = 0.000125
+2025-09-18 04:29:09 INFO     Epoch 43 [20/65]: loss = 3.232370615005493, lr = 0.000125
+2025-09-18 04:29:21 INFO     Epoch 43 [30/65]: loss = 3.1754372119903564, lr = 0.000125
+2025-09-18 04:29:21 INFO     Epoch 43 [30/65]: loss = 3.1754372119903564, lr = 0.000125
+2025-09-18 04:29:32 INFO     Epoch 43 [40/65]: loss = 3.2726011276245117, lr = 0.000125
+2025-09-18 04:29:32 INFO     Epoch 43 [40/65]: loss = 3.2726011276245117, lr = 0.000125
+2025-09-18 04:29:44 INFO     Epoch 43 [50/65]: loss = 3.0439743995666504, lr = 0.000125
+2025-09-18 04:29:44 INFO     Epoch 43 [50/65]: loss = 3.0439743995666504, lr = 0.000125
+2025-09-18 04:29:55 INFO     Epoch 43 [60/65]: loss = 3.1151812076568604, lr = 0.000125
+2025-09-18 04:29:55 INFO     Epoch 43 [60/65]: loss = 3.1151812076568604, lr = 0.000125
+2025-09-18 04:30:02 INFO     Epoch 44 [0/65]: loss = 3.1781060695648193, lr = 0.000125
+2025-09-18 04:30:02 INFO     Epoch 44 [0/65]: loss = 3.1781060695648193, lr = 0.000125
+2025-09-18 04:30:13 INFO     Epoch 44 [10/65]: loss = 3.1759567260742188, lr = 0.000125
+2025-09-18 04:30:13 INFO     Epoch 44 [10/65]: loss = 3.1759567260742188, lr = 0.000125
+2025-09-18 04:30:25 INFO     Epoch 44 [20/65]: loss = 3.271121025085449, lr = 0.000125
+2025-09-18 04:30:25 INFO     Epoch 44 [20/65]: loss = 3.271121025085449, lr = 0.000125
+2025-09-18 04:30:36 INFO     Epoch 44 [30/65]: loss = 3.093566417694092, lr = 0.000125
+2025-09-18 04:30:36 INFO     Epoch 44 [30/65]: loss = 3.093566417694092, lr = 0.000125
+2025-09-18 04:30:48 INFO     Epoch 44 [40/65]: loss = 3.2623939514160156, lr = 0.000125
+2025-09-18 04:30:48 INFO     Epoch 44 [40/65]: loss = 3.2623939514160156, lr = 0.000125
+2025-09-18 04:30:59 INFO     Epoch 44 [50/65]: loss = 3.1264171600341797, lr = 0.000125
+2025-09-18 04:30:59 INFO     Epoch 44 [50/65]: loss = 3.1264171600341797, lr = 0.000125
+2025-09-18 04:31:11 INFO     Epoch 44 [60/65]: loss = 3.23344087600708, lr = 0.000125
+2025-09-18 04:31:11 INFO     Epoch 44 [60/65]: loss = 3.23344087600708, lr = 0.000125
+2025-09-18 04:31:17 INFO     Epoch 45 [0/65]: loss = 3.1392903327941895, lr = 0.000125
+2025-09-18 04:31:17 INFO     Epoch 45 [0/65]: loss = 3.1392903327941895, lr = 0.000125
+2025-09-18 04:31:28 INFO     Epoch 45 [10/65]: loss = 3.170562267303467, lr = 0.000125
+2025-09-18 04:31:28 INFO     Epoch 45 [10/65]: loss = 3.170562267303467, lr = 0.000125
+2025-09-18 04:31:40 INFO     Epoch 45 [20/65]: loss = 3.184044361114502, lr = 0.000125
+2025-09-18 04:31:40 INFO     Epoch 45 [20/65]: loss = 3.184044361114502, lr = 0.000125
+2025-09-18 04:31:51 INFO     Epoch 45 [30/65]: loss = 3.3367137908935547, lr = 0.000125
+2025-09-18 04:31:51 INFO     Epoch 45 [30/65]: loss = 3.3367137908935547, lr = 0.000125
+2025-09-18 04:32:03 INFO     Epoch 45 [40/65]: loss = 3.153597831726074, lr = 0.000125
+2025-09-18 04:32:03 INFO     Epoch 45 [40/65]: loss = 3.153597831726074, lr = 0.000125
+2025-09-18 04:32:14 INFO     Epoch 45 [50/65]: loss = 3.1380372047424316, lr = 0.000125
+2025-09-18 04:32:14 INFO     Epoch 45 [50/65]: loss = 3.1380372047424316, lr = 0.000125
+2025-09-18 04:32:25 INFO     Epoch 45 [60/65]: loss = 3.131467580795288, lr = 0.000125
+2025-09-18 04:32:25 INFO     Epoch 45 [60/65]: loss = 3.131467580795288, lr = 0.000125
+2025-09-18 04:32:32 INFO     Epoch 46 [0/65]: loss = 3.159605026245117, lr = 0.000125
+2025-09-18 04:32:32 INFO     Epoch 46 [0/65]: loss = 3.159605026245117, lr = 0.000125
+2025-09-18 04:32:43 INFO     Epoch 46 [10/65]: loss = 3.1091079711914062, lr = 0.000125
+2025-09-18 04:32:43 INFO     Epoch 46 [10/65]: loss = 3.1091079711914062, lr = 0.000125
+2025-09-18 04:32:55 INFO     Epoch 46 [20/65]: loss = 3.0606603622436523, lr = 0.000125
+2025-09-18 04:32:55 INFO     Epoch 46 [20/65]: loss = 3.0606603622436523, lr = 0.000125
+2025-09-18 04:33:06 INFO     Epoch 46 [30/65]: loss = 3.158142328262329, lr = 0.000125
+2025-09-18 04:33:06 INFO     Epoch 46 [30/65]: loss = 3.158142328262329, lr = 0.000125
+2025-09-18 04:33:18 INFO     Epoch 46 [40/65]: loss = 3.2265193462371826, lr = 0.000125
+2025-09-18 04:33:18 INFO     Epoch 46 [40/65]: loss = 3.2265193462371826, lr = 0.000125
+2025-09-18 04:33:29 INFO     Epoch 46 [50/65]: loss = 3.075617551803589, lr = 0.000125
+2025-09-18 04:33:29 INFO     Epoch 46 [50/65]: loss = 3.075617551803589, lr = 0.000125
+2025-09-18 04:33:41 INFO     Epoch 46 [60/65]: loss = 3.113851547241211, lr = 0.000125
+2025-09-18 04:33:41 INFO     Epoch 46 [60/65]: loss = 3.113851547241211, lr = 0.000125
+2025-09-18 04:33:47 INFO     Epoch 47 [0/65]: loss = 3.210805892944336, lr = 0.000125
+2025-09-18 04:33:47 INFO     Epoch 47 [0/65]: loss = 3.210805892944336, lr = 0.000125
+2025-09-18 04:33:59 INFO     Epoch 47 [10/65]: loss = 3.0750246047973633, lr = 0.000125
+2025-09-18 04:33:59 INFO     Epoch 47 [10/65]: loss = 3.0750246047973633, lr = 0.000125
+2025-09-18 04:34:10 INFO     Epoch 47 [20/65]: loss = 3.0558934211730957, lr = 0.000125
+2025-09-18 04:34:10 INFO     Epoch 47 [20/65]: loss = 3.0558934211730957, lr = 0.000125
+2025-09-18 04:34:22 INFO     Epoch 47 [30/65]: loss = 3.065664529800415, lr = 0.000125
+2025-09-18 04:34:22 INFO     Epoch 47 [30/65]: loss = 3.065664529800415, lr = 0.000125
+2025-09-18 04:34:33 INFO     Epoch 47 [40/65]: loss = 3.0988121032714844, lr = 0.000125
+2025-09-18 04:34:33 INFO     Epoch 47 [40/65]: loss = 3.0988121032714844, lr = 0.000125
+2025-09-18 04:34:45 INFO     Epoch 47 [50/65]: loss = 3.1154303550720215, lr = 0.000125
+2025-09-18 04:34:45 INFO     Epoch 47 [50/65]: loss = 3.1154303550720215, lr = 0.000125
+2025-09-18 04:34:56 INFO     Epoch 47 [60/65]: loss = 3.117033004760742, lr = 0.000125
+2025-09-18 04:34:56 INFO     Epoch 47 [60/65]: loss = 3.117033004760742, lr = 0.000125
+2025-09-18 04:35:03 INFO     Epoch 48 [0/65]: loss = 3.1142678260803223, lr = 0.000125
+2025-09-18 04:35:03 INFO     Epoch 48 [0/65]: loss = 3.1142678260803223, lr = 0.000125
+2025-09-18 04:35:14 INFO     Epoch 48 [10/65]: loss = 3.1434452533721924, lr = 0.000125
+2025-09-18 04:35:14 INFO     Epoch 48 [10/65]: loss = 3.1434452533721924, lr = 0.000125
+2025-09-18 04:35:26 INFO     Epoch 48 [20/65]: loss = 3.1269731521606445, lr = 0.000125
+2025-09-18 04:35:26 INFO     Epoch 48 [20/65]: loss = 3.1269731521606445, lr = 0.000125
+2025-09-18 04:35:37 INFO     Epoch 48 [30/65]: loss = 3.2969040870666504, lr = 0.000125
+2025-09-18 04:35:37 INFO     Epoch 48 [30/65]: loss = 3.2969040870666504, lr = 0.000125
+2025-09-18 04:35:49 INFO     Epoch 48 [40/65]: loss = 3.2172129154205322, lr = 0.000125
+2025-09-18 04:35:49 INFO     Epoch 48 [40/65]: loss = 3.2172129154205322, lr = 0.000125
+2025-09-18 04:36:00 INFO     Epoch 48 [50/65]: loss = 3.1030569076538086, lr = 0.000125
+2025-09-18 04:36:00 INFO     Epoch 48 [50/65]: loss = 3.1030569076538086, lr = 0.000125
+2025-09-18 04:36:12 INFO     Epoch 48 [60/65]: loss = 3.213918685913086, lr = 0.000125
+2025-09-18 04:36:12 INFO     Epoch 48 [60/65]: loss = 3.213918685913086, lr = 0.000125
+2025-09-18 04:36:18 INFO     Epoch 49 [0/65]: loss = 3.1640071868896484, lr = 0.000125
+2025-09-18 04:36:18 INFO     Epoch 49 [0/65]: loss = 3.1640071868896484, lr = 0.000125
+2025-09-18 04:36:29 INFO     Epoch 49 [10/65]: loss = 3.1461191177368164, lr = 0.000125
+2025-09-18 04:36:29 INFO     Epoch 49 [10/65]: loss = 3.1461191177368164, lr = 0.000125
+2025-09-18 04:36:41 INFO     Epoch 49 [20/65]: loss = 3.1011738777160645, lr = 0.000125
+2025-09-18 04:36:41 INFO     Epoch 49 [20/65]: loss = 3.1011738777160645, lr = 0.000125
+2025-09-18 04:36:52 INFO     Epoch 49 [30/65]: loss = 3.0447335243225098, lr = 0.000125
+2025-09-18 04:36:52 INFO     Epoch 49 [30/65]: loss = 3.0447335243225098, lr = 0.000125
+2025-09-18 04:37:04 INFO     Epoch 49 [40/65]: loss = 3.071913719177246, lr = 0.000125
+2025-09-18 04:37:04 INFO     Epoch 49 [40/65]: loss = 3.071913719177246, lr = 0.000125
+2025-09-18 04:37:15 INFO     Epoch 49 [50/65]: loss = 3.1349692344665527, lr = 0.000125
+2025-09-18 04:37:15 INFO     Epoch 49 [50/65]: loss = 3.1349692344665527, lr = 0.000125
+2025-09-18 04:37:27 INFO     Epoch 49 [60/65]: loss = 3.120682716369629, lr = 0.000125
+2025-09-18 04:37:27 INFO     Epoch 49 [60/65]: loss = 3.120682716369629, lr = 0.000125
+2025-09-18 04:44:43 INFO     384 samples generated in 1024 evaluations.
+2025-09-18 04:44:51 INFO     384 samples generated in 1024 evaluations.
+2025-09-18 04:44:55 INFO     Evaluating [0/65] samples generated [384/500] running fid 195.6592559814453
+2025-09-18 04:44:55 INFO     Evaluating [0/65] samples generated [384/500] running fid 195.6592559814453
+2025-09-18 04:51:58 INFO     384 samples generated in 1024 evaluations.
+2025-09-18 04:52:04 INFO     384 samples generated in 1024 evaluations.
+2025-09-18 04:52:15 INFO     Evaluating [50/65] samples generated [500/500] running fid 173.4272918701172
+2025-09-18 04:52:15 INFO     Evaluating [50/65] samples generated [500/500] running fid 173.4272918701172
+2025-09-18 04:52:22 INFO     Epoch 50 [0/65]: loss = 3.157630443572998, lr = 0.000125
+2025-09-18 04:52:22 INFO     Epoch 50 [0/65]: loss = 3.157630443572998, lr = 0.000125
+2025-09-18 04:52:33 INFO     Epoch 50 [10/65]: loss = 3.22017240524292, lr = 0.000125
+2025-09-18 04:52:33 INFO     Epoch 50 [10/65]: loss = 3.22017240524292, lr = 0.000125
+2025-09-18 04:52:45 INFO     Epoch 50 [20/65]: loss = 3.11639666557312, lr = 0.000125
+2025-09-18 04:52:45 INFO     Epoch 50 [20/65]: loss = 3.11639666557312, lr = 0.000125
+2025-09-18 04:52:56 INFO     Epoch 50 [30/65]: loss = 3.135403633117676, lr = 0.000125
+2025-09-18 04:52:56 INFO     Epoch 50 [30/65]: loss = 3.135403633117676, lr = 0.000125
+2025-09-18 04:53:08 INFO     Epoch 50 [40/65]: loss = 3.1505331993103027, lr = 0.000125
+2025-09-18 04:53:08 INFO     Epoch 50 [40/65]: loss = 3.1505331993103027, lr = 0.000125
+2025-09-18 04:53:19 INFO     Epoch 50 [50/65]: loss = 3.227107524871826, lr = 0.000125
+2025-09-18 04:53:19 INFO     Epoch 50 [50/65]: loss = 3.227107524871826, lr = 0.000125
+2025-09-18 04:53:31 INFO     Epoch 50 [60/65]: loss = 3.0163793563842773, lr = 0.000125
+2025-09-18 04:53:31 INFO     Epoch 50 [60/65]: loss = 3.0163793563842773, lr = 0.000125
+2025-09-18 04:53:37 INFO     Epoch 51 [0/65]: loss = 3.1239421367645264, lr = 0.000125
+2025-09-18 04:53:37 INFO     Epoch 51 [0/65]: loss = 3.1239421367645264, lr = 0.000125
+2025-09-18 04:53:48 INFO     Epoch 51 [10/65]: loss = 3.202566146850586, lr = 0.000125
+2025-09-18 04:53:48 INFO     Epoch 51 [10/65]: loss = 3.202566146850586, lr = 0.000125
+2025-09-18 04:54:00 INFO     Epoch 51 [20/65]: loss = 3.1816201210021973, lr = 0.000125
+2025-09-18 04:54:00 INFO     Epoch 51 [20/65]: loss = 3.1816201210021973, lr = 0.000125
+2025-09-18 04:54:12 INFO     Epoch 51 [30/65]: loss = 3.0867772102355957, lr = 0.000125
+2025-09-18 04:54:12 INFO     Epoch 51 [30/65]: loss = 3.0867772102355957, lr = 0.000125
+2025-09-18 04:54:23 INFO     Epoch 51 [40/65]: loss = 3.124938726425171, lr = 0.000125
+2025-09-18 04:54:23 INFO     Epoch 51 [40/65]: loss = 3.124938726425171, lr = 0.000125
+2025-09-18 04:54:35 INFO     Epoch 51 [50/65]: loss = 3.1436595916748047, lr = 0.000125
+2025-09-18 04:54:35 INFO     Epoch 51 [50/65]: loss = 3.1436595916748047, lr = 0.000125
+2025-09-18 04:54:46 INFO     Epoch 51 [60/65]: loss = 3.131328582763672, lr = 0.000125
+2025-09-18 04:54:46 INFO     Epoch 51 [60/65]: loss = 3.131328582763672, lr = 0.000125
+2025-09-18 04:54:52 INFO     Epoch 52 [0/65]: loss = 3.040771484375, lr = 0.000125
+2025-09-18 04:54:52 INFO     Epoch 52 [0/65]: loss = 3.040771484375, lr = 0.000125
+2025-09-18 04:55:04 INFO     Epoch 52 [10/65]: loss = 3.129760265350342, lr = 0.000125
+2025-09-18 04:55:04 INFO     Epoch 52 [10/65]: loss = 3.129760265350342, lr = 0.000125
+2025-09-18 04:55:15 INFO     Epoch 52 [20/65]: loss = 3.1210596561431885, lr = 0.000125
+2025-09-18 04:55:15 INFO     Epoch 52 [20/65]: loss = 3.1210596561431885, lr = 0.000125
+2025-09-18 04:55:27 INFO     Epoch 52 [30/65]: loss = 3.064260959625244, lr = 0.000125
+2025-09-18 04:55:27 INFO     Epoch 52 [30/65]: loss = 3.064260959625244, lr = 0.000125
+2025-09-18 04:55:38 INFO     Epoch 52 [40/65]: loss = 3.1398327350616455, lr = 0.000125
+2025-09-18 04:55:38 INFO     Epoch 52 [40/65]: loss = 3.1398327350616455, lr = 0.000125
+2025-09-18 04:55:50 INFO     Epoch 52 [50/65]: loss = 3.2544631958007812, lr = 0.000125
+2025-09-18 04:55:50 INFO     Epoch 52 [50/65]: loss = 3.2544631958007812, lr = 0.000125
+2025-09-18 04:56:01 INFO     Epoch 52 [60/65]: loss = 3.1461453437805176, lr = 0.000125
+2025-09-18 04:56:01 INFO     Epoch 52 [60/65]: loss = 3.1461453437805176, lr = 0.000125
+2025-09-18 04:56:08 INFO     Epoch 53 [0/65]: loss = 3.11328387260437, lr = 0.000125
+2025-09-18 04:56:08 INFO     Epoch 53 [0/65]: loss = 3.11328387260437, lr = 0.000125
+2025-09-18 04:56:19 INFO     Epoch 53 [10/65]: loss = 3.122992515563965, lr = 0.000125
+2025-09-18 04:56:19 INFO     Epoch 53 [10/65]: loss = 3.122992515563965, lr = 0.000125
+2025-09-18 04:56:31 INFO     Epoch 53 [20/65]: loss = 3.2049560546875, lr = 0.000125
+2025-09-18 04:56:31 INFO     Epoch 53 [20/65]: loss = 3.2049560546875, lr = 0.000125
+2025-09-18 04:56:42 INFO     Epoch 53 [30/65]: loss = 3.049720525741577, lr = 0.000125
+2025-09-18 04:56:42 INFO     Epoch 53 [30/65]: loss = 3.049720525741577, lr = 0.000125
+2025-09-18 04:56:53 INFO     Epoch 53 [40/65]: loss = 3.191938877105713, lr = 0.000125
+2025-09-18 04:56:53 INFO     Epoch 53 [40/65]: loss = 3.191938877105713, lr = 0.000125
+2025-09-18 04:57:05 INFO     Epoch 53 [50/65]: loss = 3.0512351989746094, lr = 0.000125
+2025-09-18 04:57:05 INFO     Epoch 53 [50/65]: loss = 3.0512351989746094, lr = 0.000125
+2025-09-18 04:57:16 INFO     Epoch 53 [60/65]: loss = 3.0894107818603516, lr = 0.000125
+2025-09-18 04:57:16 INFO     Epoch 53 [60/65]: loss = 3.0894107818603516, lr = 0.000125
+2025-09-18 04:57:22 INFO     Epoch 54 [0/65]: loss = 3.11895489692688, lr = 0.000125
+2025-09-18 04:57:22 INFO     Epoch 54 [0/65]: loss = 3.11895489692688, lr = 0.000125
+2025-09-18 04:57:34 INFO     Epoch 54 [10/65]: loss = 3.186121702194214, lr = 0.000125
+2025-09-18 04:57:34 INFO     Epoch 54 [10/65]: loss = 3.186121702194214, lr = 0.000125
+2025-09-18 04:57:45 INFO     Epoch 54 [20/65]: loss = 3.120948076248169, lr = 0.000125
+2025-09-18 04:57:45 INFO     Epoch 54 [20/65]: loss = 3.120948076248169, lr = 0.000125
+2025-09-18 04:57:56 INFO     Epoch 54 [30/65]: loss = 3.2209067344665527, lr = 0.000125
+2025-09-18 04:57:56 INFO     Epoch 54 [30/65]: loss = 3.2209067344665527, lr = 0.000125
+2025-09-18 04:58:08 INFO     Epoch 54 [40/65]: loss = 3.139620780944824, lr = 0.000125
+2025-09-18 04:58:08 INFO     Epoch 54 [40/65]: loss = 3.139620780944824, lr = 0.000125
+2025-09-18 04:58:19 INFO     Epoch 54 [50/65]: loss = 3.0576069355010986, lr = 0.000125
+2025-09-18 04:58:19 INFO     Epoch 54 [50/65]: loss = 3.0576069355010986, lr = 0.000125
+2025-09-18 04:58:31 INFO     Epoch 54 [60/65]: loss = 3.150702476501465, lr = 0.000125
+2025-09-18 04:58:31 INFO     Epoch 54 [60/65]: loss = 3.150702476501465, lr = 0.000125
+2025-09-18 04:58:37 INFO     Epoch 55 [0/65]: loss = 3.069063663482666, lr = 0.000125
+2025-09-18 04:58:37 INFO     Epoch 55 [0/65]: loss = 3.069063663482666, lr = 0.000125
+2025-09-18 04:58:49 INFO     Epoch 55 [10/65]: loss = 3.1451783180236816, lr = 0.000125
+2025-09-18 04:58:49 INFO     Epoch 55 [10/65]: loss = 3.1451783180236816, lr = 0.000125
+2025-09-18 04:59:00 INFO     Epoch 55 [20/65]: loss = 3.1447594165802, lr = 0.000125
+2025-09-18 04:59:00 INFO     Epoch 55 [20/65]: loss = 3.1447594165802, lr = 0.000125
+2025-09-18 04:59:12 INFO     Epoch 55 [30/65]: loss = 3.130819797515869, lr = 0.000125
+2025-09-18 04:59:12 INFO     Epoch 55 [30/65]: loss = 3.130819797515869, lr = 0.000125
+2025-09-18 04:59:23 INFO     Epoch 55 [40/65]: loss = 3.1732378005981445, lr = 0.000125
+2025-09-18 04:59:23 INFO     Epoch 55 [40/65]: loss = 3.1732378005981445, lr = 0.000125
+2025-09-18 04:59:35 INFO     Epoch 55 [50/65]: loss = 3.084047794342041, lr = 0.000125
+2025-09-18 04:59:35 INFO     Epoch 55 [50/65]: loss = 3.084047794342041, lr = 0.000125
+2025-09-18 04:59:46 INFO     Epoch 55 [60/65]: loss = 3.0765678882598877, lr = 0.000125
+2025-09-18 04:59:46 INFO     Epoch 55 [60/65]: loss = 3.0765678882598877, lr = 0.000125
+2025-09-18 04:59:53 INFO     Epoch 56 [0/65]: loss = 3.0707061290740967, lr = 0.000125
+2025-09-18 04:59:53 INFO     Epoch 56 [0/65]: loss = 3.0707061290740967, lr = 0.000125
+2025-09-18 05:00:04 INFO     Epoch 56 [10/65]: loss = 3.046515941619873, lr = 0.000125
+2025-09-18 05:00:04 INFO     Epoch 56 [10/65]: loss = 3.046515941619873, lr = 0.000125
+2025-09-18 05:00:15 INFO     Epoch 56 [20/65]: loss = 3.163789987564087, lr = 0.000125
+2025-09-18 05:00:15 INFO     Epoch 56 [20/65]: loss = 3.163789987564087, lr = 0.000125
+2025-09-18 05:00:27 INFO     Epoch 56 [30/65]: loss = 3.042591094970703, lr = 0.000125
+2025-09-18 05:00:27 INFO     Epoch 56 [30/65]: loss = 3.042591094970703, lr = 0.000125
+2025-09-18 05:00:38 INFO     Epoch 56 [40/65]: loss = 3.1517982482910156, lr = 0.000125
+2025-09-18 05:00:38 INFO     Epoch 56 [40/65]: loss = 3.1517982482910156, lr = 0.000125
+2025-09-18 05:00:49 INFO     Epoch 56 [50/65]: loss = 3.1545464992523193, lr = 0.000125
+2025-09-18 05:00:49 INFO     Epoch 56 [50/65]: loss = 3.1545464992523193, lr = 0.000125
+2025-09-18 05:01:01 INFO     Epoch 56 [60/65]: loss = 3.1152281761169434, lr = 0.000125
+2025-09-18 05:01:01 INFO     Epoch 56 [60/65]: loss = 3.1152281761169434, lr = 0.000125
+2025-09-18 05:01:07 INFO     Epoch 57 [0/65]: loss = 3.2642807960510254, lr = 0.000125
+2025-09-18 05:01:07 INFO     Epoch 57 [0/65]: loss = 3.2642807960510254, lr = 0.000125
+2025-09-18 05:01:19 INFO     Epoch 57 [10/65]: loss = 3.1387524604797363, lr = 0.000125
+2025-09-18 05:01:19 INFO     Epoch 57 [10/65]: loss = 3.1387524604797363, lr = 0.000125
+2025-09-18 05:01:30 INFO     Epoch 57 [20/65]: loss = 3.0858848094940186, lr = 0.000125
+2025-09-18 05:01:30 INFO     Epoch 57 [20/65]: loss = 3.0858848094940186, lr = 0.000125
+2025-09-18 05:01:42 INFO     Epoch 57 [30/65]: loss = 3.085594654083252, lr = 0.000125
+2025-09-18 05:01:42 INFO     Epoch 57 [30/65]: loss = 3.085594654083252, lr = 0.000125
+2025-09-18 05:01:53 INFO     Epoch 57 [40/65]: loss = 3.1103596687316895, lr = 0.000125
+2025-09-18 05:01:53 INFO     Epoch 57 [40/65]: loss = 3.1103596687316895, lr = 0.000125
+2025-09-18 05:02:05 INFO     Epoch 57 [50/65]: loss = 3.0910000801086426, lr = 0.000125
+2025-09-18 05:02:05 INFO     Epoch 57 [50/65]: loss = 3.0910000801086426, lr = 0.000125
+2025-09-18 05:02:16 INFO     Epoch 57 [60/65]: loss = 3.1119632720947266, lr = 0.000125
+2025-09-18 05:02:16 INFO     Epoch 57 [60/65]: loss = 3.1119632720947266, lr = 0.000125
+2025-09-18 05:02:22 INFO     Epoch 58 [0/65]: loss = 3.1091558933258057, lr = 0.000125
+2025-09-18 05:02:22 INFO     Epoch 58 [0/65]: loss = 3.1091558933258057, lr = 0.000125
+2025-09-18 05:02:34 INFO     Epoch 58 [10/65]: loss = 3.165574073791504, lr = 0.000125
+2025-09-18 05:02:34 INFO     Epoch 58 [10/65]: loss = 3.165574073791504, lr = 0.000125
+2025-09-18 05:02:46 INFO     Epoch 58 [20/65]: loss = 3.1475844383239746, lr = 0.000125
+2025-09-18 05:02:46 INFO     Epoch 58 [20/65]: loss = 3.1475844383239746, lr = 0.000125
+2025-09-18 05:02:57 INFO     Epoch 58 [30/65]: loss = 3.143545150756836, lr = 0.000125
+2025-09-18 05:02:57 INFO     Epoch 58 [30/65]: loss = 3.143545150756836, lr = 0.000125
+2025-09-18 05:03:09 INFO     Epoch 58 [40/65]: loss = 3.087005138397217, lr = 0.000125
+2025-09-18 05:03:09 INFO     Epoch 58 [40/65]: loss = 3.087005138397217, lr = 0.000125
+2025-09-18 05:03:20 INFO     Epoch 58 [50/65]: loss = 3.0733141899108887, lr = 0.000125
+2025-09-18 05:03:20 INFO     Epoch 58 [50/65]: loss = 3.0733141899108887, lr = 0.000125
+2025-09-18 05:03:32 INFO     Epoch 58 [60/65]: loss = 3.098067283630371, lr = 0.000125
+2025-09-18 05:03:32 INFO     Epoch 58 [60/65]: loss = 3.098067283630371, lr = 0.000125
+2025-09-18 05:03:38 INFO     Epoch 59 [0/65]: loss = 3.32273006439209, lr = 0.000125
+2025-09-18 05:03:38 INFO     Epoch 59 [0/65]: loss = 3.32273006439209, lr = 0.000125
+2025-09-18 05:03:50 INFO     Epoch 59 [10/65]: loss = 3.125502109527588, lr = 0.000125
+2025-09-18 05:03:50 INFO     Epoch 59 [10/65]: loss = 3.125502109527588, lr = 0.000125
+2025-09-18 05:04:01 INFO     Epoch 59 [20/65]: loss = 3.0433363914489746, lr = 0.000125
+2025-09-18 05:04:01 INFO     Epoch 59 [20/65]: loss = 3.0433363914489746, lr = 0.000125
+2025-09-18 05:04:13 INFO     Epoch 59 [30/65]: loss = 3.092416763305664, lr = 0.000125
+2025-09-18 05:04:13 INFO     Epoch 59 [30/65]: loss = 3.092416763305664, lr = 0.000125
+2025-09-18 05:04:24 INFO     Epoch 59 [40/65]: loss = 3.179564952850342, lr = 0.000125
+2025-09-18 05:04:24 INFO     Epoch 59 [40/65]: loss = 3.179564952850342, lr = 0.000125
+2025-09-18 05:04:36 INFO     Epoch 59 [50/65]: loss = 3.1620535850524902, lr = 0.000125
+2025-09-18 05:04:36 INFO     Epoch 59 [50/65]: loss = 3.1620535850524902, lr = 0.000125
+2025-09-18 05:04:47 INFO     Epoch 59 [60/65]: loss = 3.201019287109375, lr = 0.000125
+2025-09-18 05:04:47 INFO     Epoch 59 [60/65]: loss = 3.201019287109375, lr = 0.000125
+2025-09-18 05:04:53 INFO     Epoch 60 [0/65]: loss = 3.1433310508728027, lr = 0.000125
+2025-09-18 05:04:53 INFO     Epoch 60 [0/65]: loss = 3.1433310508728027, lr = 0.000125
+2025-09-18 05:05:05 INFO     Epoch 60 [10/65]: loss = 3.1604084968566895, lr = 0.000125
+2025-09-18 05:05:05 INFO     Epoch 60 [10/65]: loss = 3.1604084968566895, lr = 0.000125
+2025-09-18 05:05:17 INFO     Epoch 60 [20/65]: loss = 3.0705912113189697, lr = 0.000125
+2025-09-18 05:05:17 INFO     Epoch 60 [20/65]: loss = 3.0705912113189697, lr = 0.000125
+2025-09-18 05:05:28 INFO     Epoch 60 [30/65]: loss = 3.187648296356201, lr = 0.000125
+2025-09-18 05:05:28 INFO     Epoch 60 [30/65]: loss = 3.187648296356201, lr = 0.000125
+2025-09-18 05:05:39 INFO     Epoch 60 [40/65]: loss = 3.0636940002441406, lr = 0.000125
+2025-09-18 05:05:39 INFO     Epoch 60 [40/65]: loss = 3.0636940002441406, lr = 0.000125
+2025-09-18 05:05:51 INFO     Epoch 60 [50/65]: loss = 3.1130590438842773, lr = 0.000125
+2025-09-18 05:05:51 INFO     Epoch 60 [50/65]: loss = 3.1130590438842773, lr = 0.000125
+2025-09-18 05:06:02 INFO     Epoch 60 [60/65]: loss = 2.975231170654297, lr = 0.000125
+2025-09-18 05:06:02 INFO     Epoch 60 [60/65]: loss = 2.975231170654297, lr = 0.000125
+2025-09-18 05:06:08 INFO     Epoch 61 [0/65]: loss = 3.1614575386047363, lr = 0.000125
+2025-09-18 05:06:08 INFO     Epoch 61 [0/65]: loss = 3.1614575386047363, lr = 0.000125
+2025-09-18 05:06:20 INFO     Epoch 61 [10/65]: loss = 3.189100980758667, lr = 0.000125
+2025-09-18 05:06:20 INFO     Epoch 61 [10/65]: loss = 3.189100980758667, lr = 0.000125
+2025-09-18 05:06:31 INFO     Epoch 61 [20/65]: loss = 3.023068904876709, lr = 0.000125
+2025-09-18 05:06:31 INFO     Epoch 61 [20/65]: loss = 3.023068904876709, lr = 0.000125
+2025-09-18 05:06:43 INFO     Epoch 61 [30/65]: loss = 3.108893394470215, lr = 0.000125
+2025-09-18 05:06:43 INFO     Epoch 61 [30/65]: loss = 3.108893394470215, lr = 0.000125
+2025-09-18 05:06:54 INFO     Epoch 61 [40/65]: loss = 3.1757607460021973, lr = 0.000125
+2025-09-18 05:06:54 INFO     Epoch 61 [40/65]: loss = 3.1757607460021973, lr = 0.000125
+2025-09-18 05:07:06 INFO     Epoch 61 [50/65]: loss = 3.2090516090393066, lr = 0.000125
+2025-09-18 05:07:06 INFO     Epoch 61 [50/65]: loss = 3.2090516090393066, lr = 0.000125
+2025-09-18 05:07:17 INFO     Epoch 61 [60/65]: loss = 3.0939993858337402, lr = 0.000125
+2025-09-18 05:07:17 INFO     Epoch 61 [60/65]: loss = 3.0939993858337402, lr = 0.000125
+2025-09-18 05:07:24 INFO     Epoch 62 [0/65]: loss = 3.055114269256592, lr = 0.000125
+2025-09-18 05:07:24 INFO     Epoch 62 [0/65]: loss = 3.055114269256592, lr = 0.000125
+2025-09-18 05:07:35 INFO     Epoch 62 [10/65]: loss = 3.076516628265381, lr = 0.000125
+2025-09-18 05:07:35 INFO     Epoch 62 [10/65]: loss = 3.076516628265381, lr = 0.000125
+2025-09-18 05:07:47 INFO     Epoch 62 [20/65]: loss = 3.089228630065918, lr = 0.000125
+2025-09-18 05:07:47 INFO     Epoch 62 [20/65]: loss = 3.089228630065918, lr = 0.000125
+2025-09-18 05:07:58 INFO     Epoch 62 [30/65]: loss = 3.18269944190979, lr = 0.000125
+2025-09-18 05:07:58 INFO     Epoch 62 [30/65]: loss = 3.18269944190979, lr = 0.000125
+2025-09-18 05:08:09 INFO     Epoch 62 [40/65]: loss = 3.12294340133667, lr = 0.000125
+2025-09-18 05:08:09 INFO     Epoch 62 [40/65]: loss = 3.12294340133667, lr = 0.000125
+2025-09-18 05:08:21 INFO     Epoch 62 [50/65]: loss = 3.150114059448242, lr = 0.000125
+2025-09-18 05:08:21 INFO     Epoch 62 [50/65]: loss = 3.150114059448242, lr = 0.000125
+2025-09-18 05:08:32 INFO     Epoch 62 [60/65]: loss = 3.1600565910339355, lr = 0.000125
+2025-09-18 05:08:32 INFO     Epoch 62 [60/65]: loss = 3.1600565910339355, lr = 0.000125
+2025-09-18 05:08:39 INFO     Epoch 63 [0/65]: loss = 3.151287794113159, lr = 0.000125
+2025-09-18 05:08:39 INFO     Epoch 63 [0/65]: loss = 3.151287794113159, lr = 0.000125
+2025-09-18 05:08:50 INFO     Epoch 63 [10/65]: loss = 3.0748586654663086, lr = 0.000125
+2025-09-18 05:08:50 INFO     Epoch 63 [10/65]: loss = 3.0748586654663086, lr = 0.000125
+2025-09-18 05:09:02 INFO     Epoch 63 [20/65]: loss = 3.0455031394958496, lr = 0.000125
+2025-09-18 05:09:02 INFO     Epoch 63 [20/65]: loss = 3.0455031394958496, lr = 0.000125
+2025-09-18 05:09:13 INFO     Epoch 63 [30/65]: loss = 3.0645735263824463, lr = 0.000125
+2025-09-18 05:09:13 INFO     Epoch 63 [30/65]: loss = 3.0645735263824463, lr = 0.000125
+2025-09-18 05:09:25 INFO     Epoch 63 [40/65]: loss = 3.106153964996338, lr = 0.000125
+2025-09-18 05:09:25 INFO     Epoch 63 [40/65]: loss = 3.106153964996338, lr = 0.000125
+2025-09-18 05:09:36 INFO     Epoch 63 [50/65]: loss = 3.195385694503784, lr = 0.000125
+2025-09-18 05:09:36 INFO     Epoch 63 [50/65]: loss = 3.195385694503784, lr = 0.000125
+2025-09-18 05:09:48 INFO     Epoch 63 [60/65]: loss = 3.178778648376465, lr = 0.000125
+2025-09-18 05:09:48 INFO     Epoch 63 [60/65]: loss = 3.178778648376465, lr = 0.000125
+2025-09-18 05:09:54 INFO     Epoch 64 [0/65]: loss = 3.1145927906036377, lr = 0.000125
+2025-09-18 05:09:54 INFO     Epoch 64 [0/65]: loss = 3.1145927906036377, lr = 0.000125
+2025-09-18 05:10:06 INFO     Epoch 64 [10/65]: loss = 2.992298126220703, lr = 0.000125
+2025-09-18 05:10:06 INFO     Epoch 64 [10/65]: loss = 2.992298126220703, lr = 0.000125
+2025-09-18 05:10:17 INFO     Epoch 64 [20/65]: loss = 3.1345317363739014, lr = 0.000125
+2025-09-18 05:10:17 INFO     Epoch 64 [20/65]: loss = 3.1345317363739014, lr = 0.000125
+2025-09-18 05:10:29 INFO     Epoch 64 [30/65]: loss = 3.10390567779541, lr = 0.000125
+2025-09-18 05:10:29 INFO     Epoch 64 [30/65]: loss = 3.10390567779541, lr = 0.000125
+2025-09-18 05:10:40 INFO     Epoch 64 [40/65]: loss = 3.0962977409362793, lr = 0.000125
+2025-09-18 05:10:40 INFO     Epoch 64 [40/65]: loss = 3.0962977409362793, lr = 0.000125
+2025-09-18 05:10:52 INFO     Epoch 64 [50/65]: loss = 3.116982936859131, lr = 0.000125
+2025-09-18 05:10:52 INFO     Epoch 64 [50/65]: loss = 3.116982936859131, lr = 0.000125
+2025-09-18 05:11:03 INFO     Epoch 64 [60/65]: loss = 3.1240081787109375, lr = 0.000125
+2025-09-18 05:11:03 INFO     Epoch 64 [60/65]: loss = 3.1240081787109375, lr = 0.000125
+2025-09-18 05:11:10 INFO     Epoch 65 [0/65]: loss = 3.0307366847991943, lr = 0.000125
+2025-09-18 05:11:10 INFO     Epoch 65 [0/65]: loss = 3.0307366847991943, lr = 0.000125
+2025-09-18 05:11:21 INFO     Epoch 65 [10/65]: loss = 3.1452059745788574, lr = 0.000125
+2025-09-18 05:11:21 INFO     Epoch 65 [10/65]: loss = 3.1452059745788574, lr = 0.000125
+2025-09-18 05:11:33 INFO     Epoch 65 [20/65]: loss = 3.182250738143921, lr = 0.000125
+2025-09-18 05:11:33 INFO     Epoch 65 [20/65]: loss = 3.182250738143921, lr = 0.000125
+2025-09-18 05:11:44 INFO     Epoch 65 [30/65]: loss = 3.0544919967651367, lr = 0.000125
+2025-09-18 05:11:44 INFO     Epoch 65 [30/65]: loss = 3.0544919967651367, lr = 0.000125
+2025-09-18 05:11:56 INFO     Epoch 65 [40/65]: loss = 3.0153701305389404, lr = 0.000125
+2025-09-18 05:11:56 INFO     Epoch 65 [40/65]: loss = 3.0153701305389404, lr = 0.000125
+2025-09-18 05:12:07 INFO     Epoch 65 [50/65]: loss = 2.9929039478302, lr = 0.000125
+2025-09-18 05:12:07 INFO     Epoch 65 [50/65]: loss = 2.9929039478302, lr = 0.000125
+2025-09-18 05:12:19 INFO     Epoch 65 [60/65]: loss = 3.0504980087280273, lr = 0.000125
+2025-09-18 05:12:19 INFO     Epoch 65 [60/65]: loss = 3.0504980087280273, lr = 0.000125
+2025-09-18 05:12:25 INFO     Epoch 66 [0/65]: loss = 3.1291141510009766, lr = 0.000125
+2025-09-18 05:12:25 INFO     Epoch 66 [0/65]: loss = 3.1291141510009766, lr = 0.000125
+2025-09-18 05:12:37 INFO     Epoch 66 [10/65]: loss = 3.0870041847229004, lr = 0.000125
+2025-09-18 05:12:37 INFO     Epoch 66 [10/65]: loss = 3.0870041847229004, lr = 0.000125
+2025-09-18 05:12:48 INFO     Epoch 66 [20/65]: loss = 3.019862651824951, lr = 0.000125
+2025-09-18 05:12:48 INFO     Epoch 66 [20/65]: loss = 3.019862651824951, lr = 0.000125
+2025-09-18 05:13:00 INFO     Epoch 66 [30/65]: loss = 3.1095662117004395, lr = 0.000125
+2025-09-18 05:13:00 INFO     Epoch 66 [30/65]: loss = 3.1095662117004395, lr = 0.000125
+2025-09-18 05:13:11 INFO     Epoch 66 [40/65]: loss = 3.117661476135254, lr = 0.000125
+2025-09-18 05:13:11 INFO     Epoch 66 [40/65]: loss = 3.117661476135254, lr = 0.000125
+2025-09-18 05:13:23 INFO     Epoch 66 [50/65]: loss = 3.036655902862549, lr = 0.000125
+2025-09-18 05:13:23 INFO     Epoch 66 [50/65]: loss = 3.036655902862549, lr = 0.000125
+2025-09-18 05:13:34 INFO     Epoch 66 [60/65]: loss = 3.1058120727539062, lr = 0.000125
+2025-09-18 05:13:34 INFO     Epoch 66 [60/65]: loss = 3.1058120727539062, lr = 0.000125
+2025-09-18 05:13:41 INFO     Epoch 67 [0/65]: loss = 3.0962679386138916, lr = 0.000125
+2025-09-18 05:13:41 INFO     Epoch 67 [0/65]: loss = 3.0962679386138916, lr = 0.000125
+2025-09-18 05:13:52 INFO     Epoch 67 [10/65]: loss = 3.1365857124328613, lr = 0.000125
+2025-09-18 05:13:52 INFO     Epoch 67 [10/65]: loss = 3.1365857124328613, lr = 0.000125
+2025-09-18 05:14:04 INFO     Epoch 67 [20/65]: loss = 3.030323028564453, lr = 0.000125
+2025-09-18 05:14:04 INFO     Epoch 67 [20/65]: loss = 3.030323028564453, lr = 0.000125
+2025-09-18 05:14:15 INFO     Epoch 67 [30/65]: loss = 3.0764904022216797, lr = 0.000125
+2025-09-18 05:14:15 INFO     Epoch 67 [30/65]: loss = 3.0764904022216797, lr = 0.000125
+2025-09-18 05:14:27 INFO     Epoch 67 [40/65]: loss = 3.0392329692840576, lr = 0.000125
+2025-09-18 05:14:27 INFO     Epoch 67 [40/65]: loss = 3.0392329692840576, lr = 0.000125
+2025-09-18 05:14:38 INFO     Epoch 67 [50/65]: loss = 3.095552921295166, lr = 0.000125
+2025-09-18 05:14:38 INFO     Epoch 67 [50/65]: loss = 3.095552921295166, lr = 0.000125
+2025-09-18 05:14:50 INFO     Epoch 67 [60/65]: loss = 3.0125625133514404, lr = 0.000125
+2025-09-18 05:14:50 INFO     Epoch 67 [60/65]: loss = 3.0125625133514404, lr = 0.000125
+2025-09-18 05:14:56 INFO     Epoch 68 [0/65]: loss = 3.0339012145996094, lr = 0.000125
+2025-09-18 05:14:56 INFO     Epoch 68 [0/65]: loss = 3.0339012145996094, lr = 0.000125
+2025-09-18 05:15:08 INFO     Epoch 68 [10/65]: loss = 3.041360378265381, lr = 0.000125
+2025-09-18 05:15:08 INFO     Epoch 68 [10/65]: loss = 3.041360378265381, lr = 0.000125
+2025-09-18 05:15:19 INFO     Epoch 68 [20/65]: loss = 3.175386905670166, lr = 0.000125
+2025-09-18 05:15:19 INFO     Epoch 68 [20/65]: loss = 3.175386905670166, lr = 0.000125
+2025-09-18 05:15:30 INFO     Epoch 68 [30/65]: loss = 3.1287035942077637, lr = 0.000125
+2025-09-18 05:15:30 INFO     Epoch 68 [30/65]: loss = 3.1287035942077637, lr = 0.000125
+2025-09-18 05:15:42 INFO     Epoch 68 [40/65]: loss = 3.0640368461608887, lr = 0.000125
+2025-09-18 05:15:42 INFO     Epoch 68 [40/65]: loss = 3.0640368461608887, lr = 0.000125
+2025-09-18 05:15:54 INFO     Epoch 68 [50/65]: loss = 3.0785789489746094, lr = 0.000125
+2025-09-18 05:15:54 INFO     Epoch 68 [50/65]: loss = 3.0785789489746094, lr = 0.000125
+2025-09-18 05:16:05 INFO     Epoch 68 [60/65]: loss = 3.083550214767456, lr = 0.000125
+2025-09-18 05:16:05 INFO     Epoch 68 [60/65]: loss = 3.083550214767456, lr = 0.000125
+2025-09-18 05:16:12 INFO     Epoch 69 [0/65]: loss = 3.073671340942383, lr = 0.000125
+2025-09-18 05:16:12 INFO     Epoch 69 [0/65]: loss = 3.073671340942383, lr = 0.000125
+2025-09-18 05:16:23 INFO     Epoch 69 [10/65]: loss = 3.1790337562561035, lr = 0.000125
+2025-09-18 05:16:23 INFO     Epoch 69 [10/65]: loss = 3.1790337562561035, lr = 0.000125
+2025-09-18 05:16:35 INFO     Epoch 69 [20/65]: loss = 3.063854217529297, lr = 0.000125
+2025-09-18 05:16:35 INFO     Epoch 69 [20/65]: loss = 3.063854217529297, lr = 0.000125
+2025-09-18 05:16:46 INFO     Epoch 69 [30/65]: loss = 2.9492123126983643, lr = 0.000125
+2025-09-18 05:16:46 INFO     Epoch 69 [30/65]: loss = 2.9492123126983643, lr = 0.000125
+2025-09-18 05:16:58 INFO     Epoch 69 [40/65]: loss = 3.1608004570007324, lr = 0.000125
+2025-09-18 05:16:58 INFO     Epoch 69 [40/65]: loss = 3.1608004570007324, lr = 0.000125
+2025-09-18 05:17:09 INFO     Epoch 69 [50/65]: loss = 2.8822414875030518, lr = 0.000125
+2025-09-18 05:17:09 INFO     Epoch 69 [50/65]: loss = 2.8822414875030518, lr = 0.000125
+2025-09-18 05:17:21 INFO     Epoch 69 [60/65]: loss = 3.0232012271881104, lr = 0.000125
+2025-09-18 05:17:21 INFO     Epoch 69 [60/65]: loss = 3.0232012271881104, lr = 0.000125
+2025-09-18 05:17:27 INFO     Epoch 70 [0/65]: loss = 3.181081533432007, lr = 0.000125
+2025-09-18 05:17:27 INFO     Epoch 70 [0/65]: loss = 3.181081533432007, lr = 0.000125
+2025-09-18 05:17:39 INFO     Epoch 70 [10/65]: loss = 3.0610430240631104, lr = 0.000125
+2025-09-18 05:17:39 INFO     Epoch 70 [10/65]: loss = 3.0610430240631104, lr = 0.000125
+2025-09-18 05:17:50 INFO     Epoch 70 [20/65]: loss = 3.018418312072754, lr = 0.000125
+2025-09-18 05:17:50 INFO     Epoch 70 [20/65]: loss = 3.018418312072754, lr = 0.000125
+2025-09-18 05:18:02 INFO     Epoch 70 [30/65]: loss = 3.0408883094787598, lr = 0.000125
+2025-09-18 05:18:02 INFO     Epoch 70 [30/65]: loss = 3.0408883094787598, lr = 0.000125
+2025-09-18 05:18:13 INFO     Epoch 70 [40/65]: loss = 3.0657753944396973, lr = 0.000125
+2025-09-18 05:18:13 INFO     Epoch 70 [40/65]: loss = 3.0657753944396973, lr = 0.000125
+2025-09-18 05:18:24 INFO     Epoch 70 [50/65]: loss = 3.122713804244995, lr = 0.000125
+2025-09-18 05:18:24 INFO     Epoch 70 [50/65]: loss = 3.122713804244995, lr = 0.000125
+2025-09-18 05:18:36 INFO     Epoch 70 [60/65]: loss = 3.039400100708008, lr = 0.000125
+2025-09-18 05:18:36 INFO     Epoch 70 [60/65]: loss = 3.039400100708008, lr = 0.000125
+2025-09-18 05:18:42 INFO     Epoch 71 [0/65]: loss = 3.050255298614502, lr = 0.000125
+2025-09-18 05:18:42 INFO     Epoch 71 [0/65]: loss = 3.050255298614502, lr = 0.000125
+2025-09-18 05:18:54 INFO     Epoch 71 [10/65]: loss = 2.9766292572021484, lr = 0.000125
+2025-09-18 05:18:54 INFO     Epoch 71 [10/65]: loss = 2.9766292572021484, lr = 0.000125
+2025-09-18 05:19:05 INFO     Epoch 71 [20/65]: loss = 3.069688081741333, lr = 0.000125
+2025-09-18 05:19:05 INFO     Epoch 71 [20/65]: loss = 3.069688081741333, lr = 0.000125
+2025-09-18 05:19:16 INFO     Epoch 71 [30/65]: loss = 3.087461471557617, lr = 0.000125
+2025-09-18 05:19:16 INFO     Epoch 71 [30/65]: loss = 3.087461471557617, lr = 0.000125
+2025-09-18 05:19:28 INFO     Epoch 71 [40/65]: loss = 3.153132915496826, lr = 0.000125
+2025-09-18 05:19:28 INFO     Epoch 71 [40/65]: loss = 3.153132915496826, lr = 0.000125
+2025-09-18 05:19:39 INFO     Epoch 71 [50/65]: loss = 3.137627363204956, lr = 0.000125
+2025-09-18 05:19:39 INFO     Epoch 71 [50/65]: loss = 3.137627363204956, lr = 0.000125
+2025-09-18 05:19:51 INFO     Epoch 71 [60/65]: loss = 3.0731706619262695, lr = 0.000125
+2025-09-18 05:19:51 INFO     Epoch 71 [60/65]: loss = 3.0731706619262695, lr = 0.000125
+2025-09-18 05:19:57 INFO     Epoch 72 [0/65]: loss = 3.0960302352905273, lr = 0.000125
+2025-09-18 05:19:57 INFO     Epoch 72 [0/65]: loss = 3.0960302352905273, lr = 0.000125
+2025-09-18 05:20:09 INFO     Epoch 72 [10/65]: loss = 3.090574264526367, lr = 0.000125
+2025-09-18 05:20:09 INFO     Epoch 72 [10/65]: loss = 3.090574264526367, lr = 0.000125
+2025-09-18 05:20:20 INFO     Epoch 72 [20/65]: loss = 3.1097846031188965, lr = 0.000125
+2025-09-18 05:20:20 INFO     Epoch 72 [20/65]: loss = 3.1097846031188965, lr = 0.000125
+2025-09-18 05:20:32 INFO     Epoch 72 [30/65]: loss = 3.123347282409668, lr = 0.000125
+2025-09-18 05:20:32 INFO     Epoch 72 [30/65]: loss = 3.123347282409668, lr = 0.000125
+2025-09-18 05:20:43 INFO     Epoch 72 [40/65]: loss = 3.0766959190368652, lr = 0.000125
+2025-09-18 05:20:43 INFO     Epoch 72 [40/65]: loss = 3.0766959190368652, lr = 0.000125
+2025-09-18 05:20:55 INFO     Epoch 72 [50/65]: loss = 3.156750440597534, lr = 0.000125
+2025-09-18 05:20:55 INFO     Epoch 72 [50/65]: loss = 3.156750440597534, lr = 0.000125
+2025-09-18 05:21:06 INFO     Epoch 72 [60/65]: loss = 2.975647449493408, lr = 0.000125
+2025-09-18 05:21:06 INFO     Epoch 72 [60/65]: loss = 2.975647449493408, lr = 0.000125
+2025-09-18 05:21:13 INFO     Epoch 73 [0/65]: loss = 3.0145273208618164, lr = 0.000125
+2025-09-18 05:21:13 INFO     Epoch 73 [0/65]: loss = 3.0145273208618164, lr = 0.000125
+2025-09-18 05:21:24 INFO     Epoch 73 [10/65]: loss = 3.0311079025268555, lr = 0.000125
+2025-09-18 05:21:24 INFO     Epoch 73 [10/65]: loss = 3.0311079025268555, lr = 0.000125
+2025-09-18 05:21:36 INFO     Epoch 73 [20/65]: loss = 3.0326926708221436, lr = 0.000125
+2025-09-18 05:21:36 INFO     Epoch 73 [20/65]: loss = 3.0326926708221436, lr = 0.000125
+2025-09-18 05:21:47 INFO     Epoch 73 [30/65]: loss = 3.089871406555176, lr = 0.000125
+2025-09-18 05:21:47 INFO     Epoch 73 [30/65]: loss = 3.089871406555176, lr = 0.000125
+2025-09-18 05:21:59 INFO     Epoch 73 [40/65]: loss = 3.051365852355957, lr = 0.000125
+2025-09-18 05:21:59 INFO     Epoch 73 [40/65]: loss = 3.051365852355957, lr = 0.000125
+2025-09-18 05:22:10 INFO     Epoch 73 [50/65]: loss = 3.1622562408447266, lr = 0.000125
+2025-09-18 05:22:10 INFO     Epoch 73 [50/65]: loss = 3.1622562408447266, lr = 0.000125
+2025-09-18 05:22:22 INFO     Epoch 73 [60/65]: loss = 3.095134735107422, lr = 0.000125
+2025-09-18 05:22:22 INFO     Epoch 73 [60/65]: loss = 3.095134735107422, lr = 0.000125
+2025-09-18 05:22:28 INFO     Epoch 74 [0/65]: loss = 3.03548264503479, lr = 0.000125
+2025-09-18 05:22:28 INFO     Epoch 74 [0/65]: loss = 3.03548264503479, lr = 0.000125
+2025-09-18 05:22:40 INFO     Epoch 74 [10/65]: loss = 3.1024131774902344, lr = 0.000125
+2025-09-18 05:22:40 INFO     Epoch 74 [10/65]: loss = 3.1024131774902344, lr = 0.000125
+2025-09-18 05:22:51 INFO     Epoch 74 [20/65]: loss = 3.1515235900878906, lr = 0.000125
+2025-09-18 05:22:51 INFO     Epoch 74 [20/65]: loss = 3.1515235900878906, lr = 0.000125
+2025-09-18 05:23:03 INFO     Epoch 74 [30/65]: loss = 3.137437343597412, lr = 0.000125
+2025-09-18 05:23:03 INFO     Epoch 74 [30/65]: loss = 3.137437343597412, lr = 0.000125
+2025-09-18 05:23:14 INFO     Epoch 74 [40/65]: loss = 3.064161777496338, lr = 0.000125
+2025-09-18 05:23:14 INFO     Epoch 74 [40/65]: loss = 3.064161777496338, lr = 0.000125
+2025-09-18 05:23:26 INFO     Epoch 74 [50/65]: loss = 3.1614460945129395, lr = 0.000125
+2025-09-18 05:23:26 INFO     Epoch 74 [50/65]: loss = 3.1614460945129395, lr = 0.000125
+2025-09-18 05:23:37 INFO     Epoch 74 [60/65]: loss = 3.057537078857422, lr = 0.000125
+2025-09-18 05:23:37 INFO     Epoch 74 [60/65]: loss = 3.057537078857422, lr = 0.000125
+2025-09-18 05:23:44 INFO     Epoch 75 [0/65]: loss = 3.122326612472534, lr = 0.000125
+2025-09-18 05:23:44 INFO     Epoch 75 [0/65]: loss = 3.122326612472534, lr = 0.000125
+2025-09-18 05:23:55 INFO     Epoch 75 [10/65]: loss = 3.0868630409240723, lr = 0.000125
+2025-09-18 05:23:55 INFO     Epoch 75 [10/65]: loss = 3.0868630409240723, lr = 0.000125
+2025-09-18 05:24:07 INFO     Epoch 75 [20/65]: loss = 3.0673811435699463, lr = 0.000125
+2025-09-18 05:24:07 INFO     Epoch 75 [20/65]: loss = 3.0673811435699463, lr = 0.000125
+2025-09-18 05:24:18 INFO     Epoch 75 [30/65]: loss = 3.066335678100586, lr = 0.000125
+2025-09-18 05:24:18 INFO     Epoch 75 [30/65]: loss = 3.066335678100586, lr = 0.000125
+2025-09-18 05:24:30 INFO     Epoch 75 [40/65]: loss = 3.1297006607055664, lr = 0.000125
+2025-09-18 05:24:30 INFO     Epoch 75 [40/65]: loss = 3.1297006607055664, lr = 0.000125
+2025-09-18 05:24:41 INFO     Epoch 75 [50/65]: loss = 3.1266262531280518, lr = 0.000125
+2025-09-18 05:24:41 INFO     Epoch 75 [50/65]: loss = 3.1266262531280518, lr = 0.000125
+2025-09-18 05:24:52 INFO     Epoch 75 [60/65]: loss = 3.0730903148651123, lr = 0.000125
+2025-09-18 05:24:52 INFO     Epoch 75 [60/65]: loss = 3.0730903148651123, lr = 0.000125
+2025-09-18 05:24:59 INFO     Epoch 76 [0/65]: loss = 3.07324481010437, lr = 0.000125
+2025-09-18 05:24:59 INFO     Epoch 76 [0/65]: loss = 3.07324481010437, lr = 0.000125
+2025-09-18 05:25:10 INFO     Epoch 76 [10/65]: loss = 3.03776216506958, lr = 0.000125
+2025-09-18 05:25:10 INFO     Epoch 76 [10/65]: loss = 3.03776216506958, lr = 0.000125
+2025-09-18 05:25:21 INFO     Epoch 76 [20/65]: loss = 3.0421249866485596, lr = 0.000125
+2025-09-18 05:25:21 INFO     Epoch 76 [20/65]: loss = 3.0421249866485596, lr = 0.000125
+2025-09-18 05:25:33 INFO     Epoch 76 [30/65]: loss = 3.153261184692383, lr = 0.000125
+2025-09-18 05:25:33 INFO     Epoch 76 [30/65]: loss = 3.153261184692383, lr = 0.000125
+2025-09-18 05:25:44 INFO     Epoch 76 [40/65]: loss = 3.068988561630249, lr = 0.000125
+2025-09-18 05:25:44 INFO     Epoch 76 [40/65]: loss = 3.068988561630249, lr = 0.000125
+2025-09-18 05:25:56 INFO     Epoch 76 [50/65]: loss = 2.980194568634033, lr = 0.000125
+2025-09-18 05:25:56 INFO     Epoch 76 [50/65]: loss = 2.980194568634033, lr = 0.000125
+2025-09-18 05:26:07 INFO     Epoch 76 [60/65]: loss = 2.921995162963867, lr = 0.000125
+2025-09-18 05:26:07 INFO     Epoch 76 [60/65]: loss = 2.921995162963867, lr = 0.000125
+2025-09-18 05:26:14 INFO     Epoch 77 [0/65]: loss = 3.0510597229003906, lr = 0.000125
+2025-09-18 05:26:14 INFO     Epoch 77 [0/65]: loss = 3.0510597229003906, lr = 0.000125
+2025-09-18 05:26:25 INFO     Epoch 77 [10/65]: loss = 3.0878701210021973, lr = 0.000125
+2025-09-18 05:26:25 INFO     Epoch 77 [10/65]: loss = 3.0878701210021973, lr = 0.000125
+2025-09-18 05:26:37 INFO     Epoch 77 [20/65]: loss = 3.0465617179870605, lr = 0.000125
+2025-09-18 05:26:37 INFO     Epoch 77 [20/65]: loss = 3.0465617179870605, lr = 0.000125
+2025-09-18 05:26:48 INFO     Epoch 77 [30/65]: loss = 3.0043559074401855, lr = 0.000125
+2025-09-18 05:26:48 INFO     Epoch 77 [30/65]: loss = 3.0043559074401855, lr = 0.000125
+2025-09-18 05:27:00 INFO     Epoch 77 [40/65]: loss = 2.976499557495117, lr = 0.000125
+2025-09-18 05:27:00 INFO     Epoch 77 [40/65]: loss = 2.976499557495117, lr = 0.000125
+2025-09-18 05:27:11 INFO     Epoch 77 [50/65]: loss = 3.026188373565674, lr = 0.000125
+2025-09-18 05:27:11 INFO     Epoch 77 [50/65]: loss = 3.026188373565674, lr = 0.000125
+2025-09-18 05:27:23 INFO     Epoch 77 [60/65]: loss = 3.046044111251831, lr = 0.000125
+2025-09-18 05:27:23 INFO     Epoch 77 [60/65]: loss = 3.046044111251831, lr = 0.000125
+2025-09-18 05:27:29 INFO     Epoch 78 [0/65]: loss = 3.0083818435668945, lr = 0.000125
+2025-09-18 05:27:29 INFO     Epoch 78 [0/65]: loss = 3.0083818435668945, lr = 0.000125
+2025-09-18 05:27:41 INFO     Epoch 78 [10/65]: loss = 3.003084421157837, lr = 0.000125
+2025-09-18 05:27:41 INFO     Epoch 78 [10/65]: loss = 3.003084421157837, lr = 0.000125
+2025-09-18 05:27:52 INFO     Epoch 78 [20/65]: loss = 3.0826735496520996, lr = 0.000125
+2025-09-18 05:27:52 INFO     Epoch 78 [20/65]: loss = 3.0826735496520996, lr = 0.000125
+2025-09-18 05:28:04 INFO     Epoch 78 [30/65]: loss = 3.114105224609375, lr = 0.000125
+2025-09-18 05:28:04 INFO     Epoch 78 [30/65]: loss = 3.114105224609375, lr = 0.000125
+2025-09-18 05:28:15 INFO     Epoch 78 [40/65]: loss = 3.1446633338928223, lr = 0.000125
+2025-09-18 05:28:15 INFO     Epoch 78 [40/65]: loss = 3.1446633338928223, lr = 0.000125
+2025-09-18 05:28:27 INFO     Epoch 78 [50/65]: loss = 3.0942726135253906, lr = 0.000125
+2025-09-18 05:28:27 INFO     Epoch 78 [50/65]: loss = 3.0942726135253906, lr = 0.000125
+2025-09-18 05:28:38 INFO     Epoch 78 [60/65]: loss = 3.106240749359131, lr = 0.000125
+2025-09-18 05:28:38 INFO     Epoch 78 [60/65]: loss = 3.106240749359131, lr = 0.000125
+2025-09-18 05:28:45 INFO     Epoch 79 [0/65]: loss = 3.125354766845703, lr = 0.000125
+2025-09-18 05:28:45 INFO     Epoch 79 [0/65]: loss = 3.125354766845703, lr = 0.000125
+2025-09-18 05:28:56 INFO     Epoch 79 [10/65]: loss = 3.0755276679992676, lr = 0.000125
+2025-09-18 05:28:56 INFO     Epoch 79 [10/65]: loss = 3.0755276679992676, lr = 0.000125
+2025-09-18 05:29:08 INFO     Epoch 79 [20/65]: loss = 3.0451278686523438, lr = 0.000125
+2025-09-18 05:29:08 INFO     Epoch 79 [20/65]: loss = 3.0451278686523438, lr = 0.000125
+2025-09-18 05:29:19 INFO     Epoch 79 [30/65]: loss = 3.042287588119507, lr = 0.000125
+2025-09-18 05:29:19 INFO     Epoch 79 [30/65]: loss = 3.042287588119507, lr = 0.000125
+2025-09-18 05:29:31 INFO     Epoch 79 [40/65]: loss = 3.076444149017334, lr = 0.000125
+2025-09-18 05:29:31 INFO     Epoch 79 [40/65]: loss = 3.076444149017334, lr = 0.000125
+2025-09-18 05:29:42 INFO     Epoch 79 [50/65]: loss = 3.061469316482544, lr = 0.000125
+2025-09-18 05:29:42 INFO     Epoch 79 [50/65]: loss = 3.061469316482544, lr = 0.000125
+2025-09-18 05:29:54 INFO     Epoch 79 [60/65]: loss = 3.0244140625, lr = 0.000125
+2025-09-18 05:29:54 INFO     Epoch 79 [60/65]: loss = 3.0244140625, lr = 0.000125
+2025-09-18 05:30:00 INFO     Epoch 80 [0/65]: loss = 3.0291359424591064, lr = 0.000125
+2025-09-18 05:30:00 INFO     Epoch 80 [0/65]: loss = 3.0291359424591064, lr = 0.000125
+2025-09-18 05:30:12 INFO     Epoch 80 [10/65]: loss = 3.1559343338012695, lr = 0.000125
+2025-09-18 05:30:12 INFO     Epoch 80 [10/65]: loss = 3.1559343338012695, lr = 0.000125
+2025-09-18 05:30:23 INFO     Epoch 80 [20/65]: loss = 3.1092703342437744, lr = 0.000125
+2025-09-18 05:30:23 INFO     Epoch 80 [20/65]: loss = 3.1092703342437744, lr = 0.000125
+2025-09-18 05:30:34 INFO     Epoch 80 [30/65]: loss = 3.0734643936157227, lr = 0.000125
+2025-09-18 05:30:34 INFO     Epoch 80 [30/65]: loss = 3.0734643936157227, lr = 0.000125
+2025-09-18 05:30:46 INFO     Epoch 80 [40/65]: loss = 3.1542749404907227, lr = 0.000125
+2025-09-18 05:30:46 INFO     Epoch 80 [40/65]: loss = 3.1542749404907227, lr = 0.000125
+2025-09-18 05:30:57 INFO     Epoch 80 [50/65]: loss = 3.0523805618286133, lr = 0.000125
+2025-09-18 05:30:57 INFO     Epoch 80 [50/65]: loss = 3.0523805618286133, lr = 0.000125
+2025-09-18 05:31:09 INFO     Epoch 80 [60/65]: loss = 3.0647103786468506, lr = 0.000125
+2025-09-18 05:31:09 INFO     Epoch 80 [60/65]: loss = 3.0647103786468506, lr = 0.000125
+2025-09-18 05:31:15 INFO     Epoch 81 [0/65]: loss = 3.0377037525177, lr = 0.000125
+2025-09-18 05:31:15 INFO     Epoch 81 [0/65]: loss = 3.0377037525177, lr = 0.000125
+2025-09-18 05:31:27 INFO     Epoch 81 [10/65]: loss = 3.1602067947387695, lr = 0.000125
+2025-09-18 05:31:27 INFO     Epoch 81 [10/65]: loss = 3.1602067947387695, lr = 0.000125
+2025-09-18 05:31:38 INFO     Epoch 81 [20/65]: loss = 3.0002546310424805, lr = 0.000125
+2025-09-18 05:31:38 INFO     Epoch 81 [20/65]: loss = 3.0002546310424805, lr = 0.000125
+2025-09-18 05:31:50 INFO     Epoch 81 [30/65]: loss = 3.1458663940429688, lr = 0.000125
+2025-09-18 05:31:50 INFO     Epoch 81 [30/65]: loss = 3.1458663940429688, lr = 0.000125
+2025-09-18 05:32:01 INFO     Epoch 81 [40/65]: loss = 3.0329952239990234, lr = 0.000125
+2025-09-18 05:32:01 INFO     Epoch 81 [40/65]: loss = 3.0329952239990234, lr = 0.000125
+2025-09-18 05:32:13 INFO     Epoch 81 [50/65]: loss = 3.0233802795410156, lr = 0.000125
+2025-09-18 05:32:13 INFO     Epoch 81 [50/65]: loss = 3.0233802795410156, lr = 0.000125
+2025-09-18 05:32:24 INFO     Epoch 81 [60/65]: loss = 3.0817270278930664, lr = 0.000125
+2025-09-18 05:32:24 INFO     Epoch 81 [60/65]: loss = 3.0817270278930664, lr = 0.000125
+2025-09-18 05:32:31 INFO     Epoch 82 [0/65]: loss = 3.0653953552246094, lr = 0.000125
+2025-09-18 05:32:31 INFO     Epoch 82 [0/65]: loss = 3.0653953552246094, lr = 0.000125
+2025-09-18 05:32:42 INFO     Epoch 82 [10/65]: loss = 3.041329860687256, lr = 0.000125
+2025-09-18 05:32:42 INFO     Epoch 82 [10/65]: loss = 3.041329860687256, lr = 0.000125
+2025-09-18 05:32:54 INFO     Epoch 82 [20/65]: loss = 2.997744083404541, lr = 0.000125
+2025-09-18 05:32:54 INFO     Epoch 82 [20/65]: loss = 2.997744083404541, lr = 0.000125
+2025-09-18 05:33:05 INFO     Epoch 82 [30/65]: loss = 2.9749512672424316, lr = 0.000125
+2025-09-18 05:33:05 INFO     Epoch 82 [30/65]: loss = 2.9749512672424316, lr = 0.000125
+2025-09-18 05:33:17 INFO     Epoch 82 [40/65]: loss = 3.080840826034546, lr = 0.000125
+2025-09-18 05:33:17 INFO     Epoch 82 [40/65]: loss = 3.080840826034546, lr = 0.000125
+2025-09-18 05:33:28 INFO     Epoch 82 [50/65]: loss = 3.1299915313720703, lr = 0.000125
+2025-09-18 05:33:28 INFO     Epoch 82 [50/65]: loss = 3.1299915313720703, lr = 0.000125
+2025-09-18 05:33:39 INFO     Epoch 82 [60/65]: loss = 3.1105480194091797, lr = 0.000125
+2025-09-18 05:33:39 INFO     Epoch 82 [60/65]: loss = 3.1105480194091797, lr = 0.000125
+2025-09-18 05:33:46 INFO     Epoch 83 [0/65]: loss = 3.0187387466430664, lr = 0.000125
+2025-09-18 05:33:46 INFO     Epoch 83 [0/65]: loss = 3.0187387466430664, lr = 0.000125
+2025-09-18 05:33:57 INFO     Epoch 83 [10/65]: loss = 3.0503158569335938, lr = 0.000125
+2025-09-18 05:33:57 INFO     Epoch 83 [10/65]: loss = 3.0503158569335938, lr = 0.000125
+2025-09-18 05:34:09 INFO     Epoch 83 [20/65]: loss = 3.0682361125946045, lr = 0.000125
+2025-09-18 05:34:09 INFO     Epoch 83 [20/65]: loss = 3.0682361125946045, lr = 0.000125
+2025-09-18 05:34:20 INFO     Epoch 83 [30/65]: loss = 2.936927318572998, lr = 0.000125
+2025-09-18 05:34:20 INFO     Epoch 83 [30/65]: loss = 2.936927318572998, lr = 0.000125
+2025-09-18 05:34:31 INFO     Epoch 83 [40/65]: loss = 3.0796589851379395, lr = 0.000125
+2025-09-18 05:34:31 INFO     Epoch 83 [40/65]: loss = 3.0796589851379395, lr = 0.000125
+2025-09-18 05:34:43 INFO     Epoch 83 [50/65]: loss = 3.0741753578186035, lr = 0.000125
+2025-09-18 05:34:43 INFO     Epoch 83 [50/65]: loss = 3.0741753578186035, lr = 0.000125
+2025-09-18 05:34:54 INFO     Epoch 83 [60/65]: loss = 3.134676933288574, lr = 0.000125
+2025-09-18 05:34:54 INFO     Epoch 83 [60/65]: loss = 3.134676933288574, lr = 0.000125
+2025-09-18 05:35:01 INFO     Epoch 84 [0/65]: loss = 3.0249581336975098, lr = 0.000125
+2025-09-18 05:35:01 INFO     Epoch 84 [0/65]: loss = 3.0249581336975098, lr = 0.000125
+2025-09-18 05:35:12 INFO     Epoch 84 [10/65]: loss = 3.0221168994903564, lr = 0.000125
+2025-09-18 05:35:12 INFO     Epoch 84 [10/65]: loss = 3.0221168994903564, lr = 0.000125
+2025-09-18 05:35:24 INFO     Epoch 84 [20/65]: loss = 3.0717055797576904, lr = 0.000125
+2025-09-18 05:35:24 INFO     Epoch 84 [20/65]: loss = 3.0717055797576904, lr = 0.000125
+2025-09-18 05:35:35 INFO     Epoch 84 [30/65]: loss = 2.978034496307373, lr = 0.000125
+2025-09-18 05:35:35 INFO     Epoch 84 [30/65]: loss = 2.978034496307373, lr = 0.000125
+2025-09-18 05:35:47 INFO     Epoch 84 [40/65]: loss = 3.11733341217041, lr = 0.000125
+2025-09-18 05:35:47 INFO     Epoch 84 [40/65]: loss = 3.11733341217041, lr = 0.000125
+2025-09-18 05:35:58 INFO     Epoch 84 [50/65]: loss = 3.0867176055908203, lr = 0.000125
+2025-09-18 05:35:58 INFO     Epoch 84 [50/65]: loss = 3.0867176055908203, lr = 0.000125
+2025-09-18 05:36:10 INFO     Epoch 84 [60/65]: loss = 3.14217472076416, lr = 0.000125
+2025-09-18 05:36:10 INFO     Epoch 84 [60/65]: loss = 3.14217472076416, lr = 0.000125
+2025-09-18 05:36:16 INFO     Epoch 85 [0/65]: loss = 3.0139336585998535, lr = 0.000125
+2025-09-18 05:36:16 INFO     Epoch 85 [0/65]: loss = 3.0139336585998535, lr = 0.000125
+2025-09-18 05:36:28 INFO     Epoch 85 [10/65]: loss = 2.9772467613220215, lr = 0.000125
+2025-09-18 05:36:28 INFO     Epoch 85 [10/65]: loss = 2.9772467613220215, lr = 0.000125
+2025-09-18 05:36:39 INFO     Epoch 85 [20/65]: loss = 3.1609225273132324, lr = 0.000125
+2025-09-18 05:36:39 INFO     Epoch 85 [20/65]: loss = 3.1609225273132324, lr = 0.000125
+2025-09-18 05:36:51 INFO     Epoch 85 [30/65]: loss = 3.1267528533935547, lr = 0.000125
+2025-09-18 05:36:51 INFO     Epoch 85 [30/65]: loss = 3.1267528533935547, lr = 0.000125
+2025-09-18 05:37:02 INFO     Epoch 85 [40/65]: loss = 2.981044292449951, lr = 0.000125
+2025-09-18 05:37:02 INFO     Epoch 85 [40/65]: loss = 2.981044292449951, lr = 0.000125
+2025-09-18 05:37:14 INFO     Epoch 85 [50/65]: loss = 3.1082043647766113, lr = 0.000125
+2025-09-18 05:37:14 INFO     Epoch 85 [50/65]: loss = 3.1082043647766113, lr = 0.000125
+2025-09-18 05:37:25 INFO     Epoch 85 [60/65]: loss = 3.05250883102417, lr = 0.000125
+2025-09-18 05:37:25 INFO     Epoch 85 [60/65]: loss = 3.05250883102417, lr = 0.000125
+2025-09-18 05:37:32 INFO     Epoch 86 [0/65]: loss = 3.0986857414245605, lr = 0.000125
+2025-09-18 05:37:32 INFO     Epoch 86 [0/65]: loss = 3.0986857414245605, lr = 0.000125
+2025-09-18 05:37:43 INFO     Epoch 86 [10/65]: loss = 2.9636852741241455, lr = 0.000125
+2025-09-18 05:37:43 INFO     Epoch 86 [10/65]: loss = 2.9636852741241455, lr = 0.000125
+2025-09-18 05:37:55 INFO     Epoch 86 [20/65]: loss = 3.0713233947753906, lr = 0.000125
+2025-09-18 05:37:55 INFO     Epoch 86 [20/65]: loss = 3.0713233947753906, lr = 0.000125
+2025-09-18 05:38:06 INFO     Epoch 86 [30/65]: loss = 2.9868459701538086, lr = 0.000125
+2025-09-18 05:38:06 INFO     Epoch 86 [30/65]: loss = 2.9868459701538086, lr = 0.000125
+2025-09-18 05:38:18 INFO     Epoch 86 [40/65]: loss = 3.1263632774353027, lr = 0.000125
+2025-09-18 05:38:18 INFO     Epoch 86 [40/65]: loss = 3.1263632774353027, lr = 0.000125
+2025-09-18 05:38:29 INFO     Epoch 86 [50/65]: loss = 3.019610643386841, lr = 0.000125
+2025-09-18 05:38:29 INFO     Epoch 86 [50/65]: loss = 3.019610643386841, lr = 0.000125
+2025-09-18 05:38:41 INFO     Epoch 86 [60/65]: loss = 2.9927546977996826, lr = 0.000125
+2025-09-18 05:38:41 INFO     Epoch 86 [60/65]: loss = 2.9927546977996826, lr = 0.000125
+2025-09-18 05:38:47 INFO     Epoch 87 [0/65]: loss = 3.1124773025512695, lr = 0.000125
+2025-09-18 05:38:47 INFO     Epoch 87 [0/65]: loss = 3.1124773025512695, lr = 0.000125
+2025-09-18 05:38:59 INFO     Epoch 87 [10/65]: loss = 3.014233112335205, lr = 0.000125
+2025-09-18 05:38:59 INFO     Epoch 87 [10/65]: loss = 3.014233112335205, lr = 0.000125
+2025-09-18 05:39:10 INFO     Epoch 87 [20/65]: loss = 3.0762462615966797, lr = 0.000125
+2025-09-18 05:39:10 INFO     Epoch 87 [20/65]: loss = 3.0762462615966797, lr = 0.000125
+2025-09-18 05:39:22 INFO     Epoch 87 [30/65]: loss = 2.981567621231079, lr = 0.000125
+2025-09-18 05:39:22 INFO     Epoch 87 [30/65]: loss = 2.981567621231079, lr = 0.000125
+2025-09-18 05:39:33 INFO     Epoch 87 [40/65]: loss = 3.1583778858184814, lr = 0.000125
+2025-09-18 05:39:33 INFO     Epoch 87 [40/65]: loss = 3.1583778858184814, lr = 0.000125
+2025-09-18 05:39:45 INFO     Epoch 87 [50/65]: loss = 3.102389335632324, lr = 0.000125
+2025-09-18 05:39:45 INFO     Epoch 87 [50/65]: loss = 3.102389335632324, lr = 0.000125
+2025-09-18 05:39:56 INFO     Epoch 87 [60/65]: loss = 2.985823631286621, lr = 0.000125
+2025-09-18 05:39:56 INFO     Epoch 87 [60/65]: loss = 2.985823631286621, lr = 0.000125
+2025-09-18 05:40:03 INFO     Epoch 88 [0/65]: loss = 3.1331310272216797, lr = 0.000125
+2025-09-18 05:40:03 INFO     Epoch 88 [0/65]: loss = 3.1331310272216797, lr = 0.000125
+2025-09-18 05:40:14 INFO     Epoch 88 [10/65]: loss = 3.085805654525757, lr = 0.000125
+2025-09-18 05:40:14 INFO     Epoch 88 [10/65]: loss = 3.085805654525757, lr = 0.000125
+2025-09-18 05:40:26 INFO     Epoch 88 [20/65]: loss = 3.0014798641204834, lr = 0.000125
+2025-09-18 05:40:26 INFO     Epoch 88 [20/65]: loss = 3.0014798641204834, lr = 0.000125
+2025-09-18 05:40:37 INFO     Epoch 88 [30/65]: loss = 3.028621196746826, lr = 0.000125
+2025-09-18 05:40:37 INFO     Epoch 88 [30/65]: loss = 3.028621196746826, lr = 0.000125
+2025-09-18 05:40:48 INFO     Epoch 88 [40/65]: loss = 3.0968732833862305, lr = 0.000125
+2025-09-18 05:40:48 INFO     Epoch 88 [40/65]: loss = 3.0968732833862305, lr = 0.000125
+2025-09-18 05:41:00 INFO     Epoch 88 [50/65]: loss = 3.047311305999756, lr = 0.000125
+2025-09-18 05:41:00 INFO     Epoch 88 [50/65]: loss = 3.047311305999756, lr = 0.000125
+2025-09-18 05:41:11 INFO     Epoch 88 [60/65]: loss = 2.9623920917510986, lr = 0.000125
+2025-09-18 05:41:11 INFO     Epoch 88 [60/65]: loss = 2.9623920917510986, lr = 0.000125
+2025-09-18 05:41:17 INFO     Epoch 89 [0/65]: loss = 2.9992799758911133, lr = 0.000125
+2025-09-18 05:41:17 INFO     Epoch 89 [0/65]: loss = 2.9992799758911133, lr = 0.000125
+2025-09-18 05:41:29 INFO     Epoch 89 [10/65]: loss = 3.1309447288513184, lr = 0.000125
+2025-09-18 05:41:29 INFO     Epoch 89 [10/65]: loss = 3.1309447288513184, lr = 0.000125
+2025-09-18 05:41:40 INFO     Epoch 89 [20/65]: loss = 2.9783077239990234, lr = 0.000125
+2025-09-18 05:41:40 INFO     Epoch 89 [20/65]: loss = 2.9783077239990234, lr = 0.000125
+2025-09-18 05:41:52 INFO     Epoch 89 [30/65]: loss = 3.0389463901519775, lr = 0.000125
+2025-09-18 05:41:52 INFO     Epoch 89 [30/65]: loss = 3.0389463901519775, lr = 0.000125
+2025-09-18 05:42:03 INFO     Epoch 89 [40/65]: loss = 3.1279377937316895, lr = 0.000125
+2025-09-18 05:42:03 INFO     Epoch 89 [40/65]: loss = 3.1279377937316895, lr = 0.000125
+2025-09-18 05:42:15 INFO     Epoch 89 [50/65]: loss = 3.113250732421875, lr = 0.000125
+2025-09-18 05:42:15 INFO     Epoch 89 [50/65]: loss = 3.113250732421875, lr = 0.000125
+2025-09-18 05:42:26 INFO     Epoch 89 [60/65]: loss = 3.0596213340759277, lr = 0.000125
+2025-09-18 05:42:26 INFO     Epoch 89 [60/65]: loss = 3.0596213340759277, lr = 0.000125
+2025-09-18 05:42:33 INFO     Epoch 90 [0/65]: loss = 3.115177631378174, lr = 0.000125
+2025-09-18 05:42:33 INFO     Epoch 90 [0/65]: loss = 3.115177631378174, lr = 0.000125
+2025-09-18 05:42:44 INFO     Epoch 90 [10/65]: loss = 3.072397470474243, lr = 0.000125
+2025-09-18 05:42:44 INFO     Epoch 90 [10/65]: loss = 3.072397470474243, lr = 0.000125
+2025-09-18 05:42:56 INFO     Epoch 90 [20/65]: loss = 3.1558613777160645, lr = 0.000125
+2025-09-18 05:42:56 INFO     Epoch 90 [20/65]: loss = 3.1558613777160645, lr = 0.000125
+2025-09-18 05:43:07 INFO     Epoch 90 [30/65]: loss = 2.9791553020477295, lr = 0.000125
+2025-09-18 05:43:07 INFO     Epoch 90 [30/65]: loss = 2.9791553020477295, lr = 0.000125
+2025-09-18 05:43:19 INFO     Epoch 90 [40/65]: loss = 2.961764335632324, lr = 0.000125
+2025-09-18 05:43:19 INFO     Epoch 90 [40/65]: loss = 2.961764335632324, lr = 0.000125
+2025-09-18 05:43:30 INFO     Epoch 90 [50/65]: loss = 3.132504940032959, lr = 0.000125
+2025-09-18 05:43:30 INFO     Epoch 90 [50/65]: loss = 3.132504940032959, lr = 0.000125
+2025-09-18 05:43:42 INFO     Epoch 90 [60/65]: loss = 3.141627311706543, lr = 0.000125
+2025-09-18 05:43:42 INFO     Epoch 90 [60/65]: loss = 3.141627311706543, lr = 0.000125
+2025-09-18 05:43:48 INFO     Epoch 91 [0/65]: loss = 3.125770330429077, lr = 0.000125
+2025-09-18 05:43:48 INFO     Epoch 91 [0/65]: loss = 3.125770330429077, lr = 0.000125
+2025-09-18 05:44:00 INFO     Epoch 91 [10/65]: loss = 3.0635690689086914, lr = 0.000125
+2025-09-18 05:44:00 INFO     Epoch 91 [10/65]: loss = 3.0635690689086914, lr = 0.000125
+2025-09-18 05:44:11 INFO     Epoch 91 [20/65]: loss = 2.9882588386535645, lr = 0.000125
+2025-09-18 05:44:11 INFO     Epoch 91 [20/65]: loss = 2.9882588386535645, lr = 0.000125
+2025-09-18 05:44:23 INFO     Epoch 91 [30/65]: loss = 2.991880416870117, lr = 0.000125
+2025-09-18 05:44:23 INFO     Epoch 91 [30/65]: loss = 2.991880416870117, lr = 0.000125
+2025-09-18 05:44:34 INFO     Epoch 91 [40/65]: loss = 2.998835563659668, lr = 0.000125
+2025-09-18 05:44:34 INFO     Epoch 91 [40/65]: loss = 2.998835563659668, lr = 0.000125
+2025-09-18 05:44:46 INFO     Epoch 91 [50/65]: loss = 3.025947093963623, lr = 0.000125
+2025-09-18 05:44:46 INFO     Epoch 91 [50/65]: loss = 3.025947093963623, lr = 0.000125
+2025-09-18 05:44:57 INFO     Epoch 91 [60/65]: loss = 2.984257221221924, lr = 0.000125
+2025-09-18 05:44:57 INFO     Epoch 91 [60/65]: loss = 2.984257221221924, lr = 0.000125
+2025-09-18 05:45:04 INFO     Epoch 92 [0/65]: loss = 3.1617321968078613, lr = 0.000125
+2025-09-18 05:45:04 INFO     Epoch 92 [0/65]: loss = 3.1617321968078613, lr = 0.000125
+2025-09-18 05:45:15 INFO     Epoch 92 [10/65]: loss = 3.0874645709991455, lr = 0.000125
+2025-09-18 05:45:15 INFO     Epoch 92 [10/65]: loss = 3.0874645709991455, lr = 0.000125
+2025-09-18 05:45:27 INFO     Epoch 92 [20/65]: loss = 3.073859930038452, lr = 0.000125
+2025-09-18 05:45:27 INFO     Epoch 92 [20/65]: loss = 3.073859930038452, lr = 0.000125
+2025-09-18 05:45:38 INFO     Epoch 92 [30/65]: loss = 2.949237108230591, lr = 0.000125
+2025-09-18 05:45:38 INFO     Epoch 92 [30/65]: loss = 2.949237108230591, lr = 0.000125
+2025-09-18 05:45:49 INFO     Epoch 92 [40/65]: loss = 2.9095053672790527, lr = 0.000125
+2025-09-18 05:45:49 INFO     Epoch 92 [40/65]: loss = 2.9095053672790527, lr = 0.000125
+2025-09-18 05:46:00 INFO     Epoch 92 [50/65]: loss = 3.122128486633301, lr = 0.000125
+2025-09-18 05:46:00 INFO     Epoch 92 [50/65]: loss = 3.122128486633301, lr = 0.000125
+2025-09-18 05:46:12 INFO     Epoch 92 [60/65]: loss = 3.1259994506835938, lr = 0.000125
+2025-09-18 05:46:12 INFO     Epoch 92 [60/65]: loss = 3.1259994506835938, lr = 0.000125
+2025-09-18 05:46:18 INFO     Epoch 93 [0/65]: loss = 2.997847080230713, lr = 0.000125
+2025-09-18 05:46:18 INFO     Epoch 93 [0/65]: loss = 2.997847080230713, lr = 0.000125
+2025-09-18 05:46:30 INFO     Epoch 93 [10/65]: loss = 3.1346545219421387, lr = 0.000125
+2025-09-18 05:46:30 INFO     Epoch 93 [10/65]: loss = 3.1346545219421387, lr = 0.000125
+2025-09-18 05:46:41 INFO     Epoch 93 [20/65]: loss = 2.9249191284179688, lr = 0.000125
+2025-09-18 05:46:41 INFO     Epoch 93 [20/65]: loss = 2.9249191284179688, lr = 0.000125
+2025-09-18 05:46:52 INFO     Epoch 93 [30/65]: loss = 3.0423333644866943, lr = 0.000125
+2025-09-18 05:46:52 INFO     Epoch 93 [30/65]: loss = 3.0423333644866943, lr = 0.000125
+2025-09-18 05:47:04 INFO     Epoch 93 [40/65]: loss = 3.083811044692993, lr = 0.000125
+2025-09-18 05:47:04 INFO     Epoch 93 [40/65]: loss = 3.083811044692993, lr = 0.000125
+2025-09-18 05:47:15 INFO     Epoch 93 [50/65]: loss = 2.9964518547058105, lr = 0.000125
+2025-09-18 05:47:15 INFO     Epoch 93 [50/65]: loss = 2.9964518547058105, lr = 0.000125
+2025-09-18 05:47:27 INFO     Epoch 93 [60/65]: loss = 3.083042621612549, lr = 0.000125
+2025-09-18 05:47:27 INFO     Epoch 93 [60/65]: loss = 3.083042621612549, lr = 0.000125
+2025-09-18 05:47:33 INFO     Epoch 94 [0/65]: loss = 2.9603092670440674, lr = 0.000125
+2025-09-18 05:47:33 INFO     Epoch 94 [0/65]: loss = 2.9603092670440674, lr = 0.000125
+2025-09-18 05:47:45 INFO     Epoch 94 [10/65]: loss = 2.9908030033111572, lr = 0.000125
+2025-09-18 05:47:45 INFO     Epoch 94 [10/65]: loss = 2.9908030033111572, lr = 0.000125
+2025-09-18 05:47:56 INFO     Epoch 94 [20/65]: loss = 3.0391125679016113, lr = 0.000125
+2025-09-18 05:47:56 INFO     Epoch 94 [20/65]: loss = 3.0391125679016113, lr = 0.000125
+2025-09-18 05:48:08 INFO     Epoch 94 [30/65]: loss = 3.004091262817383, lr = 0.000125
+2025-09-18 05:48:08 INFO     Epoch 94 [30/65]: loss = 3.004091262817383, lr = 0.000125
+2025-09-18 05:48:19 INFO     Epoch 94 [40/65]: loss = 2.9832096099853516, lr = 0.000125
+2025-09-18 05:48:19 INFO     Epoch 94 [40/65]: loss = 2.9832096099853516, lr = 0.000125
+2025-09-18 05:48:31 INFO     Epoch 94 [50/65]: loss = 3.09177303314209, lr = 0.000125
+2025-09-18 05:48:31 INFO     Epoch 94 [50/65]: loss = 3.09177303314209, lr = 0.000125
+2025-09-18 05:48:42 INFO     Epoch 94 [60/65]: loss = 3.0846362113952637, lr = 0.000125
+2025-09-18 05:48:42 INFO     Epoch 94 [60/65]: loss = 3.0846362113952637, lr = 0.000125
+2025-09-18 05:48:48 INFO     Epoch 95 [0/65]: loss = 3.1640148162841797, lr = 0.000125
+2025-09-18 05:48:48 INFO     Epoch 95 [0/65]: loss = 3.1640148162841797, lr = 0.000125
+2025-09-18 05:49:00 INFO     Epoch 95 [10/65]: loss = 3.0720481872558594, lr = 0.000125
+2025-09-18 05:49:00 INFO     Epoch 95 [10/65]: loss = 3.0720481872558594, lr = 0.000125
+2025-09-18 05:49:12 INFO     Epoch 95 [20/65]: loss = 2.998154640197754, lr = 0.000125
+2025-09-18 05:49:12 INFO     Epoch 95 [20/65]: loss = 2.998154640197754, lr = 0.000125
+2025-09-18 05:49:23 INFO     Epoch 95 [30/65]: loss = 3.1109180450439453, lr = 0.000125
+2025-09-18 05:49:23 INFO     Epoch 95 [30/65]: loss = 3.1109180450439453, lr = 0.000125
+2025-09-18 05:49:35 INFO     Epoch 95 [40/65]: loss = 3.064502716064453, lr = 0.000125
+2025-09-18 05:49:35 INFO     Epoch 95 [40/65]: loss = 3.064502716064453, lr = 0.000125
+2025-09-18 05:49:46 INFO     Epoch 95 [50/65]: loss = 2.9577178955078125, lr = 0.000125
+2025-09-18 05:49:46 INFO     Epoch 95 [50/65]: loss = 2.9577178955078125, lr = 0.000125
+2025-09-18 05:49:58 INFO     Epoch 95 [60/65]: loss = 2.9842581748962402, lr = 0.000125
+2025-09-18 05:49:58 INFO     Epoch 95 [60/65]: loss = 2.9842581748962402, lr = 0.000125
+2025-09-18 05:50:04 INFO     Epoch 96 [0/65]: loss = 3.0744054317474365, lr = 0.000125
+2025-09-18 05:50:04 INFO     Epoch 96 [0/65]: loss = 3.0744054317474365, lr = 0.000125
+2025-09-18 05:50:15 INFO     Epoch 96 [10/65]: loss = 3.063167095184326, lr = 0.000125
+2025-09-18 05:50:15 INFO     Epoch 96 [10/65]: loss = 3.063167095184326, lr = 0.000125
+2025-09-18 05:50:27 INFO     Epoch 96 [20/65]: loss = 3.0247557163238525, lr = 0.000125
+2025-09-18 05:50:27 INFO     Epoch 96 [20/65]: loss = 3.0247557163238525, lr = 0.000125
+2025-09-18 05:50:38 INFO     Epoch 96 [30/65]: loss = 3.0751442909240723, lr = 0.000125
+2025-09-18 05:50:38 INFO     Epoch 96 [30/65]: loss = 3.0751442909240723, lr = 0.000125
+2025-09-18 05:50:49 INFO     Epoch 96 [40/65]: loss = 3.1020925045013428, lr = 0.000125
+2025-09-18 05:50:49 INFO     Epoch 96 [40/65]: loss = 3.1020925045013428, lr = 0.000125
+2025-09-18 05:51:01 INFO     Epoch 96 [50/65]: loss = 3.008591651916504, lr = 0.000125
+2025-09-18 05:51:01 INFO     Epoch 96 [50/65]: loss = 3.008591651916504, lr = 0.000125
+2025-09-18 05:51:12 INFO     Epoch 96 [60/65]: loss = 3.0698394775390625, lr = 0.000125
+2025-09-18 05:51:12 INFO     Epoch 96 [60/65]: loss = 3.0698394775390625, lr = 0.000125
+2025-09-18 05:51:18 INFO     Epoch 97 [0/65]: loss = 3.0914204120635986, lr = 0.000125
+2025-09-18 05:51:18 INFO     Epoch 97 [0/65]: loss = 3.0914204120635986, lr = 0.000125
+2025-09-18 05:51:30 INFO     Epoch 97 [10/65]: loss = 3.0021414756774902, lr = 0.000125
+2025-09-18 05:51:30 INFO     Epoch 97 [10/65]: loss = 3.0021414756774902, lr = 0.000125
+2025-09-18 05:51:41 INFO     Epoch 97 [20/65]: loss = 3.056669235229492, lr = 0.000125
+2025-09-18 05:51:41 INFO     Epoch 97 [20/65]: loss = 3.056669235229492, lr = 0.000125
+2025-09-18 05:51:53 INFO     Epoch 97 [30/65]: loss = 2.9899237155914307, lr = 0.000125
+2025-09-18 05:51:53 INFO     Epoch 97 [30/65]: loss = 2.9899237155914307, lr = 0.000125
+2025-09-18 05:52:04 INFO     Epoch 97 [40/65]: loss = 3.0380730628967285, lr = 0.000125
+2025-09-18 05:52:04 INFO     Epoch 97 [40/65]: loss = 3.0380730628967285, lr = 0.000125
+2025-09-18 05:52:16 INFO     Epoch 97 [50/65]: loss = 3.00671648979187, lr = 0.000125
+2025-09-18 05:52:16 INFO     Epoch 97 [50/65]: loss = 3.00671648979187, lr = 0.000125
+2025-09-18 05:52:27 INFO     Epoch 97 [60/65]: loss = 3.0333943367004395, lr = 0.000125
+2025-09-18 05:52:27 INFO     Epoch 97 [60/65]: loss = 3.0333943367004395, lr = 0.000125
+2025-09-18 05:52:34 INFO     Epoch 98 [0/65]: loss = 3.0196046829223633, lr = 0.000125
+2025-09-18 05:52:34 INFO     Epoch 98 [0/65]: loss = 3.0196046829223633, lr = 0.000125
+2025-09-18 05:52:45 INFO     Epoch 98 [10/65]: loss = 3.1240501403808594, lr = 0.000125
+2025-09-18 05:52:45 INFO     Epoch 98 [10/65]: loss = 3.1240501403808594, lr = 0.000125
+2025-09-18 05:52:57 INFO     Epoch 98 [20/65]: loss = 3.028897285461426, lr = 0.000125
+2025-09-18 05:52:57 INFO     Epoch 98 [20/65]: loss = 3.028897285461426, lr = 0.000125
+2025-09-18 05:53:08 INFO     Epoch 98 [30/65]: loss = 3.027608633041382, lr = 0.000125
+2025-09-18 05:53:08 INFO     Epoch 98 [30/65]: loss = 3.027608633041382, lr = 0.000125
+2025-09-18 05:53:20 INFO     Epoch 98 [40/65]: loss = 3.041452169418335, lr = 0.000125
+2025-09-18 05:53:20 INFO     Epoch 98 [40/65]: loss = 3.041452169418335, lr = 0.000125
+2025-09-18 05:53:31 INFO     Epoch 98 [50/65]: loss = 3.0112557411193848, lr = 0.000125
+2025-09-18 05:53:31 INFO     Epoch 98 [50/65]: loss = 3.0112557411193848, lr = 0.000125
+2025-09-18 05:53:43 INFO     Epoch 98 [60/65]: loss = 3.004985809326172, lr = 0.000125
+2025-09-18 05:53:43 INFO     Epoch 98 [60/65]: loss = 3.004985809326172, lr = 0.000125
+2025-09-18 05:53:49 INFO     Epoch 99 [0/65]: loss = 3.023392915725708, lr = 0.000125
+2025-09-18 05:53:49 INFO     Epoch 99 [0/65]: loss = 3.023392915725708, lr = 0.000125
+2025-09-18 05:54:01 INFO     Epoch 99 [10/65]: loss = 3.018340587615967, lr = 0.000125
+2025-09-18 05:54:01 INFO     Epoch 99 [10/65]: loss = 3.018340587615967, lr = 0.000125
+2025-09-18 05:54:12 INFO     Epoch 99 [20/65]: loss = 3.1615281105041504, lr = 0.000125
+2025-09-18 05:54:12 INFO     Epoch 99 [20/65]: loss = 3.1615281105041504, lr = 0.000125
+2025-09-18 05:54:23 INFO     Epoch 99 [30/65]: loss = 3.0179553031921387, lr = 0.000125
+2025-09-18 05:54:23 INFO     Epoch 99 [30/65]: loss = 3.0179553031921387, lr = 0.000125
+2025-09-18 05:54:35 INFO     Epoch 99 [40/65]: loss = 3.152099609375, lr = 0.000125
+2025-09-18 05:54:35 INFO     Epoch 99 [40/65]: loss = 3.152099609375, lr = 0.000125
+2025-09-18 05:54:46 INFO     Epoch 99 [50/65]: loss = 3.077484130859375, lr = 0.000125
+2025-09-18 05:54:46 INFO     Epoch 99 [50/65]: loss = 3.077484130859375, lr = 0.000125
+2025-09-18 05:54:58 INFO     Epoch 99 [60/65]: loss = 3.0206756591796875, lr = 0.000125
+2025-09-18 05:54:58 INFO     Epoch 99 [60/65]: loss = 3.0206756591796875, lr = 0.000125
+2025-09-18 06:02:06 INFO     384 samples generated in 1024 evaluations.
+2025-09-18 06:02:14 INFO     384 samples generated in 1024 evaluations.
+2025-09-18 06:02:18 INFO     Evaluating [0/65] samples generated [384/500] running fid 137.54522705078125
+2025-09-18 06:02:18 INFO     Evaluating [0/65] samples generated [384/500] running fid 137.54522705078125
+2025-09-18 06:09:20 INFO     384 samples generated in 1024 evaluations.
+2025-09-18 06:09:26 INFO     384 samples generated in 1024 evaluations.
+2025-09-18 06:09:37 INFO     Evaluating [50/65] samples generated [500/500] running fid 112.09266662597656
+2025-09-18 06:09:37 INFO     Evaluating [50/65] samples generated [500/500] running fid 112.09266662597656
+2025-09-18 06:09:44 INFO     Epoch 100 [0/65]: loss = 2.9979166984558105, lr = 0.000125
+2025-09-18 06:09:44 INFO     Epoch 100 [0/65]: loss = 2.9979166984558105, lr = 0.000125
+2025-09-18 06:09:55 INFO     Epoch 100 [10/65]: loss = 2.980544090270996, lr = 0.000125
+2025-09-18 06:09:55 INFO     Epoch 100 [10/65]: loss = 2.980544090270996, lr = 0.000125
+2025-09-18 06:10:07 INFO     Epoch 100 [20/65]: loss = 3.0923354625701904, lr = 0.000125
+2025-09-18 06:10:07 INFO     Epoch 100 [20/65]: loss = 3.0923354625701904, lr = 0.000125
+2025-09-18 06:10:18 INFO     Epoch 100 [30/65]: loss = 3.0407145023345947, lr = 0.000125
+2025-09-18 06:10:18 INFO     Epoch 100 [30/65]: loss = 3.0407145023345947, lr = 0.000125
+2025-09-18 06:10:30 INFO     Epoch 100 [40/65]: loss = 2.962562322616577, lr = 0.000125
+2025-09-18 06:10:30 INFO     Epoch 100 [40/65]: loss = 2.962562322616577, lr = 0.000125
+2025-09-18 06:10:41 INFO     Epoch 100 [50/65]: loss = 2.923591375350952, lr = 0.000125
+2025-09-18 06:10:41 INFO     Epoch 100 [50/65]: loss = 2.923591375350952, lr = 0.000125
+2025-09-18 06:10:53 INFO     Epoch 100 [60/65]: loss = 2.9861245155334473, lr = 0.000125
+2025-09-18 06:10:53 INFO     Epoch 100 [60/65]: loss = 2.9861245155334473, lr = 0.000125
+2025-09-18 06:10:59 INFO     Epoch 101 [0/65]: loss = 3.04555606842041, lr = 0.000125
+2025-09-18 06:10:59 INFO     Epoch 101 [0/65]: loss = 3.04555606842041, lr = 0.000125
+2025-09-18 06:11:11 INFO     Epoch 101 [10/65]: loss = 3.0775508880615234, lr = 0.000125
+2025-09-18 06:11:11 INFO     Epoch 101 [10/65]: loss = 3.0775508880615234, lr = 0.000125
+2025-09-18 06:11:22 INFO     Epoch 101 [20/65]: loss = 3.0479462146759033, lr = 0.000125
+2025-09-18 06:11:22 INFO     Epoch 101 [20/65]: loss = 3.0479462146759033, lr = 0.000125
+2025-09-18 06:11:33 INFO     Epoch 101 [30/65]: loss = 3.066854238510132, lr = 0.000125
+2025-09-18 06:11:33 INFO     Epoch 101 [30/65]: loss = 3.066854238510132, lr = 0.000125
+2025-09-18 06:11:45 INFO     Epoch 101 [40/65]: loss = 2.9931883811950684, lr = 0.000125
+2025-09-18 06:11:45 INFO     Epoch 101 [40/65]: loss = 2.9931883811950684, lr = 0.000125
+2025-09-18 06:11:56 INFO     Epoch 101 [50/65]: loss = 3.0077202320098877, lr = 0.000125
+2025-09-18 06:11:56 INFO     Epoch 101 [50/65]: loss = 3.0077202320098877, lr = 0.000125
+2025-09-18 06:12:08 INFO     Epoch 101 [60/65]: loss = 3.01509952545166, lr = 0.000125
+2025-09-18 06:12:08 INFO     Epoch 101 [60/65]: loss = 3.01509952545166, lr = 0.000125
+2025-09-18 06:12:14 INFO     Epoch 102 [0/65]: loss = 2.9745535850524902, lr = 0.000125
+2025-09-18 06:12:14 INFO     Epoch 102 [0/65]: loss = 2.9745535850524902, lr = 0.000125
+2025-09-18 06:12:26 INFO     Epoch 102 [10/65]: loss = 2.84368896484375, lr = 0.000125
+2025-09-18 06:12:26 INFO     Epoch 102 [10/65]: loss = 2.84368896484375, lr = 0.000125
+2025-09-18 06:12:37 INFO     Epoch 102 [20/65]: loss = 3.0131912231445312, lr = 0.000125
+2025-09-18 06:12:37 INFO     Epoch 102 [20/65]: loss = 3.0131912231445312, lr = 0.000125
+2025-09-18 06:12:49 INFO     Epoch 102 [30/65]: loss = 2.9927291870117188, lr = 0.000125
+2025-09-18 06:12:49 INFO     Epoch 102 [30/65]: loss = 2.9927291870117188, lr = 0.000125
+2025-09-18 06:13:00 INFO     Epoch 102 [40/65]: loss = 2.923610210418701, lr = 0.000125
+2025-09-18 06:13:00 INFO     Epoch 102 [40/65]: loss = 2.923610210418701, lr = 0.000125
+2025-09-18 06:13:12 INFO     Epoch 102 [50/65]: loss = 3.0549094676971436, lr = 0.000125
+2025-09-18 06:13:12 INFO     Epoch 102 [50/65]: loss = 3.0549094676971436, lr = 0.000125
+2025-09-18 06:13:23 INFO     Epoch 102 [60/65]: loss = 3.043515920639038, lr = 0.000125
+2025-09-18 06:13:23 INFO     Epoch 102 [60/65]: loss = 3.043515920639038, lr = 0.000125
+2025-09-18 06:13:30 INFO     Epoch 103 [0/65]: loss = 3.0813589096069336, lr = 0.000125
+2025-09-18 06:13:30 INFO     Epoch 103 [0/65]: loss = 3.0813589096069336, lr = 0.000125
+2025-09-18 06:13:41 INFO     Epoch 103 [10/65]: loss = 3.0295019149780273, lr = 0.000125
+2025-09-18 06:13:41 INFO     Epoch 103 [10/65]: loss = 3.0295019149780273, lr = 0.000125
+2025-09-18 06:13:53 INFO     Epoch 103 [20/65]: loss = 3.0515871047973633, lr = 0.000125
+2025-09-18 06:13:53 INFO     Epoch 103 [20/65]: loss = 3.0515871047973633, lr = 0.000125
+2025-09-18 06:14:04 INFO     Epoch 103 [30/65]: loss = 3.093250274658203, lr = 0.000125
+2025-09-18 06:14:04 INFO     Epoch 103 [30/65]: loss = 3.093250274658203, lr = 0.000125
+2025-09-18 06:14:15 INFO     Epoch 103 [40/65]: loss = 3.0563602447509766, lr = 0.000125
+2025-09-18 06:14:15 INFO     Epoch 103 [40/65]: loss = 3.0563602447509766, lr = 0.000125
+2025-09-18 06:14:27 INFO     Epoch 103 [50/65]: loss = 3.030538558959961, lr = 0.000125
+2025-09-18 06:14:27 INFO     Epoch 103 [50/65]: loss = 3.030538558959961, lr = 0.000125
+2025-09-18 06:14:39 INFO     Epoch 103 [60/65]: loss = 2.969148874282837, lr = 0.000125
+2025-09-18 06:14:39 INFO     Epoch 103 [60/65]: loss = 2.969148874282837, lr = 0.000125
+2025-09-18 06:14:45 INFO     Epoch 104 [0/65]: loss = 3.146714687347412, lr = 0.000125
+2025-09-18 06:14:45 INFO     Epoch 104 [0/65]: loss = 3.146714687347412, lr = 0.000125
+2025-09-18 06:14:57 INFO     Epoch 104 [10/65]: loss = 2.9500341415405273, lr = 0.000125
+2025-09-18 06:14:57 INFO     Epoch 104 [10/65]: loss = 2.9500341415405273, lr = 0.000125
+2025-09-18 06:15:08 INFO     Epoch 104 [20/65]: loss = 2.9360666275024414, lr = 0.000125
+2025-09-18 06:15:08 INFO     Epoch 104 [20/65]: loss = 2.9360666275024414, lr = 0.000125
+2025-09-18 06:15:20 INFO     Epoch 104 [30/65]: loss = 3.0761284828186035, lr = 0.000125
+2025-09-18 06:15:20 INFO     Epoch 104 [30/65]: loss = 3.0761284828186035, lr = 0.000125
+2025-09-18 06:15:31 INFO     Epoch 104 [40/65]: loss = 3.0697708129882812, lr = 0.000125
+2025-09-18 06:15:31 INFO     Epoch 104 [40/65]: loss = 3.0697708129882812, lr = 0.000125
+2025-09-18 06:15:43 INFO     Epoch 104 [50/65]: loss = 3.016665458679199, lr = 0.000125
+2025-09-18 06:15:43 INFO     Epoch 104 [50/65]: loss = 3.016665458679199, lr = 0.000125
+2025-09-18 06:15:54 INFO     Epoch 104 [60/65]: loss = 3.1124558448791504, lr = 0.000125
+2025-09-18 06:15:54 INFO     Epoch 104 [60/65]: loss = 3.1124558448791504, lr = 0.000125
+2025-09-18 06:16:01 INFO     Epoch 105 [0/65]: loss = 2.993657350540161, lr = 0.000125
+2025-09-18 06:16:01 INFO     Epoch 105 [0/65]: loss = 2.993657350540161, lr = 0.000125
+2025-09-18 06:16:12 INFO     Epoch 105 [10/65]: loss = 2.977855682373047, lr = 0.000125
+2025-09-18 06:16:12 INFO     Epoch 105 [10/65]: loss = 2.977855682373047, lr = 0.000125
+2025-09-18 06:16:24 INFO     Epoch 105 [20/65]: loss = 2.830936908721924, lr = 0.000125
+2025-09-18 06:16:24 INFO     Epoch 105 [20/65]: loss = 2.830936908721924, lr = 0.000125
+2025-09-18 06:16:35 INFO     Epoch 105 [30/65]: loss = 2.9470181465148926, lr = 0.000125
+2025-09-18 06:16:35 INFO     Epoch 105 [30/65]: loss = 2.9470181465148926, lr = 0.000125
+2025-09-18 06:16:47 INFO     Epoch 105 [40/65]: loss = 3.0398800373077393, lr = 0.000125
+2025-09-18 06:16:47 INFO     Epoch 105 [40/65]: loss = 3.0398800373077393, lr = 0.000125
+2025-09-18 06:16:58 INFO     Epoch 105 [50/65]: loss = 3.0517144203186035, lr = 0.000125
+2025-09-18 06:16:58 INFO     Epoch 105 [50/65]: loss = 3.0517144203186035, lr = 0.000125
+2025-09-18 06:17:10 INFO     Epoch 105 [60/65]: loss = 3.0564756393432617, lr = 0.000125
+2025-09-18 06:17:10 INFO     Epoch 105 [60/65]: loss = 3.0564756393432617, lr = 0.000125
+2025-09-18 06:17:16 INFO     Epoch 106 [0/65]: loss = 3.1022157669067383, lr = 0.000125
+2025-09-18 06:17:16 INFO     Epoch 106 [0/65]: loss = 3.1022157669067383, lr = 0.000125
+2025-09-18 06:17:27 INFO     Epoch 106 [10/65]: loss = 2.946145534515381, lr = 0.000125
+2025-09-18 06:17:27 INFO     Epoch 106 [10/65]: loss = 2.946145534515381, lr = 0.000125
+2025-09-18 06:17:39 INFO     Epoch 106 [20/65]: loss = 3.1010096073150635, lr = 0.000125
+2025-09-18 06:17:39 INFO     Epoch 106 [20/65]: loss = 3.1010096073150635, lr = 0.000125
+2025-09-18 06:17:50 INFO     Epoch 106 [30/65]: loss = 3.0524392127990723, lr = 0.000125
+2025-09-18 06:17:50 INFO     Epoch 106 [30/65]: loss = 3.0524392127990723, lr = 0.000125
+2025-09-18 06:18:02 INFO     Epoch 106 [40/65]: loss = 3.1000897884368896, lr = 0.000125
+2025-09-18 06:18:02 INFO     Epoch 106 [40/65]: loss = 3.1000897884368896, lr = 0.000125
+2025-09-18 06:18:14 INFO     Epoch 106 [50/65]: loss = 3.0780205726623535, lr = 0.000125
+2025-09-18 06:18:14 INFO     Epoch 106 [50/65]: loss = 3.0780205726623535, lr = 0.000125
+2025-09-18 06:18:25 INFO     Epoch 106 [60/65]: loss = 2.9743025302886963, lr = 0.000125
+2025-09-18 06:18:25 INFO     Epoch 106 [60/65]: loss = 2.9743025302886963, lr = 0.000125
+2025-09-18 06:18:32 INFO     Epoch 107 [0/65]: loss = 2.987095832824707, lr = 0.000125
+2025-09-18 06:18:32 INFO     Epoch 107 [0/65]: loss = 2.987095832824707, lr = 0.000125
+2025-09-18 06:18:43 INFO     Epoch 107 [10/65]: loss = 3.019191026687622, lr = 0.000125
+2025-09-18 06:18:43 INFO     Epoch 107 [10/65]: loss = 3.019191026687622, lr = 0.000125
+2025-09-18 06:18:55 INFO     Epoch 107 [20/65]: loss = 3.0781750679016113, lr = 0.000125
+2025-09-18 06:18:55 INFO     Epoch 107 [20/65]: loss = 3.0781750679016113, lr = 0.000125
+2025-09-18 06:19:06 INFO     Epoch 107 [30/65]: loss = 2.9656858444213867, lr = 0.000125
+2025-09-18 06:19:06 INFO     Epoch 107 [30/65]: loss = 2.9656858444213867, lr = 0.000125
+2025-09-18 06:19:18 INFO     Epoch 107 [40/65]: loss = 2.9452309608459473, lr = 0.000125
+2025-09-18 06:19:18 INFO     Epoch 107 [40/65]: loss = 2.9452309608459473, lr = 0.000125
+2025-09-18 06:19:29 INFO     Epoch 107 [50/65]: loss = 2.917100429534912, lr = 0.000125
+2025-09-18 06:19:29 INFO     Epoch 107 [50/65]: loss = 2.917100429534912, lr = 0.000125
+2025-09-18 06:19:41 INFO     Epoch 107 [60/65]: loss = 2.9093997478485107, lr = 0.000125
+2025-09-18 06:19:41 INFO     Epoch 107 [60/65]: loss = 2.9093997478485107, lr = 0.000125
+2025-09-18 06:19:47 INFO     Epoch 108 [0/65]: loss = 2.949611186981201, lr = 0.000125
+2025-09-18 06:19:47 INFO     Epoch 108 [0/65]: loss = 2.949611186981201, lr = 0.000125
+2025-09-18 06:19:59 INFO     Epoch 108 [10/65]: loss = 3.086455821990967, lr = 0.000125
+2025-09-18 06:19:59 INFO     Epoch 108 [10/65]: loss = 3.086455821990967, lr = 0.000125
+2025-09-18 06:20:10 INFO     Epoch 108 [20/65]: loss = 3.006141185760498, lr = 0.000125
+2025-09-18 06:20:10 INFO     Epoch 108 [20/65]: loss = 3.006141185760498, lr = 0.000125
+2025-09-18 06:20:22 INFO     Epoch 108 [30/65]: loss = 3.0212769508361816, lr = 0.000125
+2025-09-18 06:20:22 INFO     Epoch 108 [30/65]: loss = 3.0212769508361816, lr = 0.000125
+2025-09-18 06:20:33 INFO     Epoch 108 [40/65]: loss = 2.994532585144043, lr = 0.000125
+2025-09-18 06:20:33 INFO     Epoch 108 [40/65]: loss = 2.994532585144043, lr = 0.000125
+2025-09-18 06:20:45 INFO     Epoch 108 [50/65]: loss = 3.0891013145446777, lr = 0.000125
+2025-09-18 06:20:45 INFO     Epoch 108 [50/65]: loss = 3.0891013145446777, lr = 0.000125
+2025-09-18 06:20:56 INFO     Epoch 108 [60/65]: loss = 3.1006619930267334, lr = 0.000125
+2025-09-18 06:20:56 INFO     Epoch 108 [60/65]: loss = 3.1006619930267334, lr = 0.000125
+2025-09-18 06:21:02 INFO     Epoch 109 [0/65]: loss = 3.041865348815918, lr = 0.000125
+2025-09-18 06:21:02 INFO     Epoch 109 [0/65]: loss = 3.041865348815918, lr = 0.000125
+2025-09-18 06:21:14 INFO     Epoch 109 [10/65]: loss = 3.0838069915771484, lr = 0.000125
+2025-09-18 06:21:14 INFO     Epoch 109 [10/65]: loss = 3.0838069915771484, lr = 0.000125
+2025-09-18 06:21:26 INFO     Epoch 109 [20/65]: loss = 2.9676833152770996, lr = 0.000125
+2025-09-18 06:21:26 INFO     Epoch 109 [20/65]: loss = 2.9676833152770996, lr = 0.000125
+2025-09-18 06:21:37 INFO     Epoch 109 [30/65]: loss = 3.0389723777770996, lr = 0.000125
+2025-09-18 06:21:37 INFO     Epoch 109 [30/65]: loss = 3.0389723777770996, lr = 0.000125
+2025-09-18 06:21:49 INFO     Epoch 109 [40/65]: loss = 3.073568820953369, lr = 0.000125
+2025-09-18 06:21:49 INFO     Epoch 109 [40/65]: loss = 3.073568820953369, lr = 0.000125
+2025-09-18 06:22:00 INFO     Epoch 109 [50/65]: loss = 2.913548469543457, lr = 0.000125
+2025-09-18 06:22:00 INFO     Epoch 109 [50/65]: loss = 2.913548469543457, lr = 0.000125
+2025-09-18 06:22:12 INFO     Epoch 109 [60/65]: loss = 3.0959668159484863, lr = 0.000125
+2025-09-18 06:22:12 INFO     Epoch 109 [60/65]: loss = 3.0959668159484863, lr = 0.000125
+2025-09-18 06:22:18 INFO     Epoch 110 [0/65]: loss = 3.0475568771362305, lr = 0.000125
+2025-09-18 06:22:18 INFO     Epoch 110 [0/65]: loss = 3.0475568771362305, lr = 0.000125
+2025-09-18 06:22:30 INFO     Epoch 110 [10/65]: loss = 3.0101895332336426, lr = 0.000125
+2025-09-18 06:22:30 INFO     Epoch 110 [10/65]: loss = 3.0101895332336426, lr = 0.000125
+2025-09-18 06:22:41 INFO     Epoch 110 [20/65]: loss = 3.0494117736816406, lr = 0.000125
+2025-09-18 06:22:41 INFO     Epoch 110 [20/65]: loss = 3.0494117736816406, lr = 0.000125
+2025-09-18 06:22:53 INFO     Epoch 110 [30/65]: loss = 3.197171211242676, lr = 0.000125
+2025-09-18 06:22:53 INFO     Epoch 110 [30/65]: loss = 3.197171211242676, lr = 0.000125
+W0918 06:22:58.851858 234482 site-packages/torch/distributed/elastic/multiprocessing/api.py:897] Sending process 234575 closing signal SIGTERM
+E0918 06:22:58.854914 234482 site-packages/torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: -15) local_rank: 0 (pid: 234574) of binary: /sds_wangby/group_conda_envs/anaconda3/envs/verl/bin/python
+Traceback (most recent call last):
+  File "/sds_wangby/group_conda_envs/anaconda3/envs/verl/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+  File "/sds_wangby/group_conda_envs/anaconda3/envs/verl/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+  File "/sds_wangby/group_conda_envs/anaconda3/envs/verl/lib/python3.10/site-packages/torch/distributed/run.py", line 919, in main
+    run(args)
+  File "/sds_wangby/group_conda_envs/anaconda3/envs/verl/lib/python3.10/site-packages/torch/distributed/run.py", line 910, in run
+    elastic_launch(
+  File "/sds_wangby/group_conda_envs/anaconda3/envs/verl/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/sds_wangby/group_conda_envs/anaconda3/envs/verl/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+========================================================
+train.py FAILED
+--------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+--------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2025-09-18_06:22:58
+  host      : 8ccnho97r944-0
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 234574)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 234574
+========================================================

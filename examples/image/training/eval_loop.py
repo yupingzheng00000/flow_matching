@@ -8,7 +8,7 @@ from pathlib import Path as _Path
 
 _this_dir = _Path(__file__).resolve().parent
 # Go up three levels: .../flow_matching/examples/image/training -> .../flow_matching
-_pkg_root = _this_dir.parents[3]
+_pkg_root = _this_dir.parents[2]
 if str(_pkg_root) not in _sys.path:
     _sys.path.insert(0, str(_pkg_root))
 
@@ -164,6 +164,9 @@ def eval_model(
         fid_metric.update(samples, real=True)
 
         if num_synthetic < fid_samples:
+            # Reset NFE counter on the wrapper that will actually be used
+            # For mixture/continuous branches we use cfg_scaled_model; for metric-induced we use cfg_scaled_logits_model
+            # Note: metric-induced branch performs a dummy forward to infer K; we reset AFTER that to avoid +1 in the count
             cfg_scaled_model.reset_nfe_counter()
             if args.discrete_flow_matching:
                 # Discrete sampling
@@ -206,8 +209,11 @@ def eval_model(
                             path=ko_path,
                             vocabulary_size=K,
                         )
-                    # Start tokens: zeros (any fixed token is acceptable since β(0)=0 → near-uniform)
-                    x_0 = torch.zeros(samples.shape, dtype=torch.long, device=device)
+                    # Reset NFE counter on the logits wrapper before stepping to avoid counting the dummy forward
+                    cfg_scaled_logits_model.reset_nfe_counter()
+                    # Start tokens: uniform over [0, K) since β(0)=0 ⇒ p0 is uniform
+                    K_init = ko_solver.vocabulary_size
+                    x_0 = torch.randint(0, K_init, samples.shape, device=device, dtype=torch.long)
                     dtype_cat = torch.float32 if args.sampling_dtype == "float32" else torch.float64
                     synthetic_samples = ko_solver.sample(
                         x_init=x_0,

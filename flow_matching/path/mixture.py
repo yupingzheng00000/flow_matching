@@ -143,7 +143,7 @@ class MetricInducedGibbsProbPath(ProbPath):
         embed_range: str = "unit",  # "unit" -> [0,1], "pm1" -> [-1,1] (KO)
         a: float = 5.0,              # β(t) = c * (t/(1-t))**a (KO: a=5)
         c: float = 1.0,              # (KO: c=1)
-        eps_t: float = 1e-6,
+        eps_t: float = 1e-7,          # clamp t away from 0,1 for beta(t) stability
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
     ):
@@ -227,8 +227,8 @@ class MetricInducedGibbsProbPath(ProbPath):
         """
         eps = self.eps_t
         t = t.clamp(min=eps, max=1.0 - eps)  # (B,)
-        u = 1.0 - t + eps                     # avoid /0
-        y = t / u                              # t/(1-t+eps)
+        u = 1.0 - t                            # denominator; safe since t <= 1 - eps
+        y = t / u                              # t/(1 - t)
         beta_t = self.c * (y ** self.a)
         # KO exact derivative (with clamp): dy/dt = 1 / (1 - t + eps)^2
         dy_dt = 1.0 / (u * u)

@@ -141,7 +141,7 @@ def main(args):
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], find_unused_parameters=True
+            model, device_ids=[args.gpu], find_unused_parameters=False
         )
         model_without_ddp = model.module
 
@@ -287,3 +287,11 @@ if __name__ == "__main__":
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
+
+"""
+CUDA_VISIBLE_DEVICES=0,1 nohup setsid torchrun --standalone 
+--nproc_per_node=2 train.py   --dataset=cifar10   --discrete_flow_matching --metric_induced/
+--batch_size=384   --lr=0.000125   --accum_iter=1   --epochs=3000  /
+--class_drop_prob=1.0   --compute_fid   --sym_func   --cfg_scale=0.0   /
+--wandb   --wandb_project flow_matching   --wandb_run_name cifar10_dfm_bs384   --bf16   > out.log 2>&1 &
+"""
