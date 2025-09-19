@@ -39,6 +39,7 @@ from train_arg_parser import get_args_parser
 
 from flow_matching.path import (
     BetaSchedule,
+    BetaScheduleEMA,
     ExpMonotoneRQSConfig,
     ExpMonotoneRQSSchedule,
     MetricInducedGibbsProbPath,
@@ -50,7 +51,7 @@ from training.data_transform import get_train_transform
 from training.eval_loop import eval_model
 from training.grad_scaler import NativeScalerWithGradNormCount as NativeScaler
 from training.load_and_save import load_model, save_model
-from training.train_loop import train_one_epoch
+from training.train_loop import AdaptiveKLController, train_one_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,8 @@ def main(args):
     logger.info(str(sampler_train))
 
     beta_schedule: Optional[BetaSchedule] = None
+    beta_schedule_ema: Optional[BetaScheduleEMA] = None
+    kl_controller: Optional[AdaptiveKLController] = None
     metric_path: Optional[MetricInducedGibbsProbPath] = None
     if getattr(args, "ko_metric_induced", False):
         embed_range = "pm1" if args.mi_embed_range == "pm1" else "unit"
@@ -172,6 +175,30 @@ def main(args):
             gumbel_tau=float(getattr(args, "mi_gumbel_tau", 1.0)),
             gumbel_hard=True,
         )
+        if (
+            getattr(args, "mi_learnable_beta", False)
+            and getattr(args, "mi_beta_use_ema", False)
+            and isinstance(metric_path.beta_schedule, nn.Module)
+        ):
+            beta_schedule_ema = BetaScheduleEMA(
+                metric_path.beta_schedule,
+                decay=float(getattr(args, "mi_beta_ema_decay", 0.999)),
+            )
+            beta_schedule_ema.to(device=device)
+            beta_schedule_ema.synchronize_from(metric_path.beta_schedule)
+
+            kl_target = float(getattr(args, "mi_beta_kl_target", 0.0))
+            kl_init_weight = float(getattr(args, "mi_beta_kl_init_weight", 0.0))
+            if kl_target > 0.0 and kl_init_weight > 0.0:
+                kl_controller = AdaptiveKLController(
+                    target=kl_target,
+                    init_weight=kl_init_weight,
+                    adapt_rate=float(getattr(args, "mi_beta_kl_adapt_rate", 2.0)),
+                    tolerance=float(getattr(args, "mi_beta_kl_tolerance", 1.5)),
+                    min_weight=float(getattr(args, "mi_beta_kl_min_weight", 1e-4)),
+                    max_weight=float(getattr(args, "mi_beta_kl_max_weight", 1e4)),
+                )
+                kl_controller.to(device=device)
 
     # define the model
     logger.info("Initializing Model")
@@ -208,8 +235,12 @@ def main(args):
         schedule_params = list(metric_path.learnable_parameters())
         if schedule_params:
             optimizer_params.extend(schedule_params)
-            if isinstance(metric_path.beta_schedule, nn.Module):
-                extra_modules["metric_beta_schedule"] = metric_path.beta_schedule
+        if isinstance(metric_path.beta_schedule, nn.Module):
+            extra_modules["metric_beta_schedule"] = metric_path.beta_schedule
+        if beta_schedule_ema is not None:
+            extra_modules["metric_beta_schedule_ema"] = beta_schedule_ema
+        if kl_controller is not None:
+            extra_modules["metric_beta_kl_controller"] = kl_controller
     optimizer = torch.optim.AdamW(
         optimizer_params, lr=args.lr, betas=args.optimizer_betas
     )
@@ -238,6 +269,13 @@ def main(args):
         lr_schedule=lr_schedule,
         extra_modules=extra_modules,
     )
+    if (
+        beta_schedule_ema is not None
+        and metric_path is not None
+        and isinstance(metric_path.beta_schedule, BetaSchedule)
+        and beta_schedule_ema.num_updates.item() == 0
+    ):
+        beta_schedule_ema.synchronize_from(metric_path.beta_schedule)
 
     # Optional Weights & Biases
     wandb_run = None
@@ -274,6 +312,8 @@ def main(args):
                 loss_scaler=loss_scaler,
                 args=args,
                 path=metric_path,
+                schedule_ema=beta_schedule_ema,
+                kl_controller=kl_controller,
             )
             log_stats = {
                 **{f"train_{k}": v for k, v in train_stats.items()},
@@ -356,11 +396,3 @@ if __name__ == "__main__":
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
-
-"""
-CUDA_VISIBLE_DEVICES=0,1 nohup setsid torchrun --standalone 
---nproc_per_node=2 train.py   --dataset=cifar10   --discrete_flow_matching --metric_induced/
---batch_size=384   --lr=0.000125   --accum_iter=1   --epochs=3000  /
---class_drop_prob=1.0   --compute_fid   --sym_func   --cfg_scale=0.0   /
---wandb   --wandb_project flow_matching   --wandb_run_name cifar10_dfm_bs384   --bf16   > out.log 2>&1 &
-"""

@@ -15,6 +15,7 @@ from flow_matching.path import (
     MixtureDiscreteProbPath,
     ExpMonotoneRQSConfig,
     ExpMonotoneRQSSchedule,
+    BetaScheduleEMA,
     MonotoneRQBetaSchedule,
     MonotoneRQConfig,
 )
@@ -204,6 +205,64 @@ class TestMetricInducedProbPath(unittest.TestCase):
         self.assertEqual(sample.x_t_soft.shape, x1.shape + (path.vocab_size,))
         probs = sample.x_t_soft.sum(dim=-1)
         self.assertTrue(torch.allclose(probs, torch.ones_like(probs)))
+
+
+class TestScheduleUtilities(unittest.TestCase):
+    def test_metric_induced_beta_override_matches_manual(self):
+        path = MetricInducedGibbsProbPath(
+            vocab_size=4,
+            emb_dim=1,
+            metric="lp",
+            lp_order=2.0,
+            embed_range="unit",
+            a=1.0,
+            c=1.0,
+        )
+        x1 = torch.tensor([[0, 1], [2, 3]], dtype=torch.long)
+        t = torch.tensor([0.25, 0.75])
+        beta_values = torch.tensor([0.5, 2.0])
+        manual_dist = path.distances_from_tokens(x1)
+        expected = torch.softmax(-beta_values.view(-1, 1, 1) * manual_dist, dim=-1)
+        result = path.get_prob_distribution_from_tokens(x1, t, beta_values=beta_values)
+        self.assertTrue(torch.allclose(result, expected, atol=1e-6))
+
+        if path.beta_schedule is None:
+            schedule = ExpMonotoneRQSSchedule(ExpMonotoneRQSConfig(num_bins=4, tail_bound=3.0))
+            path.beta_schedule = schedule
+        default_probs = path.get_prob_distribution_from_tokens(x1, t)
+        override_probs = path.get_prob_distribution_from_tokens(
+            x1, t, beta_schedule=path.beta_schedule
+        )
+        self.assertTrue(torch.allclose(default_probs, override_probs, atol=1e-6))
+
+    def test_beta_schedule_ema_tracks_schedule(self):
+        schedule = ExpMonotoneRQSSchedule(
+            ExpMonotoneRQSConfig(num_bins=3, tail_bound=2.0, init_c=1.0, init_a=2.0)
+        )
+        ema = BetaScheduleEMA(schedule, decay=0.5)
+        ema.synchronize_from(schedule)
+
+        t = torch.tensor([0.3])
+        base_beta, _ = schedule.beta_and_derivative(t)
+        ema_beta, _ = ema.beta_and_derivative(t)
+        self.assertTrue(torch.allclose(base_beta, ema_beta, atol=1e-6))
+
+        with torch.no_grad():
+            schedule.y0.add_(1.0)
+        ema.update(schedule)
+        effective_decay = min(0.5, (1 + ema.num_updates.item()) / (10 + ema.num_updates.item()))
+        expected_param = (1.0 - effective_decay) * 1.0  # previous teacher value was zero
+        self.assertAlmostEqual(float(ema.teacher.y0), expected_param, places=6)
+        self.assertEqual(int(ema.num_updates.item()), 1)
+
+        ema_beta_after, _ = ema.beta_and_derivative(t)
+        self.assertFalse(torch.allclose(base_beta, ema_beta_after))
+
+        ema.synchronize_from(schedule)
+        self.assertEqual(int(ema.num_updates.item()), 0)
+        synced_beta, _ = ema.beta_and_derivative(t)
+        schedule_beta, _ = schedule.beta_and_derivative(t)
+        self.assertTrue(torch.allclose(synced_beta, schedule_beta, atol=1e-6))
 
 
 class TestMonotoneRQSchedule(unittest.TestCase):

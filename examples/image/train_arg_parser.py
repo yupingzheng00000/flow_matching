@@ -301,6 +301,56 @@ def get_args_parser():
         help="Stability epsilon used when applying the logit inside the spline schedule.",
     )
     parser.add_argument(
+        "--mi_beta_use_ema",
+        action="store_true",
+        help="Track an exponential moving average teacher of the learnable β(t) schedule",
+    )
+    parser.add_argument(
+        "--mi_beta_ema_decay",
+        default=0.999,
+        type=float,
+        help="Decay for the EMA teacher of the β(t) schedule (closer to 1 slows the updates).",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_target",
+        default=0.01,
+        type=float,
+        help="Target forward KL divergence between the EMA teacher and student β(t) policies.",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_init_weight",
+        default=1.0,
+        type=float,
+        help="Initial multiplier for the schedule KL penalty (adaptive controller adjusts it).",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_adapt_rate",
+        default=2.0,
+        type=float,
+        help="Multiplicative step applied to the KL weight when diverging from the target.",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_tolerance",
+        default=1.5,
+        type=float,
+        help=(
+            "Tolerance band around the target KL before the adaptive controller changes the"
+            " penalty weight."
+        ),
+    )
+    parser.add_argument(
+        "--mi_beta_kl_min_weight",
+        default=1e-4,
+        type=float,
+        help="Lower clamp for the adaptive schedule KL weight.",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_max_weight",
+        default=1e4,
+        type=float,
+        help="Upper clamp for the adaptive schedule KL weight.",
+    )
+    parser.add_argument(
         "--mi_use_gumbel",
         action="store_true",
         help="Use straight-through Gumbel-Softmax sampling for metric-induced training inputs.",
