@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from torch import Tensor
 
@@ -50,4 +51,10 @@ class DiscretePathSample:
     t: Tensor = field(metadata={"help": "time samples t (batch_size, ...)."})
     x_t: Tensor = field(
         metadata={"help": "samples X_t ~ p_t(X_t), shape (batch_size, ...)."}
+    )
+    x_t_soft: Optional[Tensor] = field(
+        default=None,
+        metadata={
+            "help": "Optional relaxed assignments (e.g., straight-through Gumbel outputs) matching x_t's shape with an extra vocab dimension.",
+        },
     )

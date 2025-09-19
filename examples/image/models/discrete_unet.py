@@ -21,10 +21,22 @@ class PixelEmbedding(nn.Module):
         self.embedding_table = nn.Embedding(n_tokens, hidden_size)
 
     def forward(self, x: torch.Tensor):
-        B, _, H, W = x.shape
-        emb = self.embedding_table(x)
-        result = emb.permute(0, 1, 4, 2, 3).reshape(B, -1, H, W)
-        return result
+        if x.dtype in (torch.int32, torch.int64):
+            B, _, H, W = x.shape
+            emb = self.embedding_table(x)
+            result = emb.permute(0, 1, 4, 2, 3).reshape(B, -1, H, W)
+            return result
+
+        if x.ndim == 5 and x.shape[-1] == self.embedding_table.num_embeddings:
+            B, C, H, W, _ = x.shape
+            emb_weight = self.embedding_table.weight
+            emb = torch.matmul(x, emb_weight)
+            result = emb.permute(0, 1, 4, 2, 3).reshape(B, -1, H, W)
+            return result
+
+        raise ValueError(
+            "PixelEmbedding expects integer tokens of shape (B,C,H,W) or relaxed assignments (B,C,H,W,K)."
+        )
 
 
 @dataclass(eq=False)
@@ -88,7 +100,13 @@ class DiscreteUNetModel(nn.Module):
     def forward(
         self, x_t: torch.Tensor, t: torch.Tensor, extra: Mapping[str, torch.Tensor]
     ) -> torch.Tensor:
-        B, C, H, W = x_t.shape
+        if x_t.ndim == 4:
+            B, C, H, W = x_t.shape
+        elif x_t.ndim == 5 and x_t.shape[-1] == self.vocab_size:
+            B, C, H, W, _ = x_t.shape
+        else:
+            raise ValueError("x_t must be integer tokens or relaxed assignments with vocab dimension")
+
         logits = (
             self.unet(self.pixel_embedding(x_t), t, extra)
             .reshape(B, C, self.vocab_size, H, W)
