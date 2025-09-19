@@ -255,7 +255,7 @@ def get_args_parser():
     )
     parser.add_argument(
         "--mi_beta_schedule",
-        default="bounded_rqs",
+        default="exp_rqs",
         choices=["bounded_rqs", "exp_rqs"],
         type=str,
         help=(
