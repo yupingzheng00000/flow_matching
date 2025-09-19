@@ -81,13 +81,48 @@ def load_model(
                 if state_dict is not None:
                     module.load_state_dict(state_dict)
         if (
-            "optimizer" in checkpoint
-            and "epoch" in checkpoint
-            and not (hasattr(args, "eval") and args.eval)
+            "epoch" in checkpoint and not (hasattr(args, "eval") and args.eval)
         ):
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            lr_schedule.load_state_dict(checkpoint["lr_schedule"])
-            args.start_epoch = checkpoint["epoch"] + 1
+            # Try to restore optimizer state. If the architecture changed (different
+            # parameter groups), fall back to fresh optimizer instead of crashing.
+            if "optimizer" in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint["optimizer"])  # type: ignore[arg-type]
+                except ValueError as e:
+                    print(
+                        f"[resume] WARNING: optimizer state incompatible: {e}.\n"
+                        "          Continuing with a fresh optimizer."
+                    )
+                except Exception as e:
+                    print(
+                        f"[resume] WARNING: failed to load optimizer state: {e}.\n"
+                        "          Continuing with a fresh optimizer."
+                    )
+
+            # Restore LR scheduler if possible; otherwise align last_epoch.
+            try:
+                if "lr_schedule" in checkpoint:
+                    lr_schedule.load_state_dict(checkpoint["lr_schedule"])  # type: ignore[arg-type]
+                else:
+                    # Best-effort alignment
+                    lr_schedule.last_epoch = checkpoint["epoch"]
+            except Exception as e:
+                print(
+                    f"[resume] WARNING: lr_schedule state incompatible: {e}.\n"
+                    f"          Setting last_epoch to {checkpoint['epoch']}."
+                )
+                try:
+                    lr_schedule.last_epoch = checkpoint["epoch"]
+                except Exception:
+                    pass
+
+            # Restore AMP scaler if present; ignore incompatibilities.
             if "scaler" in checkpoint:
-                loss_scaler.load_state_dict(checkpoint["scaler"])
-            print("With optim & sched!")
+                try:
+                    loss_scaler.load_state_dict(checkpoint["scaler"])  # type: ignore[arg-type]
+                except Exception as e:
+                    print(f"[resume] WARNING: failed to load scaler state: {e}")
+
+            # Always continue from the next epoch when resuming weights.
+            args.start_epoch = checkpoint["epoch"] + 1
+            print("Resume: weights loaded; optimizer/scheduler restored if compatible.")

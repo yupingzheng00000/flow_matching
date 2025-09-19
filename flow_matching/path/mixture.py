@@ -345,12 +345,22 @@ class MetricInducedGibbsProbPath(ProbPath):
         dist_rows = dist_table.index_select(dim=0, index=flat)  # [B*S, K]
         return dist_rows.view(token_indices.shape + (K,))
 
-    def get_prob_distribution_from_tokens(self, x1_tokens: Tensor, t: Tensor) -> Tensor:
+    def get_prob_distribution_from_tokens(
+        self,
+        x1_tokens: Tensor,
+        t: Tensor,
+        *,
+        beta_values: Optional[Tensor] = None,
+        beta_schedule: Optional[BetaSchedule] = None,
+    ) -> Tensor:
         """Fast probability path using token indices directly.
 
         Args:
             x1_tokens: int tensor [B,S]
             t: [B]
+            beta_values: optional precomputed β(t) values of shape [B].
+            beta_schedule: optional schedule override used when ``beta_values`` is not
+                provided. When omitted, the path's current schedule is used.
         Returns:
             probs: [B,S,K]
         """
@@ -359,7 +369,12 @@ class MetricInducedGibbsProbPath(ProbPath):
         dtype = self.embedding.weight.dtype
         self._ensure_tables(device=device, dtype=dtype)
         d = self.distances_from_tokens(x1_tokens)  # [B,S,K]
-        beta_t, _ = self.beta(t)
+        if beta_values is not None:
+            beta_t = beta_values
+        elif beta_schedule is not None:
+            beta_t, _ = beta_schedule.beta_and_derivative(t)
+        else:
+            beta_t, _ = self.beta(t)
         beta_t = beta_t.view(B, 1, 1)
         logits = -beta_t * d
         return torch.softmax(logits, dim=-1)

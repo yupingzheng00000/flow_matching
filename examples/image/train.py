@@ -15,8 +15,13 @@ import sys as _sys
 from pathlib import Path as _Path
 
 _this_dir = _Path(__file__).resolve().parent
-# Go up three levels: .../flow_matching/examples/image -> .../flow_matching
-_pkg_root = _this_dir.parents[2]
+# Insert repository root so that 'flow_matching' package is importable in all launch modes
+# .../LLADA/flow_matching/examples/image -> repo root is parents[2] (i.e., .../LLADA)
+# Package root to add to sys.path so that `import flow_matching` resolves to
+# .../LLADA/flow_matching/flow_matching/__init__.py
+# Here, `_this_dir` is .../LLADA/flow_matching/examples/image
+# `_this_dir.parents[1]` is .../LLADA/flow_matching (the package root containing the inner package dir `flow_matching/`)
+_pkg_root = _this_dir.parents[1]
 if str(_pkg_root) not in _sys.path:
     _sys.path.insert(0, str(_pkg_root))
 
@@ -38,6 +43,10 @@ from models.model_configs import instantiate_model
 from train_arg_parser import get_args_parser
 
 from flow_matching.path import (
+    BetaSchedule,
+    BetaScheduleEMA,
+    ExpMonotoneRQSConfig,
+    ExpMonotoneRQSSchedule,
     MetricInducedGibbsProbPath,
     MonotoneRQBetaSchedule,
     MonotoneRQConfig,
@@ -47,7 +56,7 @@ from training.data_transform import get_train_transform
 from training.eval_loop import eval_model
 from training.grad_scaler import NativeScalerWithGradNormCount as NativeScaler
 from training.load_and_save import load_model, save_model
-from training.train_loop import train_one_epoch
+from training.train_loop import AdaptiveKLController, train_one_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -123,20 +132,36 @@ def main(args):
     )
     logger.info(str(sampler_train))
 
-    beta_schedule: Optional[MonotoneRQBetaSchedule] = None
+    beta_schedule: Optional[BetaSchedule] = None
+    beta_schedule_ema: Optional[BetaScheduleEMA] = None
+    kl_controller: Optional[AdaptiveKLController] = None
     metric_path: Optional[MetricInducedGibbsProbPath] = None
     if getattr(args, "ko_metric_induced", False):
         embed_range = "pm1" if args.mi_embed_range == "pm1" else "unit"
         if getattr(args, "mi_learnable_beta", False):
-            spline_config = MonotoneRQConfig(
-                num_bins=int(getattr(args, "mi_spline_bins", 8)),
-                tail_bound=float(getattr(args, "mi_spline_tail_bound", 6.0)),
-                beta_min=float(getattr(args, "mi_beta_min", 0.0)),
-                beta_max=float(getattr(args, "mi_beta_max", 20.0)),
-                t_eps=float(getattr(args, "mi_t_eps", 1e-4)),
-                logit_eps=float(getattr(args, "mi_logit_eps", 1e-6)),
-            )
-            beta_schedule = MonotoneRQBetaSchedule(config=spline_config)
+            schedule_type = getattr(args, "mi_beta_schedule", "bounded_rqs")
+            if schedule_type == "exp_rqs":
+                spline_config = ExpMonotoneRQSConfig(
+                    num_bins=int(getattr(args, "mi_spline_bins", 8)),
+                    tail_bound=float(getattr(args, "mi_spline_tail_bound", 6.0)),
+                    init_c=float(getattr(args, "mi_c", 1.0)),
+                    init_a=float(getattr(args, "mi_a", 5.0)),
+                    t_eps=float(getattr(args, "mi_t_eps", 1e-4)),
+                    logit_eps=float(getattr(args, "mi_logit_eps", 1e-6)),
+                )
+                beta_schedule = ExpMonotoneRQSSchedule(config=spline_config)
+            elif schedule_type == "bounded_rqs":
+                spline_config = MonotoneRQConfig(
+                    num_bins=int(getattr(args, "mi_spline_bins", 8)),
+                    tail_bound=float(getattr(args, "mi_spline_tail_bound", 6.0)),
+                    beta_min=float(getattr(args, "mi_beta_min", 0.0)),
+                    beta_max=float(getattr(args, "mi_beta_max", 20.0)),
+                    t_eps=float(getattr(args, "mi_t_eps", 1e-4)),
+                    logit_eps=float(getattr(args, "mi_logit_eps", 1e-6)),
+                )
+                beta_schedule = MonotoneRQBetaSchedule(config=spline_config)
+            else:
+                raise ValueError(f"Unsupported β schedule type: {schedule_type}")
             beta_schedule.to(device=device)
 
         metric_path = MetricInducedGibbsProbPath(
@@ -155,6 +180,30 @@ def main(args):
             gumbel_tau=float(getattr(args, "mi_gumbel_tau", 1.0)),
             gumbel_hard=True,
         )
+        if (
+            getattr(args, "mi_learnable_beta", False)
+            and getattr(args, "mi_beta_use_ema", False)
+            and isinstance(metric_path.beta_schedule, nn.Module)
+        ):
+            beta_schedule_ema = BetaScheduleEMA(
+                metric_path.beta_schedule,
+                decay=float(getattr(args, "mi_beta_ema_decay", 0.999)),
+            )
+            beta_schedule_ema.to(device=device)
+            beta_schedule_ema.synchronize_from(metric_path.beta_schedule)
+
+            kl_target = float(getattr(args, "mi_beta_kl_target", 0.0))
+            kl_init_weight = float(getattr(args, "mi_beta_kl_init_weight", 0.0))
+            if kl_target > 0.0 and kl_init_weight > 0.0:
+                kl_controller = AdaptiveKLController(
+                    target=kl_target,
+                    init_weight=kl_init_weight,
+                    adapt_rate=float(getattr(args, "mi_beta_kl_adapt_rate", 2.0)),
+                    tolerance=float(getattr(args, "mi_beta_kl_tolerance", 1.5)),
+                    min_weight=float(getattr(args, "mi_beta_kl_min_weight", 1e-4)),
+                    max_weight=float(getattr(args, "mi_beta_kl_max_weight", 1e4)),
+                )
+                kl_controller.to(device=device)
 
     # define the model
     logger.info("Initializing Model")
@@ -185,8 +234,13 @@ def main(args):
         )
         model_without_ddp = model.module
 
-    optimizer_params = list(model_without_ddp.parameters())
+    # Build optimizer with per-group learning rates
+    model_params = list(model_without_ddp.parameters())
+    param_groups = [
+        {"params": model_params, "lr": args.lr},
+    ]
     extra_modules = {}
+    schedule_params = []
     if metric_path is not None:
         schedule_params = list(metric_path.learnable_parameters())
         if schedule_params:
@@ -194,8 +248,19 @@ def main(args):
             if isinstance(metric_path.beta_schedule, nn.Module):
                 extra_modules["metric_beta_schedule"] = metric_path.beta_schedule
     optimizer = torch.optim.AdamW(
-        optimizer_params, lr=args.lr, betas=args.optimizer_betas
+        param_groups, lr=args.lr, betas=args.optimizer_betas
     )
+
+    # Log optimizer group info
+    try:
+        num_model_params = sum(p.numel() for p in model_params if getattr(p, "requires_grad", True))
+        num_sched_params = sum(p.numel() for p in schedule_params) if len(schedule_params) > 0 else 0
+        logger.info(
+            f"Optimizer param groups: model={num_model_params} @ {args.lr:.2e}"
+            + (f"; schedule={num_sched_params} @ {(args.lr * 0.1):.2e}" if num_sched_params > 0 else "")
+        )
+    except Exception:
+        pass
     if args.decay_lr:
         lr_schedule = torch.optim.lr_scheduler.LinearLR(
             optimizer,
@@ -221,6 +286,13 @@ def main(args):
         lr_schedule=lr_schedule,
         extra_modules=extra_modules,
     )
+    if (
+        beta_schedule_ema is not None
+        and metric_path is not None
+        and isinstance(metric_path.beta_schedule, BetaSchedule)
+        and beta_schedule_ema.num_updates.item() == 0
+    ):
+        beta_schedule_ema.synchronize_from(metric_path.beta_schedule)
 
     # Optional Weights & Biases
     wandb_run = None
@@ -257,6 +329,8 @@ def main(args):
                 loss_scaler=loss_scaler,
                 args=args,
                 path=metric_path,
+                schedule_ema=beta_schedule_ema,
+                kl_controller=kl_controller,
             )
             log_stats = {
                 **{f"train_{k}": v for k, v in train_stats.items()},
@@ -339,11 +413,3 @@ if __name__ == "__main__":
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
-
-"""
-CUDA_VISIBLE_DEVICES=0,1 nohup setsid torchrun --standalone 
---nproc_per_node=2 train.py   --dataset=cifar10   --discrete_flow_matching --metric_induced/
---batch_size=384   --lr=0.000125   --accum_iter=1   --epochs=3000  /
---class_drop_prob=1.0   --compute_fid   --sym_func   --cfg_scale=0.0   /
---wandb   --wandb_project flow_matching   --wandb_run_name cifar10_dfm_bs384   --bf16   > out.log 2>&1 &
-"""

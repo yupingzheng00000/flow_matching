@@ -6,7 +6,14 @@
 
 from .affine import AffineProbPath, CondOTProbPath
 from .geodesic import GeodesicProbPath
-from .beta_schedules import BetaSchedule, MonotoneRQBetaSchedule, MonotoneRQConfig
+from .beta_schedules import (
+    BetaSchedule,
+    ExpMonotoneRQSConfig,
+    ExpMonotoneRQSSchedule,
+    MonotoneRQBetaSchedule,
+    MonotoneRQConfig,
+)
+from .schedule_ema import BetaScheduleEMA
 from .mixture import MixtureDiscreteProbPath, MetricInducedGibbsProbPath
 from .path import ProbPath
 from .path_sample import DiscretePathSample, PathSample
@@ -23,5 +30,8 @@ __all__ = [
     "DiscretePathSample",
     "BetaSchedule",
     "MonotoneRQBetaSchedule",
+    "ExpMonotoneRQSSchedule",
     "MonotoneRQConfig",
+    "ExpMonotoneRQSConfig",
+    "BetaScheduleEMA",
 ]
