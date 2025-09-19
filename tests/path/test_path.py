@@ -11,7 +11,10 @@ from flow_matching.path import (
     AffineProbPath,
     CondOTProbPath,
     GeodesicProbPath,
+    MetricInducedGibbsProbPath,
     MixtureDiscreteProbPath,
+    MonotoneRQBetaSchedule,
+    MonotoneRQConfig,
 )
 from flow_matching.path.scheduler import CondOTScheduler
 from flow_matching.utils.manifolds import FlatTorus, Sphere
@@ -175,6 +178,46 @@ class TestMixtureDiscreteProbPath(unittest.TestCase):
             1 - t
         ).unsqueeze(-1)
         self.assertTrue(torch.allclose(velocity, expected_velocity))
+
+
+class TestMetricInducedProbPath(unittest.TestCase):
+    def test_gumbel_sample_has_soft_assignments(self):
+        path = MetricInducedGibbsProbPath(
+            vocab_size=4,
+            emb_dim=1,
+            metric="lp",
+            lp_order=2.0,
+            embed_range="unit",
+            a=1.0,
+            c=1.0,
+            use_gumbel=True,
+            gumbel_tau=0.7,
+        )
+        x1 = torch.randint(0, 4, size=(3, 1, 1, 1), dtype=torch.long)
+        x0 = torch.zeros_like(x1)
+        t = torch.full((3,), 0.5)
+        sample = path.sample(x_0=x0, x_1=x1, t=t)
+        self.assertIsNotNone(sample.x_t_soft)
+        assert sample.x_t_soft is not None  # satisfy type checker
+        self.assertEqual(sample.x_t_soft.shape, x1.shape + (path.vocab_size,))
+        probs = sample.x_t_soft.sum(dim=-1)
+        self.assertTrue(torch.allclose(probs, torch.ones_like(probs)))
+
+
+class TestMonotoneRQSchedule(unittest.TestCase):
+    def test_schedule_monotonicity_and_bounds(self):
+        config = MonotoneRQConfig(num_bins=8, beta_min=0.0, beta_max=5.0)
+        schedule = MonotoneRQBetaSchedule(config=config)
+        t = torch.linspace(1e-3, 1 - 1e-3, steps=32, requires_grad=True)
+        beta, d_beta = schedule.beta_and_derivative(t)
+        self.assertTrue(torch.all(beta >= config.beta_min - 1e-5))
+        self.assertTrue(torch.all(beta <= config.beta_max + 1e-5))
+        self.assertTrue(torch.all(d_beta > 0))
+        self.assertTrue(torch.all(beta[1:] >= beta[:-1]))
+        loss = beta.sum()
+        loss.backward()
+        grads = [param.grad for param in schedule.parameters()]
+        self.assertTrue(all(g is not None for g in grads))
 
 
 if __name__ == "__main__":

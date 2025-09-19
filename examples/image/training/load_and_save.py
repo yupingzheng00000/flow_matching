@@ -4,8 +4,10 @@
 # This source code is licensed under the CC-by-NC license found in the
 # LICENSE file in the root directory of this source tree.
 from pathlib import Path
+from typing import Dict, Optional
 
 import torch
+from torch.nn import Module
 from training.distributed_mode import is_main_process
 
 
@@ -15,7 +17,14 @@ def save_on_master(*args, **kwargs):
 
 
 def save_model(
-    args, epoch, model, model_without_ddp, optimizer, lr_schedule, loss_scaler
+    args,
+    epoch,
+    model,
+    model_without_ddp,
+    optimizer,
+    lr_schedule,
+    loss_scaler,
+    extra_modules: Optional[Dict[str, Module]] = None,
 ):
     output_dir = Path(args.output_dir)
     epoch_name = str(epoch)
@@ -25,6 +34,10 @@ def save_model(
             output_dir / "checkpoint.pth",
         ]
         for checkpoint_path in checkpoint_paths:
+            extra_state = {
+                name: module.state_dict()
+                for name, module in (extra_modules or {}).items()
+            }
             to_save = {
                 "model": model_without_ddp.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -32,6 +45,7 @@ def save_model(
                 "epoch": epoch,
                 "scaler": loss_scaler.state_dict(),
                 "args": args,
+                "extra_modules": extra_state,
             }
 
             save_on_master(to_save, checkpoint_path)
@@ -44,7 +58,14 @@ def save_model(
         )
 
 
-def load_model(args, model_without_ddp, optimizer, loss_scaler, lr_schedule):
+def load_model(
+    args,
+    model_without_ddp,
+    optimizer,
+    loss_scaler,
+    lr_schedule,
+    extra_modules: Optional[Dict[str, Module]] = None,
+):
     if args.resume:
         if args.resume.startswith("https"):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -54,6 +75,11 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler, lr_schedule):
             checkpoint = torch.load(args.resume, map_location="cpu")
         model_without_ddp.load_state_dict(checkpoint["model"])
         print("Resume checkpoint %s" % args.resume)
+        if extra_modules and "extra_modules" in checkpoint:
+            for name, module in extra_modules.items():
+                state_dict = checkpoint["extra_modules"].get(name)
+                if state_dict is not None:
+                    module.load_state_dict(state_dict)
         if (
             "optimizer" in checkpoint
             and "epoch" in checkpoint

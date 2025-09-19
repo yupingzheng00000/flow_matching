@@ -7,10 +7,11 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from typing import Optional, Union
+from typing import Iterable, Optional, Union
 
 from torch import Tensor
 
+from flow_matching.path.beta_schedules import BetaSchedule
 from flow_matching.path.path import ProbPath
 
 from flow_matching.path.path_sample import DiscretePathSample
@@ -146,6 +147,10 @@ class MetricInducedGibbsProbPath(ProbPath):
         eps_t: float = 1e-7,          # clamp t away from 0,1 for beta(t) stability
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
+        beta_schedule: Optional[BetaSchedule] = None,
+        use_gumbel: bool = False,
+        gumbel_tau: float = 1.0,
+        gumbel_hard: bool = True,
     ):
         super().__init__()
         self.metric_name = metric
@@ -156,6 +161,12 @@ class MetricInducedGibbsProbPath(ProbPath):
         self.c = float(c)
         self.eps_t = float(eps_t)
         self.dtype = dtype
+        self.beta_schedule = beta_schedule
+        if self.beta_schedule is not None and device is not None:
+            self.beta_schedule.to(device=device, dtype=dtype)
+        self.use_gumbel = bool(use_gumbel)
+        self.gumbel_tau = float(gumbel_tau)
+        self.gumbel_hard = bool(gumbel_hard)
 
         self.embedding = self._build_embedding(
             embedding_path_or_weight, vocab_size, emb_dim, device, dtype
@@ -225,15 +236,22 @@ class MetricInducedGibbsProbPath(ProbPath):
         β(t) = c * (t / (1 - t))**a, with clamping for stability.
         Returns (beta_t, d_beta_t) broadcasting over batch.
         """
+        if self.beta_schedule is not None:
+            return self.beta_schedule.beta_and_derivative(t)
+
         eps = self.eps_t
         t = t.clamp(min=eps, max=1.0 - eps)  # (B,)
         u = 1.0 - t                            # denominator; safe since t <= 1 - eps
         y = t / u                              # t/(1 - t)
         beta_t = self.c * (y ** self.a)
-        # KO exact derivative (with clamp): dy/dt = 1 / (1 - t + eps)^2
         dy_dt = 1.0 / (u * u)
         d_beta_t = self.c * self.a * (y ** (self.a - 1.0)) * dy_dt
         return beta_t, d_beta_t
+
+    def learnable_parameters(self) -> Iterable[nn.Parameter]:
+        if self.beta_schedule is None:
+            return []
+        return self.beta_schedule.parameters()
 
     # ---------- Distance on the embedding space ----------
     def _pairwise_dist(self, z_flat: Tensor, E: Tensor) -> Tensor:
@@ -398,11 +416,24 @@ class MetricInducedGibbsProbPath(ProbPath):
         # Fast path via precomputed table
         probs = self.get_prob_distribution_from_tokens(x1_flat, t)
         S = probs.shape[1]
-        x_t_flat = torch.multinomial(
-            probs.view(B * S, self.vocab_size), num_samples=1, replacement=True
-        ).view(B, S)
+        x_t_soft = None
+        if self.use_gumbel:
+            logits = torch.log(probs.clamp_min(1e-12))
+            gumbel = F.gumbel_softmax(
+                logits,
+                tau=self.gumbel_tau,
+                hard=self.gumbel_hard,
+                dim=-1,
+            )
+            x_t_soft = gumbel.view(orig_shape + (self.vocab_size,))
+            x_t_flat = gumbel.argmax(dim=-1)
+        else:
+            x_t_flat = torch.multinomial(
+                probs.view(B * S, self.vocab_size), num_samples=1, replacement=True
+            ).view(B, S)
+
         x_t = x_t_flat.view(orig_shape).to(device=device, dtype=x_1.dtype)
-        return DiscretePathSample(x_t=x_t, x_1=x_1, x_0=x_0, t=t)
+        return DiscretePathSample(x_t=x_t, x_1=x_1, x_0=x_0, t=t, x_t_soft=x_t_soft)
 
     # ---------- API: posterior_to_velocity() ----------
     def posterior_to_velocity(self, posterior_logits: Tensor, x_t: Tensor, t: Tensor) -> Tensor:

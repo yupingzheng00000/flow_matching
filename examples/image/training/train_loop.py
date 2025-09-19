@@ -7,13 +7,14 @@ import argparse
 import gc
 import logging
 import math
-from typing import Iterable
+from typing import Iterable, Optional
 
 import torch
 from flow_matching.path import (
     CondOTProbPath,
     MixtureDiscreteProbPath,
     MetricInducedGibbsProbPath,
+    ProbPath,
 )
 from flow_matching.path.scheduler import PolynomialConvexScheduler
 from models.ema import EMA
@@ -50,6 +51,7 @@ def train_one_epoch(
     epoch: int,
     loss_scaler: NativeScalerWithGradNormCount,
     args: argparse.Namespace,
+    path: Optional[ProbPath] = None,
 ):
     gc.collect()
     model.train(True)
@@ -61,17 +63,8 @@ def train_one_epoch(
     #   args.ko_metric_induced = True
     # For original discrete mixture path training, keep args.discrete_flow_matching = True
     if getattr(args, "ko_metric_induced", False):
-        # KO: embed tokens into [-1,1], lp distance with p=3, beta(t)=c*(t/(1-t))**a with a=5,c=1
-        # MetricInducedGibbsProbPath provides sampling X_t ~ p_t(·|x1) for training inputs.
-        path = MetricInducedGibbsProbPath(
-            embedding_path_or_weight=None,  # default builds mapping based on embed_range
-            vocab_size=256,
-            emb_dim=1,
-            metric="lp",
-            lp_order=3.0,
-            embed_range="pm1",  # [-1,1] embedding as KO
-            a=5.0,
-            c=1.0,
+        assert isinstance(path, MetricInducedGibbsProbPath), (
+            "Metric-induced training expects a pre-instantiated MetricInducedGibbsProbPath."
         )
     elif args.discrete_flow_matching:
         scheduler = PolynomialConvexScheduler(n=3.0)
@@ -108,13 +101,14 @@ def train_one_epoch(
             # Provide dummy x_0 for signature compatibility (not used by metric-induced path)
             x_0 = torch.zeros_like(samples)
             path_sample = path.sample(t=t, x_0=x_0, x_1=samples)
+            x_t_model = path_sample.x_t_soft if path_sample.x_t_soft is not None else path_sample.x_t
 
             # Model should output logits with last dim = 256
             if getattr(args, "bf16", False):
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    logits = model(path_sample.x_t, t=t, extra=conditioning)
+                    logits = model(x_t_model, t=t, extra=conditioning)
             else:
-                logits = model(path_sample.x_t, t=t, extra=conditioning)
+                logits = model(x_t_model, t=t, extra=conditioning)
             loss = torch.nn.functional.cross_entropy(
                 logits.float().reshape([-1, 256]), samples.reshape([-1])
             ).mean()

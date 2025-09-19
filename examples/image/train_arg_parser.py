@@ -248,6 +248,58 @@ def get_args_parser():
         type=str,
         help="Embedding range for tokens: 'pm1' maps to [-1,1], '01' maps to [0,1]",
     )
+    parser.add_argument(
+        "--mi_learnable_beta",
+        action="store_true",
+        help="Enable learnable monotone RQ spline schedule for the metric-induced β(t).",
+    )
+    parser.add_argument(
+        "--mi_beta_min",
+        default=0.0,
+        type=float,
+        help="Lower bound for the learnable β(t) schedule.",
+    )
+    parser.add_argument(
+        "--mi_beta_max",
+        default=20.0,
+        type=float,
+        help="Upper bound for the learnable β(t) schedule.",
+    )
+    parser.add_argument(
+        "--mi_spline_bins",
+        default=8,
+        type=int,
+        help="Number of knots (bins) for the monotone RQ spline β(t).",
+    )
+    parser.add_argument(
+        "--mi_spline_tail_bound",
+        default=6.0,
+        type=float,
+        help="Tail bound of the spline domain in logit time.",
+    )
+    parser.add_argument(
+        "--mi_t_eps",
+        default=1e-4,
+        type=float,
+        help="Clamp applied to t before evaluating the spline schedule.",
+    )
+    parser.add_argument(
+        "--mi_logit_eps",
+        default=1e-6,
+        type=float,
+        help="Stability epsilon used when applying the logit inside the spline schedule.",
+    )
+    parser.add_argument(
+        "--mi_use_gumbel",
+        action="store_true",
+        help="Use straight-through Gumbel-Softmax sampling for metric-induced training inputs.",
+    )
+    parser.add_argument(
+        "--mi_gumbel_tau",
+        default=1.0,
+        type=float,
+        help="Temperature for the Gumbel-Softmax sampler when --mi_use_gumbel is set.",
+    )
 
     # Optional Weights & Biases logging
     parser.add_argument(

@@ -27,14 +27,21 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn as nn
 import torchvision.datasets as datasets
 from models.model_configs import instantiate_model
 from train_arg_parser import get_args_parser
 
+from flow_matching.path import (
+    MetricInducedGibbsProbPath,
+    MonotoneRQBetaSchedule,
+    MonotoneRQConfig,
+)
 from training import distributed_mode
 from training.data_transform import get_train_transform
 from training.eval_loop import eval_model
@@ -116,6 +123,39 @@ def main(args):
     )
     logger.info(str(sampler_train))
 
+    beta_schedule: Optional[MonotoneRQBetaSchedule] = None
+    metric_path: Optional[MetricInducedGibbsProbPath] = None
+    if getattr(args, "ko_metric_induced", False):
+        embed_range = "pm1" if args.mi_embed_range == "pm1" else "unit"
+        if getattr(args, "mi_learnable_beta", False):
+            spline_config = MonotoneRQConfig(
+                num_bins=int(getattr(args, "mi_spline_bins", 8)),
+                tail_bound=float(getattr(args, "mi_spline_tail_bound", 6.0)),
+                beta_min=float(getattr(args, "mi_beta_min", 0.0)),
+                beta_max=float(getattr(args, "mi_beta_max", 20.0)),
+                t_eps=float(getattr(args, "mi_t_eps", 1e-4)),
+                logit_eps=float(getattr(args, "mi_logit_eps", 1e-6)),
+            )
+            beta_schedule = MonotoneRQBetaSchedule(config=spline_config)
+            beta_schedule.to(device=device)
+
+        metric_path = MetricInducedGibbsProbPath(
+            embedding_path_or_weight=None,
+            vocab_size=256,
+            emb_dim=1,
+            metric=args.mi_metric,
+            lp_order=args.mi_lp,
+            embed_range=embed_range,
+            a=args.mi_a,
+            c=args.mi_c,
+            device=device,
+            dtype=torch.float32,
+            beta_schedule=beta_schedule,
+            use_gumbel=getattr(args, "mi_use_gumbel", False),
+            gumbel_tau=float(getattr(args, "mi_gumbel_tau", 1.0)),
+            gumbel_hard=True,
+        )
+
     # define the model
     logger.info("Initializing Model")
     model = instantiate_model(
@@ -145,8 +185,16 @@ def main(args):
         )
         model_without_ddp = model.module
 
+    optimizer_params = list(model_without_ddp.parameters())
+    extra_modules = {}
+    if metric_path is not None:
+        schedule_params = list(metric_path.learnable_parameters())
+        if schedule_params:
+            optimizer_params.extend(schedule_params)
+            if isinstance(metric_path.beta_schedule, nn.Module):
+                extra_modules["metric_beta_schedule"] = metric_path.beta_schedule
     optimizer = torch.optim.AdamW(
-        model_without_ddp.parameters(), lr=args.lr, betas=args.optimizer_betas
+        optimizer_params, lr=args.lr, betas=args.optimizer_betas
     )
     if args.decay_lr:
         lr_schedule = torch.optim.lr_scheduler.LinearLR(
@@ -171,6 +219,7 @@ def main(args):
         optimizer=optimizer,
         loss_scaler=loss_scaler,
         lr_schedule=lr_schedule,
+        extra_modules=extra_modules,
     )
 
     # Optional Weights & Biases
@@ -207,6 +256,7 @@ def main(args):
                 epoch=epoch,
                 loss_scaler=loss_scaler,
                 args=args,
+                path=metric_path,
             )
             log_stats = {
                 **{f"train_{k}": v for k, v in train_stats.items()},
@@ -231,6 +281,7 @@ def main(args):
                     lr_schedule=lr_schedule,
                     loss_scaler=loss_scaler,
                     epoch=epoch,
+                    extra_modules=extra_modules,
                 )
             if args.distributed:
                 data_loader_train.sampler.set_epoch(0)
@@ -247,6 +298,7 @@ def main(args):
                 epoch=epoch,
                 fid_samples=fid_samples,
                 args=args,
+                metric_path=metric_path,
             )
             log_stats.update({f"eval_{k}": v for k, v in eval_stats.items()})
 

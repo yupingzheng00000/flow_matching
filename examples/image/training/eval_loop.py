@@ -23,7 +23,7 @@ import math
 import os
 from argparse import Namespace
 from pathlib import Path
-from typing import Iterable, cast
+from typing import Iterable, Optional, cast
 
 import PIL.Image
 
@@ -110,6 +110,7 @@ def eval_model(
     epoch: int,
     fid_samples: int,
     args: Namespace,
+    metric_path: Optional[MetricInducedGibbsProbPath] = None,
 ):
     gc.collect()
     cfg_scaled_model = CFGScaledModel(model=model)
@@ -156,7 +157,7 @@ def eval_model(
 
     # Lazily constructed KO solver and path (once K is known)
     ko_solver = None
-    ko_path = None
+    ko_path = metric_path
 
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         samples = samples.to(device, non_blocking=True)
@@ -187,23 +188,30 @@ def eval_model(
                         )
                         K = int(logits_dummy.shape[-1])
                         # Build path
-                        mi_metric = getattr(args, "mi_metric", "lp")
-                        mi_lp = float(getattr(args, "mi_lp", 3.0))
-                        mi_a = float(getattr(args, "mi_a", 5.0))
-                        mi_c = float(getattr(args, "mi_c", 1.0))
-                        mi_embed_range = getattr(args, "mi_embed_range", "pm1")
-                        ko_path = MetricInducedGibbsProbPath(
-                            embedding_path_or_weight=None,
-                            vocab_size=K,
-                            emb_dim=1,
-                            metric=mi_metric,
-                            lp_order=mi_lp,
-                            embed_range=mi_embed_range,
-                            a=mi_a,
-                            c=mi_c,
-                            device=device,
-                            dtype=torch.float32,
-                        )
+                        if ko_path is not None and ko_path.vocab_size != K:
+                            raise ValueError(
+                                f"Provided metric-induced path expects vocab size {ko_path.vocab_size},"
+                                f" but model produced logits with last dim {K}."
+                            )
+                        if ko_path is None:
+                            mi_metric = getattr(args, "mi_metric", "lp")
+                            mi_lp = float(getattr(args, "mi_lp", 3.0))
+                            mi_a = float(getattr(args, "mi_a", 5.0))
+                            mi_c = float(getattr(args, "mi_c", 1.0))
+                            mi_embed_range = getattr(args, "mi_embed_range", "pm1")
+                            embed_range = "pm1" if mi_embed_range == "pm1" else "unit"
+                            ko_path = MetricInducedGibbsProbPath(
+                                embedding_path_or_weight=None,
+                                vocab_size=K,
+                                emb_dim=1,
+                                metric=mi_metric,
+                                lp_order=mi_lp,
+                                embed_range=embed_range,
+                                a=mi_a,
+                                c=mi_c,
+                                device=device,
+                                dtype=torch.float32,
+                            )
                         ko_solver = KODiscreteGibbsEulerSolver(
                             model=cfg_scaled_logits_model,
                             path=ko_path,
