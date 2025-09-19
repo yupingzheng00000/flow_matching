@@ -254,6 +254,17 @@ def get_args_parser():
         help="Enable learnable monotone RQ spline schedule for the metric-induced β(t).",
     )
     parser.add_argument(
+        "--mi_beta_schedule",
+        default="bounded_rqs",
+        choices=["bounded_rqs", "exp_rqs"],
+        type=str,
+        help=(
+            "Learnable β(t) schedule type. "
+            "'bounded_rqs' matches the original sigmoid-bounded spline while "
+            "'exp_rqs' uses an exponential spline with an exact warm start to c*(t/(1-t))^a."
+        ),
+    )
+    parser.add_argument(
         "--mi_beta_min",
         default=0.0,
         type=float,

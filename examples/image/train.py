@@ -38,6 +38,9 @@ from models.model_configs import instantiate_model
 from train_arg_parser import get_args_parser
 
 from flow_matching.path import (
+    BetaSchedule,
+    ExpMonotoneRQSConfig,
+    ExpMonotoneRQSSchedule,
     MetricInducedGibbsProbPath,
     MonotoneRQBetaSchedule,
     MonotoneRQConfig,
@@ -123,20 +126,34 @@ def main(args):
     )
     logger.info(str(sampler_train))
 
-    beta_schedule: Optional[MonotoneRQBetaSchedule] = None
+    beta_schedule: Optional[BetaSchedule] = None
     metric_path: Optional[MetricInducedGibbsProbPath] = None
     if getattr(args, "ko_metric_induced", False):
         embed_range = "pm1" if args.mi_embed_range == "pm1" else "unit"
         if getattr(args, "mi_learnable_beta", False):
-            spline_config = MonotoneRQConfig(
-                num_bins=int(getattr(args, "mi_spline_bins", 8)),
-                tail_bound=float(getattr(args, "mi_spline_tail_bound", 6.0)),
-                beta_min=float(getattr(args, "mi_beta_min", 0.0)),
-                beta_max=float(getattr(args, "mi_beta_max", 20.0)),
-                t_eps=float(getattr(args, "mi_t_eps", 1e-4)),
-                logit_eps=float(getattr(args, "mi_logit_eps", 1e-6)),
-            )
-            beta_schedule = MonotoneRQBetaSchedule(config=spline_config)
+            schedule_type = getattr(args, "mi_beta_schedule", "bounded_rqs")
+            if schedule_type == "exp_rqs":
+                spline_config = ExpMonotoneRQSConfig(
+                    num_bins=int(getattr(args, "mi_spline_bins", 8)),
+                    tail_bound=float(getattr(args, "mi_spline_tail_bound", 6.0)),
+                    init_c=float(getattr(args, "mi_c", 1.0)),
+                    init_a=float(getattr(args, "mi_a", 5.0)),
+                    t_eps=float(getattr(args, "mi_t_eps", 1e-4)),
+                    logit_eps=float(getattr(args, "mi_logit_eps", 1e-6)),
+                )
+                beta_schedule = ExpMonotoneRQSSchedule(config=spline_config)
+            elif schedule_type == "bounded_rqs":
+                spline_config = MonotoneRQConfig(
+                    num_bins=int(getattr(args, "mi_spline_bins", 8)),
+                    tail_bound=float(getattr(args, "mi_spline_tail_bound", 6.0)),
+                    beta_min=float(getattr(args, "mi_beta_min", 0.0)),
+                    beta_max=float(getattr(args, "mi_beta_max", 20.0)),
+                    t_eps=float(getattr(args, "mi_t_eps", 1e-4)),
+                    logit_eps=float(getattr(args, "mi_logit_eps", 1e-6)),
+                )
+                beta_schedule = MonotoneRQBetaSchedule(config=spline_config)
+            else:
+                raise ValueError(f"Unsupported β schedule type: {schedule_type}")
             beta_schedule.to(device=device)
 
         metric_path = MetricInducedGibbsProbPath(

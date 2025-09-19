@@ -13,6 +13,8 @@ from flow_matching.path import (
     GeodesicProbPath,
     MetricInducedGibbsProbPath,
     MixtureDiscreteProbPath,
+    ExpMonotoneRQSConfig,
+    ExpMonotoneRQSSchedule,
     MonotoneRQBetaSchedule,
     MonotoneRQConfig,
 )
@@ -218,6 +220,36 @@ class TestMonotoneRQSchedule(unittest.TestCase):
         loss.backward()
         grads = [param.grad for param in schedule.parameters()]
         self.assertTrue(all(g is not None for g in grads))
+
+
+class TestExpMonotoneRQSchedule(unittest.TestCase):
+    def test_warm_start_matches_baseline(self):
+        config = ExpMonotoneRQSConfig(
+            num_bins=5,
+            tail_bound=4.0,
+            init_c=1.3,
+            init_a=3.5,
+            t_eps=1e-5,
+            logit_eps=1e-6,
+        )
+        schedule = ExpMonotoneRQSSchedule(config=config).to(dtype=torch.float64)
+        t = torch.linspace(1e-3, 1 - 1e-3, steps=64, dtype=torch.float64)
+        beta, d_beta = schedule.beta_and_derivative(t)
+
+        t_clamped = t.clamp(min=config.t_eps, max=1.0 - config.t_eps)
+        u = 1.0 - t_clamped
+        ratio = t_clamped / u
+        baseline = config.init_c * (ratio ** config.init_a)
+        baseline_deriv = (
+            config.init_c
+            * config.init_a
+            * (ratio ** (config.init_a - 1.0))
+            * (1.0 / (u * u))
+        )
+
+        self.assertTrue(torch.allclose(beta, baseline, atol=1e-7, rtol=1e-5))
+        self.assertTrue(torch.allclose(d_beta, baseline_deriv, atol=1e-7, rtol=1e-5))
+        self.assertTrue(torch.all(d_beta > 0))
 
 
 if __name__ == "__main__":
