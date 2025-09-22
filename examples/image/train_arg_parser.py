@@ -301,6 +301,17 @@ def get_args_parser():
         help="Stability epsilon used when applying the logit inside the spline schedule.",
     )
     parser.add_argument(
+        "--mi_beta_log_schedule",
+        action="store_true",
+        help="When set, dump β(t) snapshots during evaluation for comparison against the fixed schedule.",
+    )
+    parser.add_argument(
+        "--mi_beta_log_points",
+        default=256,
+        type=int,
+        help="Number of time samples to evaluate when exporting β(t) snapshots.",
+    )
+    parser.add_argument(
         "--mi_beta_use_ema",
         action="store_true",
         help="Track an exponential moving average teacher of the learnable β(t) schedule",

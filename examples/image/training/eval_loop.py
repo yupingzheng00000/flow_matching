@@ -17,6 +17,7 @@ if str(_pkg_root) not in _sys.path:
 #
 # This source code is licensed under the CC-by-NC license found in the
 # LICENSE file in the root directory of this source tree.
+import csv
 import gc
 import logging
 import math
@@ -158,6 +159,85 @@ def eval_model(
     # Lazily constructed KO solver and path (once K is known)
     ko_solver = None
     ko_path = metric_path
+    schedule_snapshot_logged = False
+
+    def maybe_log_schedule_snapshot(path_obj: MetricInducedGibbsProbPath) -> None:
+        nonlocal schedule_snapshot_logged
+        if schedule_snapshot_logged:
+            return
+        if not getattr(args, "mi_beta_log_schedule", False):
+            schedule_snapshot_logged = True
+            return
+        if not distributed_mode.is_main_process():
+            schedule_snapshot_logged = True
+            return
+        output_dir = getattr(args, "output_dir", None)
+        if not output_dir:
+            logger.warning("Skipping β(t) snapshot logging because --output_dir is not set.")
+            schedule_snapshot_logged = True
+            return
+        num_points = int(getattr(args, "mi_beta_log_points", 256))
+        if num_points <= 1:
+            logger.warning(
+                "Skipping β(t) snapshot logging because --mi_beta_log_points must be > 1."
+            )
+            schedule_snapshot_logged = True
+            return
+
+        schedule_dir = Path(output_dir) / "beta_schedule_logs"
+        schedule_dir.mkdir(parents=True, exist_ok=True)
+        device = path_obj.embedding.weight.device
+        dtype = path_obj.embedding.weight.dtype
+        eps = max(float(path_obj.eps_t), 1e-8)
+        t = torch.linspace(eps, 1.0 - eps, steps=num_points, device=device, dtype=torch.float32)
+        if t.dtype != dtype:
+            t = t.to(dtype=dtype)
+
+        with torch.no_grad():
+            beta_curr, dot_curr = path_obj.beta(t)
+
+        t_cpu = t.detach().cpu().double()
+        beta_curr_cpu = beta_curr.detach().cpu().double()
+        dot_curr_cpu = dot_curr.detach().cpu().double()
+
+        denom = t_cpu * (1.0 - t_cpu)
+        beta_baseline = path_obj.c * torch.pow(t_cpu / (1.0 - t_cpu), path_obj.a)
+        dot_baseline = beta_baseline * path_obj.a / denom
+
+        data = torch.stack(
+            (
+                t_cpu,
+                beta_curr_cpu,
+                beta_baseline,
+                dot_curr_cpu,
+                dot_baseline,
+            ),
+            dim=-1,
+        )
+
+        output_path = schedule_dir / f"epoch_{epoch:04d}.csv"
+        header = [
+            "t",
+            "beta_current",
+            "beta_baseline",
+            "dot_beta_current",
+            "dot_beta_baseline",
+        ]
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(data.tolist())
+
+        schedule_snapshot_logged = True
+        logger.info(
+            "Saved β(t) snapshot for epoch %d with %d samples to %s",
+            epoch,
+            num_points,
+            output_path,
+        )
+
+    if ko_path is not None:
+        maybe_log_schedule_snapshot(ko_path)
 
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         samples = samples.to(device, non_blocking=True)
@@ -212,6 +292,7 @@ def eval_model(
                                 device=device,
                                 dtype=torch.float32,
                             )
+                        maybe_log_schedule_snapshot(ko_path)
                         ko_solver = KODiscreteGibbsEulerSolver(
                             model=cfg_scaled_logits_model,
                             path=ko_path,
