@@ -7,6 +7,7 @@ import argparse
 import gc
 import logging
 import math
+from collections import deque
 from typing import Iterable, Optional
 
 import torch
@@ -171,6 +172,16 @@ def train_one_epoch(
     kl_updates_total = 0
     kl_sum_for_step = 0.0
     kl_micro_steps = 0
+    kl_avg_for_logging: Optional[float] = None
+    kl_avg_window = int(getattr(args, "mi_beta_kl_avg_window", 1) or 1)
+    if kl_avg_window <= 0:
+        logger.warning(
+            "mi_beta_kl_avg_window must be positive; received %s. Falling back to 1.",
+            kl_avg_window,
+        )
+        kl_avg_window = 1
+    kl_window = deque(maxlen=kl_avg_window) if use_schedule_trust_region else None
+    kl_window_sum = 0.0
     if use_schedule_trust_region:
         kl_metric = MeanMetric().to(device, non_blocking=True)
         kl_penalty_metric = MeanMetric().to(device, non_blocking=True)
@@ -311,12 +322,20 @@ def train_one_epoch(
         # Loss scaler applies the optimizer when update_grad is set to true.
         # Otherwise just updates the internal gradient scales
         apply_update = (data_iter_step + 1) % accum_iter == 0
-        loss_scaler(
+        grad_norm = loss_scaler(
             loss,
             optimizer,
             parameters=model.parameters(),
             update_grad=apply_update,
         )
+        grad_step_skipped = False
+        if apply_update:
+            if grad_norm is None:
+                grad_step_skipped = True
+            elif isinstance(grad_norm, torch.Tensor):
+                grad_step_skipped = not torch.isfinite(grad_norm.detach()).all().item()
+            else:
+                grad_step_skipped = not math.isfinite(float(grad_norm))
         if apply_update and isinstance(model, EMA):
             model.update_ema()
         elif (
@@ -326,16 +345,42 @@ def train_one_epoch(
         ):
             model.module.update_ema()
 
-        if apply_update and use_schedule_ema and beta_schedule_module is not None:
+        if (
+            apply_update
+            and not grad_step_skipped
+            and use_schedule_ema
+            and beta_schedule_module is not None
+        ):
             schedule_ema.update(beta_schedule_module)
-        if apply_update and use_schedule_trust_region:
-            mean_kl_step = kl_sum_for_step / kl_micro_steps if kl_micro_steps > 0 else None
-            kl_controller.update(mean_kl_step)
-            kl_sum_for_step = 0.0
-            kl_micro_steps = 0
-        elif apply_update:
-            kl_sum_for_step = 0.0
-            kl_micro_steps = 0
+        if apply_update:
+            if use_schedule_trust_region:
+                if grad_step_skipped:
+                    kl_sum_for_step = 0.0
+                    kl_micro_steps = 0
+                    kl_avg_for_logging = None
+                else:
+                    mean_kl_step = (
+                        kl_sum_for_step / kl_micro_steps if kl_micro_steps > 0 else None
+                    )
+                    if mean_kl_step is not None and kl_window is not None:
+                        if len(kl_window) == kl_window.maxlen:
+                            removed = kl_window.popleft()
+                            kl_window_sum -= removed
+                        kl_window.append(mean_kl_step)
+                        kl_window_sum += mean_kl_step
+                        if len(kl_window) == kl_window.maxlen:
+                            averaged_kl = kl_window_sum / len(kl_window)
+                            kl_controller.update(averaged_kl)
+                            kl_avg_for_logging = averaged_kl
+                        else:
+                            kl_avg_for_logging = None
+                    else:
+                        kl_avg_for_logging = None
+                    kl_sum_for_step = 0.0
+                    kl_micro_steps = 0
+            else:
+                kl_sum_for_step = 0.0
+                kl_micro_steps = 0
 
         if apply_update and gumbel_schedule_active:
             step_index = min(gumbel_update_step + 1, gumbel_tau_steps)
@@ -362,6 +407,8 @@ def train_one_epoch(
                     f", kl = {float(schedule_kl_value.detach().cpu()):.4g},"
                     f" kl_w = {kl_controller.current_weight():.4g}"
                 )
+                if kl_avg_for_logging is not None:
+                    log_msg += f", kl_avg = {float(kl_avg_for_logging):.4g}"
             if gumbel_schedule_active and current_gumbel_tau is not None:
                 log_msg += f", tau = {float(current_gumbel_tau):.4g}"
             logger.info(log_msg)
@@ -392,6 +439,15 @@ def train_one_epoch(
                                     "train/schedule_kl_weight": float(
                                         kl_controller.current_weight()
                                     ),
+                                    **(
+                                        {
+                                            "train/schedule_kl_avg": float(
+                                                kl_avg_for_logging
+                                            )
+                                        }
+                                        if kl_avg_for_logging is not None
+                                        else {}
+                                    ),
                                 }
                                 if use_schedule_trust_region and schedule_kl_value is not None
                                 else {}
@@ -419,6 +475,8 @@ def train_one_epoch(
                 "schedule_kl_weight": float(kl_controller.current_weight()),
             }
         )
+        if kl_avg_for_logging is not None:
+            stats["schedule_kl_avg"] = float(kl_avg_for_logging)
     if gumbel_schedule_active:
         setattr(args, "_gumbel_update_step", gumbel_update_step)
     return stats

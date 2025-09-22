@@ -339,6 +339,12 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_beta_kl_avg_window",
+        default=1,
+        type=int,
+        help="Number of optimizer updates to average the schedule KL before adapting the penalty weight.",
+    )
+    parser.add_argument(
         "--mi_beta_kl_min_weight",
         default=1e-4,
         type=float,
