@@ -254,6 +254,17 @@ def get_args_parser():
         help="Enable learnable monotone RQ spline schedule for the metric-induced β(t).",
     )
     parser.add_argument(
+        "--mi_beta_schedule",
+        default="bounded_rqs",
+        choices=["bounded_rqs", "exp_rqs"],
+        type=str,
+        help=(
+            "Learnable β(t) schedule type. "
+            "'bounded_rqs' matches the original sigmoid-bounded spline while "
+            "'exp_rqs' uses an exponential spline with an exact warm start to c*(t/(1-t))^a."
+        ),
+    )
+    parser.add_argument(
         "--mi_beta_min",
         default=0.0,
         type=float,
@@ -290,6 +301,56 @@ def get_args_parser():
         help="Stability epsilon used when applying the logit inside the spline schedule.",
     )
     parser.add_argument(
+        "--mi_beta_use_ema",
+        action="store_true",
+        help="Track an exponential moving average teacher of the learnable β(t) schedule",
+    )
+    parser.add_argument(
+        "--mi_beta_ema_decay",
+        default=0.999,
+        type=float,
+        help="Decay for the EMA teacher of the β(t) schedule (closer to 1 slows the updates).",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_target",
+        default=0.01,
+        type=float,
+        help="Target forward KL divergence between the EMA teacher and student β(t) policies.",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_init_weight",
+        default=1.0,
+        type=float,
+        help="Initial multiplier for the schedule KL penalty (adaptive controller adjusts it).",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_adapt_rate",
+        default=2.0,
+        type=float,
+        help="Multiplicative step applied to the KL weight when diverging from the target.",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_tolerance",
+        default=1.5,
+        type=float,
+        help=(
+            "Tolerance band around the target KL before the adaptive controller changes the"
+            " penalty weight."
+        ),
+    )
+    parser.add_argument(
+        "--mi_beta_kl_min_weight",
+        default=1e-4,
+        type=float,
+        help="Lower clamp for the adaptive schedule KL weight.",
+    )
+    parser.add_argument(
+        "--mi_beta_kl_max_weight",
+        default=1e4,
+        type=float,
+        help="Upper clamp for the adaptive schedule KL weight.",
+    )
+    parser.add_argument(
         "--mi_use_gumbel",
         action="store_true",
         help="Use straight-through Gumbel-Softmax sampling for metric-induced training inputs.",
@@ -299,6 +360,42 @@ def get_args_parser():
         default=1.0,
         type=float,
         help="Temperature for the Gumbel-Softmax sampler when --mi_use_gumbel is set.",
+    )
+    parser.add_argument(
+        "--mi_gumbel_tau_start",
+        default=None,
+        type=float,
+        help=(
+            "Optional warm-start temperature for Gumbel-Softmax annealing. "
+            "Defaults to --mi_gumbel_tau when unspecified."
+        ),
+    )
+    parser.add_argument(
+        "--mi_gumbel_tau_end",
+        default=None,
+        type=float,
+        help=(
+            "Optional final temperature for Gumbel-Softmax annealing. "
+            "Defaults to --mi_gumbel_tau when unspecified."
+        ),
+    )
+    parser.add_argument(
+        "--mi_gumbel_tau_anneal_steps",
+        default=0,
+        type=int,
+        help=(
+            "Number of optimizer steps used to anneal the Gumbel temperature. "
+            "Set to zero to keep a fixed temperature."
+        ),
+    )
+    parser.add_argument(
+        "--mi_gumbel_tau_schedule",
+        default="quadratic",
+        choices=["quadratic", "linear", "cosine"],
+        help=(
+            "Shape of the annealing curve applied between the start and end "
+            "Gumbel temperatures."
+        ),
     )
 
     # Optional Weights & Biases logging

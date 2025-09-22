@@ -13,6 +13,9 @@ from flow_matching.path import (
     GeodesicProbPath,
     MetricInducedGibbsProbPath,
     MixtureDiscreteProbPath,
+    ExpMonotoneRQSConfig,
+    ExpMonotoneRQSSchedule,
+    BetaScheduleEMA,
     MonotoneRQBetaSchedule,
     MonotoneRQConfig,
 )
@@ -204,6 +207,64 @@ class TestMetricInducedProbPath(unittest.TestCase):
         self.assertTrue(torch.allclose(probs, torch.ones_like(probs)))
 
 
+class TestScheduleUtilities(unittest.TestCase):
+    def test_metric_induced_beta_override_matches_manual(self):
+        path = MetricInducedGibbsProbPath(
+            vocab_size=4,
+            emb_dim=1,
+            metric="lp",
+            lp_order=2.0,
+            embed_range="unit",
+            a=1.0,
+            c=1.0,
+        )
+        x1 = torch.tensor([[0, 1], [2, 3]], dtype=torch.long)
+        t = torch.tensor([0.25, 0.75])
+        beta_values = torch.tensor([0.5, 2.0])
+        manual_dist = path.distances_from_tokens(x1)
+        expected = torch.softmax(-beta_values.view(-1, 1, 1) * manual_dist, dim=-1)
+        result = path.get_prob_distribution_from_tokens(x1, t, beta_values=beta_values)
+        self.assertTrue(torch.allclose(result, expected, atol=1e-6))
+
+        if path.beta_schedule is None:
+            schedule = ExpMonotoneRQSSchedule(ExpMonotoneRQSConfig(num_bins=4, tail_bound=3.0))
+            path.beta_schedule = schedule
+        default_probs = path.get_prob_distribution_from_tokens(x1, t)
+        override_probs = path.get_prob_distribution_from_tokens(
+            x1, t, beta_schedule=path.beta_schedule
+        )
+        self.assertTrue(torch.allclose(default_probs, override_probs, atol=1e-6))
+
+    def test_beta_schedule_ema_tracks_schedule(self):
+        schedule = ExpMonotoneRQSSchedule(
+            ExpMonotoneRQSConfig(num_bins=3, tail_bound=2.0, init_c=1.0, init_a=2.0)
+        )
+        ema = BetaScheduleEMA(schedule, decay=0.5)
+        ema.synchronize_from(schedule)
+
+        t = torch.tensor([0.3])
+        base_beta, _ = schedule.beta_and_derivative(t)
+        ema_beta, _ = ema.beta_and_derivative(t)
+        self.assertTrue(torch.allclose(base_beta, ema_beta, atol=1e-6))
+
+        with torch.no_grad():
+            schedule.y0.add_(1.0)
+        ema.update(schedule)
+        effective_decay = min(0.5, (1 + ema.num_updates.item()) / (10 + ema.num_updates.item()))
+        expected_param = (1.0 - effective_decay) * 1.0  # previous teacher value was zero
+        self.assertAlmostEqual(float(ema.teacher.y0), expected_param, places=6)
+        self.assertEqual(int(ema.num_updates.item()), 1)
+
+        ema_beta_after, _ = ema.beta_and_derivative(t)
+        self.assertFalse(torch.allclose(base_beta, ema_beta_after))
+
+        ema.synchronize_from(schedule)
+        self.assertEqual(int(ema.num_updates.item()), 0)
+        synced_beta, _ = ema.beta_and_derivative(t)
+        schedule_beta, _ = schedule.beta_and_derivative(t)
+        self.assertTrue(torch.allclose(synced_beta, schedule_beta, atol=1e-6))
+
+
 class TestMonotoneRQSchedule(unittest.TestCase):
     def test_schedule_monotonicity_and_bounds(self):
         config = MonotoneRQConfig(num_bins=8, beta_min=0.0, beta_max=5.0)
@@ -218,6 +279,36 @@ class TestMonotoneRQSchedule(unittest.TestCase):
         loss.backward()
         grads = [param.grad for param in schedule.parameters()]
         self.assertTrue(all(g is not None for g in grads))
+
+
+class TestExpMonotoneRQSchedule(unittest.TestCase):
+    def test_warm_start_matches_baseline(self):
+        config = ExpMonotoneRQSConfig(
+            num_bins=5,
+            tail_bound=4.0,
+            init_c=1.3,
+            init_a=3.5,
+            t_eps=1e-5,
+            logit_eps=1e-6,
+        )
+        schedule = ExpMonotoneRQSSchedule(config=config).to(dtype=torch.float64)
+        t = torch.linspace(1e-3, 1 - 1e-3, steps=64, dtype=torch.float64)
+        beta, d_beta = schedule.beta_and_derivative(t)
+
+        t_clamped = t.clamp(min=config.t_eps, max=1.0 - config.t_eps)
+        u = 1.0 - t_clamped
+        ratio = t_clamped / u
+        baseline = config.init_c * (ratio ** config.init_a)
+        baseline_deriv = (
+            config.init_c
+            * config.init_a
+            * (ratio ** (config.init_a - 1.0))
+            * (1.0 / (u * u))
+        )
+
+        self.assertTrue(torch.allclose(beta, baseline, atol=1e-7, rtol=1e-5))
+        self.assertTrue(torch.allclose(d_beta, baseline_deriv, atol=1e-7, rtol=1e-5))
+        self.assertTrue(torch.all(d_beta > 0))
 
 
 if __name__ == "__main__":
