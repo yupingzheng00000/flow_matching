@@ -303,7 +303,10 @@ def get_args_parser():
     parser.add_argument(
         "--mi_beta_log_schedule",
         action="store_true",
-        help="When set, dump β(t) snapshots during evaluation for comparison against the fixed schedule.",
+        help=(
+            "When set, dump β(t) snapshots during evaluation for comparison against the fixed schedule "
+            "and log the curves to wandb if enabled."
+        ),
     )
     parser.add_argument(
         "--mi_beta_log_points",

@@ -215,6 +215,8 @@ def eval_model(
             dim=-1,
         )
 
+        data_rows = data.tolist()
+
         output_path = schedule_dir / f"epoch_{epoch:04d}.csv"
         header = [
             "t",
@@ -226,7 +228,59 @@ def eval_model(
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(header)
-            writer.writerows(data.tolist())
+            writer.writerows(data_rows)
+
+        if getattr(args, "wandb", False):
+            try:
+                try:
+                    import swanlab as wandb  # type: ignore
+                except Exception:  # pragma: no cover - swanlab not installed
+                    import wandb  # type: ignore
+
+                wandb_payload = {}
+                try:
+                    schedule_table = wandb.Table(columns=header, rows=data_rows)  # type: ignore[attr-defined]
+                    wandb_payload["eval/beta_schedule_table"] = schedule_table
+                except Exception as table_exc:  # pragma: no cover - wandb table unavailable
+                    logger.debug("Unable to build wandb table for β(t): %s", table_exc)
+
+                try:
+                    beta_plot = wandb.plot.line_series(  # type: ignore[attr-defined]
+                        xs=t_cpu.tolist(),
+                        ys=[
+                            beta_curr_cpu.tolist(),
+                            beta_baseline.tolist(),
+                        ],
+                        keys=["beta_current", "beta_baseline"],
+                        title=f"β(t) epoch {epoch}",
+                        xname="t",
+                    )
+                    wandb_payload["eval/beta_schedule"] = beta_plot
+                except Exception as plot_exc:  # pragma: no cover - wandb plot unavailable
+                    logger.debug("Unable to build wandb β(t) plot: %s", plot_exc)
+
+                try:
+                    dot_beta_plot = wandb.plot.line_series(  # type: ignore[attr-defined]
+                        xs=t_cpu.tolist(),
+                        ys=[
+                            dot_curr_cpu.tolist(),
+                            dot_baseline.tolist(),
+                        ],
+                        keys=["dot_beta_current", "dot_beta_baseline"],
+                        title=f"β̇(t) epoch {epoch}",
+                        xname="t",
+                    )
+                    wandb_payload["eval/dot_beta_schedule"] = dot_beta_plot
+                except Exception as dot_plot_exc:  # pragma: no cover - wandb plot unavailable
+                    logger.debug("Unable to build wandb β̇(t) plot: %s", dot_plot_exc)
+
+                if wandb_payload:
+                    try:
+                        wandb.log(wandb_payload, step=epoch)  # type: ignore[attr-defined]
+                    except Exception as log_exc:  # pragma: no cover - wandb logging failure
+                        logger.warning("Failed to log β(t) snapshot to wandb: %s", log_exc)
+            except Exception as wandb_exc:  # pragma: no cover - wandb import failure
+                logger.debug("wandb not available for β(t) snapshot logging: %s", wandb_exc)
 
         schedule_snapshot_logged = True
         logger.info(
