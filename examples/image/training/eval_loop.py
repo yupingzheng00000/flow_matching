@@ -24,7 +24,7 @@ import math
 import os
 from argparse import Namespace
 from pathlib import Path
-from typing import Iterable, Optional, cast
+from typing import Callable, Iterable, Optional, Union, cast
 
 import PIL.Image
 
@@ -305,6 +305,14 @@ def eval_model(
             cfg_scaled_model.reset_nfe_counter()
             if args.discrete_flow_matching:
                 # Discrete sampling
+                if args.sym_func:
+                    # Ensure a pure-Python function returning float for div_free / symmetrize coefficients
+                    def sym_schedule(tau: float) -> float:
+                        return 12.0 * (tau ** 2.0) * ((1.0 - tau) ** 0.25)
+
+                    sym: Union[float, Callable[[float], float]] = sym_schedule
+                else:
+                    sym: Union[float, Callable[[float], float]] = float(args.sym)
                 if getattr(args, "metric_induced", False):
                     # Metric-induced Gibbs path using dedicated KO solver
                     # Lazily build logits-wrapper and KO solver with correct vocab size K
@@ -365,18 +373,13 @@ def eval_model(
                         label=labels,
                         # IMPORTANT: disable CFG scaling when using discrete logits
                         cfg_scale=0.0,
+                        symmetrize=sym,
                     )
                 else:
                     x_0 = (
                         torch.zeros(samples.shape, dtype=torch.long, device=device)
                         + MASK_TOKEN
                     )
-                    if args.sym_func:
-                        # Ensure a pure-Python function returning float for div_free
-                        def sym(tau: float) -> float:
-                            return 12.0 * (tau ** 2.0) * ((1.0 - tau) ** 0.25)
-                    else:
-                        sym = args.sym
                     dtype = torch.float32 if args.sampling_dtype == "float32" else torch.float64
 
                     # Guard against missing solver (should never be None in this branch)

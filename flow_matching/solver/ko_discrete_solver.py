@@ -6,7 +6,7 @@
 
 from contextlib import nullcontext
 from math import ceil
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -29,7 +29,8 @@ class KODiscreteGibbsEulerSolver(Solver):
     This Euler solver advances X_t by:
       1) Sample x_1 ~ p_{1|t}(· | x_t) from the model
       2) Build conditional intensities u_t(· | x_t, x_1) ∝ p_t(· | x_1) * dβ_t * Δd(·; x_t, x_1)
-         where Δd(x; x_t, x_1) = relu( d(E[x_t],E[x_1]) - d(E[x],E[x_1]) )
+         where Δd(x; x_t, x_1) = relu( d(E[x_t],E[x_1]) - d(E[x],E[x_1]) ) and optionally
+         add a symmetric correction term symmetrize * p_t(· | x_1) * dβ_t * |d(E[x],E[x_1]) - d(E[x_t],E[x_1])|
       3) Jump with prob 1 - exp(-h * λ) where λ = Σ_x u_t(x), and draw new state from u/λ.
 
     Notes:
@@ -60,6 +61,7 @@ class KODiscreteGibbsEulerSolver(Solver):
         time_grid: Tensor = torch.tensor([0.0, 1.0]),
         return_intermediates: bool = False,
         verbose: bool = False,
+        symmetrize: Union[float, Callable[[float], float]] = 0.0,
         **model_extras,
     ) -> Tensor:
         # Time discretization
@@ -133,6 +135,17 @@ class KODiscreteGibbsEulerSolver(Solver):
                 d_beta_t = d_beta_t.view(-1, 1, 1)  # [B,1,1] via broadcast
 
                 u = probs_xt * d_beta_t * delta_d  # [B,S,K]
+
+                sym_value: float
+                if callable(symmetrize):
+                    sym_value = float(symmetrize(float(t.item())))
+                else:
+                    sym_value = float(symmetrize)
+
+                if sym_value != 0.0:
+                    sym_term = torch.abs(dist_xt_x1 - dist_x1_to_all)
+                    sym_term = probs_xt * d_beta_t * sym_term
+                    u = u + sym_value * sym_term
 
                 # Zero self-transition
                 onehot_xt = F.one_hot(x_t_tokens, num_classes=self.vocabulary_size)

@@ -106,7 +106,7 @@ def get_args_parser():
         "--sym",
         default=0.0,
         type=float,
-        help="Symmetric term for sampling the discrete flow.",
+        help="Symmetric term coefficient for discrete sampling (mixture or metric-induced).",
     )
     parser.add_argument(
         "--temp",
@@ -117,7 +117,7 @@ def get_args_parser():
     parser.add_argument(
         "--sym_func",
         action="store_true",
-        help="Use a fixed function for the symmetric term in the discrete flow.",
+        help="Use a fixed function for the symmetric term in the discrete sampler.",
     )
     parser.add_argument(
         "--sampling_dtype",
