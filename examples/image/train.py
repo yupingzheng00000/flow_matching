@@ -15,8 +15,13 @@ import sys as _sys
 from pathlib import Path as _Path
 
 _this_dir = _Path(__file__).resolve().parent
-# Go up three levels: .../flow_matching/examples/image -> .../flow_matching
-_pkg_root = _this_dir.parents[2]
+# Insert repository root so that 'flow_matching' package is importable in all launch modes
+# .../LLADA/flo1_matching/examples/image -> repo root is parents[2] (i.e., .../LLADA)
+# Package root to add to sys.path so that `import flow_matching` resolves to
+# .../LLADA/flow_matching/flow_matching/__init__.py
+# Here, `_this_dir` is .../LLADA/flow_matching/examples/image
+# `_this_dir.parents[1]` is .../LLADA/flow_matching (the package root containing the inner package dir `flow_matching/`)
+_pkg_root = _this_dir.parents[1]
 if str(_pkg_root) not in _sys.path:
     _sys.path.insert(0, str(_pkg_root))
 
@@ -161,26 +166,6 @@ def main(args):
                 raise ValueError(f"Unsupported β schedule type: {schedule_type}")
             beta_schedule.to(device=device)
 
-        gumbel_tau_default = float(getattr(args, "mi_gumbel_tau", 1.0))
-        tau_start = getattr(args, "mi_gumbel_tau_start", None)
-        tau_end = getattr(args, "mi_gumbel_tau_end", None)
-        if tau_start is None:
-            tau_start = gumbel_tau_default
-        if tau_end is None:
-            tau_end = gumbel_tau_default
-        args.mi_gumbel_tau_start = float(tau_start)
-        args.mi_gumbel_tau_end = float(tau_end)
-
-        metric_kwargs = {}
-        if getattr(args, "mi_learnable_metric", False):
-            metric_kwargs.update(
-                learnable_metric_dim=int(getattr(args, "mi_metric_dim", 0)),
-                learnable_metric_diag_eps=float(getattr(args, "mi_metric_diag_eps", 1e-4)),
-                metric_interp_lambda=float(getattr(args, "mi_metric_interp_start", 0.0)),
-            )
-        args.mi_metric_interp_start = float(getattr(args, "mi_metric_interp_start", 0.0))
-        args.mi_metric_interp_end = float(getattr(args, "mi_metric_interp_end", 1.0))
-
         metric_path = MetricInducedGibbsProbPath(
             embedding_path_or_weight=None,
             vocab_size=256,
@@ -194,7 +179,7 @@ def main(args):
             dtype=torch.float32,
             beta_schedule=beta_schedule,
             use_gumbel=getattr(args, "mi_use_gumbel", False),
-            gumbel_tau=float(args.mi_gumbel_tau_start),
+            gumbel_tau=float(getattr(args, "mi_gumbel_tau", 1.0)),
             gumbel_hard=True,
             **metric_kwargs,
         )
@@ -271,40 +256,34 @@ def main(args):
         )
         model_without_ddp = model.module
 
-    optimizer_param_groups = [{"params": list(model_without_ddp.parameters())}]
+    # Build optimizer with per-group learning rates
+    model_params = list(model_without_ddp.parameters())
+    param_groups = [
+        {"params": model_params, "lr": args.lr},
+    ]
     extra_modules = {}
+    schedule_params = []
     if metric_path is not None:
         schedule_params = list(metric_path.schedule_parameters())
         if schedule_params:
-            schedule_lr_scale = float(getattr(args, "mi_beta_lr_scale", 1.0))
-            optimizer_param_groups.append(
-                {
-                    "params": schedule_params,
-                    "lr": args.lr * schedule_lr_scale,
-                }
-            )
-        metric_params = list(metric_path.metric_parameters())
-        if metric_params:
-            metric_lr_scale = float(getattr(args, "mi_metric_lr_scale", 0.1))
-            optimizer_param_groups.append(
-                {
-                    "params": metric_params,
-                    "lr": args.lr * metric_lr_scale,
-                }
-            )
-        if isinstance(metric_path.beta_schedule, nn.Module):
-            extra_modules["metric_beta_schedule"] = metric_path.beta_schedule
-        if metric_path.learnable_metric is not None:
-            extra_modules["metric_learnable_metric"] = metric_path.learnable_metric
-        if beta_schedule_ema is not None:
-            extra_modules["metric_beta_schedule_ema"] = beta_schedule_ema
-        if metric_ema is not None:
-            extra_modules["metric_learnable_metric_ema"] = metric_ema
-        if kl_controller is not None:
-            extra_modules["metric_beta_kl_controller"] = kl_controller
+            # Schedule params use 1/10 of the base LR
+            param_groups.append({"params": schedule_params, "lr": args.lr * 0.1})
+            if isinstance(metric_path.beta_schedule, nn.Module):
+                extra_modules["metric_beta_schedule"] = metric_path.beta_schedule
     optimizer = torch.optim.AdamW(
-        optimizer_param_groups, lr=args.lr, betas=args.optimizer_betas
+        param_groups, lr=args.lr, betas=args.optimizer_betas
     )
+
+    # Log optimizer group info
+    try:
+        num_model_params = sum(p.numel() for p in model_params if getattr(p, "requires_grad", True))
+        num_sched_params = sum(p.numel() for p in schedule_params) if len(schedule_params) > 0 else 0
+        logger.info(
+            f"Optimizer param groups: model={num_model_params} @ {args.lr:.2e}"
+            + (f"; schedule={num_sched_params} @ {(args.lr * 0.1):.2e}" if num_sched_params > 0 else "")
+        )
+    except Exception:
+        pass
     if args.decay_lr:
         lr_schedule = torch.optim.lr_scheduler.LinearLR(
             optimizer,
