@@ -42,6 +42,7 @@ from flow_matching.path import (
     BetaScheduleEMA,
     ExpMonotoneRQSConfig,
     ExpMonotoneRQSSchedule,
+    LearnableMetricEMA,
     MetricInducedGibbsProbPath,
     MonotoneRQBetaSchedule,
     MonotoneRQConfig,
@@ -129,6 +130,7 @@ def main(args):
 
     beta_schedule: Optional[BetaSchedule] = None
     beta_schedule_ema: Optional[BetaScheduleEMA] = None
+    metric_ema: Optional[LearnableMetricEMA] = None
     kl_controller: Optional[AdaptiveKLController] = None
     metric_path: Optional[MetricInducedGibbsProbPath] = None
     if getattr(args, "ko_metric_induced", False):
@@ -169,6 +171,16 @@ def main(args):
         args.mi_gumbel_tau_start = float(tau_start)
         args.mi_gumbel_tau_end = float(tau_end)
 
+        metric_kwargs = {}
+        if getattr(args, "mi_learnable_metric", False):
+            metric_kwargs.update(
+                learnable_metric_dim=int(getattr(args, "mi_metric_dim", 0)),
+                learnable_metric_diag_eps=float(getattr(args, "mi_metric_diag_eps", 1e-4)),
+                metric_interp_lambda=float(getattr(args, "mi_metric_interp_start", 0.0)),
+            )
+        args.mi_metric_interp_start = float(getattr(args, "mi_metric_interp_start", 0.0))
+        args.mi_metric_interp_end = float(getattr(args, "mi_metric_interp_end", 1.0))
+
         metric_path = MetricInducedGibbsProbPath(
             embedding_path_or_weight=None,
             vocab_size=256,
@@ -184,7 +196,13 @@ def main(args):
             use_gumbel=getattr(args, "mi_use_gumbel", False),
             gumbel_tau=float(args.mi_gumbel_tau_start),
             gumbel_hard=True,
+            **metric_kwargs,
         )
+        if getattr(args, "mi_learnable_metric", False):
+            metric_path.set_metric_interpolation_lambda(args.mi_metric_interp_start)
+        kl_target = float(getattr(args, "mi_beta_kl_target", 0.0))
+        kl_init_weight = float(getattr(args, "mi_beta_kl_init_weight", 0.0))
+
         if (
             getattr(args, "mi_learnable_beta", False)
             and getattr(args, "mi_beta_use_ema", False)
@@ -197,18 +215,32 @@ def main(args):
             beta_schedule_ema.to(device=device)
             beta_schedule_ema.synchronize_from(metric_path.beta_schedule)
 
-            kl_target = float(getattr(args, "mi_beta_kl_target", 0.0))
-            kl_init_weight = float(getattr(args, "mi_beta_kl_init_weight", 0.0))
-            if kl_target > 0.0 and kl_init_weight > 0.0:
-                kl_controller = AdaptiveKLController(
-                    target=kl_target,
-                    init_weight=kl_init_weight,
-                    adapt_rate=float(getattr(args, "mi_beta_kl_adapt_rate", 2.0)),
-                    tolerance=float(getattr(args, "mi_beta_kl_tolerance", 1.5)),
-                    min_weight=float(getattr(args, "mi_beta_kl_min_weight", 1e-4)),
-                    max_weight=float(getattr(args, "mi_beta_kl_max_weight", 1e4)),
-                )
-                kl_controller.to(device=device)
+        if (
+            getattr(args, "mi_learnable_metric", False)
+            and getattr(args, "mi_metric_use_ema", False)
+            and metric_path.learnable_metric is not None
+        ):
+            metric_ema = LearnableMetricEMA(
+                metric_path.learnable_metric,
+                decay=float(getattr(args, "mi_metric_ema_decay", 0.999)),
+            )
+            metric_ema.to(device=device)
+            metric_ema.synchronize_from(metric_path.learnable_metric)
+
+        if (
+            kl_target > 0.0
+            and kl_init_weight > 0.0
+            and (beta_schedule_ema is not None or metric_ema is not None)
+        ):
+            kl_controller = AdaptiveKLController(
+                target=kl_target,
+                init_weight=kl_init_weight,
+                adapt_rate=float(getattr(args, "mi_beta_kl_adapt_rate", 2.0)),
+                tolerance=float(getattr(args, "mi_beta_kl_tolerance", 1.5)),
+                min_weight=float(getattr(args, "mi_beta_kl_min_weight", 1e-4)),
+                max_weight=float(getattr(args, "mi_beta_kl_max_weight", 1e4)),
+            )
+            kl_controller.to(device=device)
 
     # define the model
     logger.info("Initializing Model")
@@ -239,20 +271,39 @@ def main(args):
         )
         model_without_ddp = model.module
 
-    optimizer_params = list(model_without_ddp.parameters())
+    optimizer_param_groups = [{"params": list(model_without_ddp.parameters())}]
     extra_modules = {}
     if metric_path is not None:
-        schedule_params = list(metric_path.learnable_parameters())
+        schedule_params = list(metric_path.schedule_parameters())
         if schedule_params:
-            optimizer_params.extend(schedule_params)
+            schedule_lr_scale = float(getattr(args, "mi_beta_lr_scale", 1.0))
+            optimizer_param_groups.append(
+                {
+                    "params": schedule_params,
+                    "lr": args.lr * schedule_lr_scale,
+                }
+            )
+        metric_params = list(metric_path.metric_parameters())
+        if metric_params:
+            metric_lr_scale = float(getattr(args, "mi_metric_lr_scale", 0.1))
+            optimizer_param_groups.append(
+                {
+                    "params": metric_params,
+                    "lr": args.lr * metric_lr_scale,
+                }
+            )
         if isinstance(metric_path.beta_schedule, nn.Module):
             extra_modules["metric_beta_schedule"] = metric_path.beta_schedule
+        if metric_path.learnable_metric is not None:
+            extra_modules["metric_learnable_metric"] = metric_path.learnable_metric
         if beta_schedule_ema is not None:
             extra_modules["metric_beta_schedule_ema"] = beta_schedule_ema
+        if metric_ema is not None:
+            extra_modules["metric_learnable_metric_ema"] = metric_ema
         if kl_controller is not None:
             extra_modules["metric_beta_kl_controller"] = kl_controller
     optimizer = torch.optim.AdamW(
-        optimizer_params, lr=args.lr, betas=args.optimizer_betas
+        optimizer_param_groups, lr=args.lr, betas=args.optimizer_betas
     )
     if args.decay_lr:
         lr_schedule = torch.optim.lr_scheduler.LinearLR(
@@ -286,6 +337,13 @@ def main(args):
         and beta_schedule_ema.num_updates.item() == 0
     ):
         beta_schedule_ema.synchronize_from(metric_path.beta_schedule)
+    if (
+        metric_ema is not None
+        and metric_path is not None
+        and metric_path.learnable_metric is not None
+        and metric_ema.num_updates.item() == 0
+    ):
+        metric_ema.synchronize_from(metric_path.learnable_metric)
 
     # Optional Weights & Biases
     wandb_run = None
@@ -323,6 +381,7 @@ def main(args):
                 args=args,
                 path=metric_path,
                 schedule_ema=beta_schedule_ema,
+                metric_ema=metric_ema,
                 kl_controller=kl_controller,
             )
             log_stats = {

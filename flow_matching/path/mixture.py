@@ -11,6 +11,82 @@ from typing import Iterable, Optional, Union
 
 from torch import Tensor
 
+
+def _inv_softplus_tensor(x: Tensor) -> Tensor:
+    """Stable inverse softplus used for positive-diagonal initialization."""
+
+    return torch.log(torch.expm1(x))
+
+
+class MahalanobisTokenMetric(nn.Module):
+    """Learnable PSD metric defined via token codes and a lower-triangular map."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        metric_dim: int,
+        *,
+        init_codes: Optional[Tensor] = None,
+        diag_eps: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        if vocab_size <= 0:
+            raise ValueError("vocab_size must be positive")
+        if metric_dim <= 0:
+            raise ValueError("metric_dim must be positive")
+        if diag_eps < 0.0:
+            raise ValueError("diag_eps must be non-negative")
+
+        self.vocab_size = int(vocab_size)
+        self.metric_dim = int(metric_dim)
+        self.diag_eps = float(diag_eps)
+
+        self.codes = nn.Parameter(torch.zeros(self.vocab_size, self.metric_dim))
+        self._lower_params = nn.Parameter(torch.zeros(self.metric_dim, self.metric_dim))
+
+        self.reset_parameters(init_codes=init_codes)
+
+    @torch.no_grad()
+    def reset_parameters(self, init_codes: Optional[Tensor] = None) -> None:
+        if init_codes is not None:
+            if init_codes.shape != (self.vocab_size, self.metric_dim):
+                raise ValueError(
+                    "init_codes must have shape (vocab_size, metric_dim)"
+                )
+            self.codes.copy_(init_codes)
+        else:
+            self.codes.zero_()
+
+        self._lower_params.zero_()
+        inv_sp_one = _inv_softplus_tensor(torch.ones(self.metric_dim, dtype=self._lower_params.dtype))
+        torch.diagonal(self._lower_params).copy_(inv_sp_one)
+
+    def cholesky_factor(self) -> Tensor:
+        lower = torch.tril(self._lower_params)
+        diag = torch.diagonal(lower)
+        positive_diag = F.softplus(diag) + self.diag_eps
+        lower = lower - torch.diag_embed(diag) + torch.diag_embed(positive_diag)
+        return lower
+
+    def transformed_codes(self, *, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> Tensor:
+        codes = self.codes
+        if device is not None or dtype is not None:
+            codes = codes.to(device=device or codes.device, dtype=dtype or codes.dtype)
+        lower = self.cholesky_factor().to(device=codes.device, dtype=codes.dtype)
+        return codes @ lower.T
+
+    def pairwise_distance_table(
+        self, *, device: torch.device, dtype: torch.dtype
+    ) -> Tensor:
+        transformed = self.transformed_codes(device=device, dtype=dtype)
+        return torch.cdist(transformed, transformed, p=2.0)
+
+    def get_extra_state(self) -> dict:
+        return {"diag_eps": self.diag_eps}
+
+    def set_extra_state(self, state: dict) -> None:  # pragma: no cover - API requirement
+        self.diag_eps = float(state.get("diag_eps", self.diag_eps))
+
 from flow_matching.path.beta_schedules import BetaSchedule
 from flow_matching.path.path import ProbPath
 
@@ -151,6 +227,10 @@ class MetricInducedGibbsProbPath(ProbPath):
         use_gumbel: bool = False,
         gumbel_tau: float = 1.0,
         gumbel_hard: bool = True,
+        *,
+        learnable_metric_dim: int = 0,
+        learnable_metric_diag_eps: float = 1e-4,
+        metric_interp_lambda: float = 0.0,
     ):
         super().__init__()
         self.metric_name = metric
@@ -175,12 +255,33 @@ class MetricInducedGibbsProbPath(ProbPath):
         for p in self.embedding.parameters():
             p.requires_grad_(False)
 
-        # Caches for speed: token distance table and norms for cosine
+        self.learnable_metric: Optional[MahalanobisTokenMetric] = None
+        if learnable_metric_dim > 0:
+            init_codes = self._build_metric_init_codes(
+                metric_dim=int(learnable_metric_dim),
+                device=device if device is not None else self.embedding.weight.device,
+                dtype=dtype,
+            )
+            metric_module = MahalanobisTokenMetric(
+                vocab_size,
+                metric_dim=int(learnable_metric_dim),
+                init_codes=init_codes,
+                diag_eps=float(learnable_metric_diag_eps),
+            )
+            metric_module = metric_module.to(dtype=dtype)
+            if device is not None:
+                metric_module = metric_module.to(device=device)
+            self.learnable_metric = metric_module
+
+        # Caches for speed: token distance table and baseline distance table
         self._cached_dist_table: Optional[Tensor] = None  # [K,K]
+        self._base_dist_table_cpu: Optional[Tensor] = None
         self._cached_emb_weight: Optional[Tensor] = None  # reference to detect invalidation
         self._cached_metric_name: Optional[str] = None
         self._cached_lp_order: Optional[float] = None
-        self._cached_cos_norms: Optional[Tensor] = None   # [K]
+
+        self.metric_interp_lambda = 0.0
+        self.set_metric_interpolation_lambda(metric_interp_lambda)
 
     # ---------- Embedding handling ----------
     def _build_embedding(
@@ -222,6 +323,28 @@ class MetricInducedGibbsProbPath(ProbPath):
             w = w.repeat(1, emb_dim)  # trivial tiling if a wider dim is desired
         return from_weight(w)
 
+    def _build_metric_init_codes(
+        self, *, metric_dim: int, device: torch.device, dtype: torch.dtype
+    ) -> Tensor:
+        base = self.embedding.weight.detach().to(device=device, dtype=dtype)
+        codes = torch.zeros(base.size(0), metric_dim, device=device, dtype=dtype)
+        dims = min(base.size(1), metric_dim)
+        if dims > 0:
+            codes[:, :dims] = base[:, :dims]
+        return codes
+
+    def _embedding_to_tokens(self, emb: Tensor) -> Tensor:
+        if emb.shape[-1] < 1:
+            raise ValueError("Embedding tensor must have at least one dimension")
+        values = emb[..., 0]
+        if self.embed_range == "pm1":
+            scaled = (values + 1.0) * 0.5
+        else:
+            scaled = values
+        scaled = scaled.clamp(0.0, 1.0)
+        idx = torch.round(scaled * (self.vocab_size - 1)).to(dtype=torch.long)
+        return idx
+
     @property
     def vocab_size(self) -> int:
         return self.embedding.num_embeddings
@@ -229,6 +352,17 @@ class MetricInducedGibbsProbPath(ProbPath):
     @property
     def emb_dim(self) -> int:
         return self.embedding.embedding_dim
+
+    @property
+    def has_learnable_metric(self) -> bool:
+        return self.learnable_metric is not None
+
+    def set_metric_interpolation_lambda(self, value: float) -> None:
+        clamped = float(min(max(value, 0.0), 1.0))
+        self.metric_interp_lambda = clamped
+
+    def get_metric_interpolation_lambda(self) -> float:
+        return float(self.metric_interp_lambda)
 
     # ---------- Scheduler β(t) and its derivative (useful later for KO velocities) ----------
     def beta(self, t: Tensor):
@@ -249,9 +383,20 @@ class MetricInducedGibbsProbPath(ProbPath):
         return beta_t, d_beta_t
 
     def learnable_parameters(self) -> Iterable[nn.Parameter]:
-        if self.beta_schedule is None:
-            return []
-        return self.beta_schedule.parameters()
+        params: list[nn.Parameter] = []
+        if isinstance(self.beta_schedule, nn.Module):
+            params.extend(self.beta_schedule.parameters())
+        if self.learnable_metric is not None:
+            params.extend(self.learnable_metric.parameters())
+        return params
+
+    def schedule_parameters(self) -> Iterable[nn.Parameter]:
+        if isinstance(self.beta_schedule, nn.Module):
+            yield from self.beta_schedule.parameters()
+
+    def metric_parameters(self) -> Iterable[nn.Parameter]:
+        if self.learnable_metric is not None:
+            yield from self.learnable_metric.parameters()
 
     # ---------- Distance on the embedding space ----------
     def _pairwise_dist(self, z_flat: Tensor, E: Tensor) -> Tensor:
@@ -282,12 +427,7 @@ class MetricInducedGibbsProbPath(ProbPath):
         return d_flat.view(B, S, self.vocab_size)
 
     # ---------- Precompute and use fast token-indexed distances ----------
-    def _ensure_tables(self, device: torch.device, dtype: torch.dtype) -> None:
-        """Ensure the precomputed KxK distance table exists on the right device/dtype.
-
-        For Euclidean/Lp: dist[i,j] = ||E[i]-E[j]||_p
-        For Cosine: dist[i,j] = 1 - cos(E[i], E[j])
-        """
+    def _get_base_distance_table(self, device: torch.device, dtype: torch.dtype) -> Tensor:
         E = self.embedding.weight
         metric_changed = (
             self._cached_metric_name != self.metric_name
@@ -295,34 +435,54 @@ class MetricInducedGibbsProbPath(ProbPath):
         )
         weight_changed = (self._cached_emb_weight is not E)
 
-        if self._cached_dist_table is None or metric_changed or weight_changed:
-            # Recompute on CPU (smaller peak memory), then move
+        if self._base_dist_table_cpu is None or metric_changed or weight_changed:
             Ew = E.detach().to("cpu", dtype=torch.float32)
             if self.metric_name in ("euclidean", "lp"):
                 p = 2.0 if self.metric_name == "euclidean" else float(self.lp_order)
-                # cdist over all pairs: [K,K]
-                dist = torch.cdist(Ew, Ew, p=p)
-                self._cached_cos_norms = None
+                dist_cpu = torch.cdist(Ew, Ew, p=p)
             elif self.metric_name == "cosine":
                 Ew_n = F.normalize(Ew, p=2, dim=-1)
-                dist = 1.0 - (Ew_n @ Ew_n.T)
-                # Also cache norms for pair_distance_tokens fast path (if needed)
-                self._cached_cos_norms = Ew.norm(p=2, dim=-1)  # keep CPU copy
+                dist_cpu = 1.0 - (Ew_n @ Ew_n.T)
             else:
                 raise ValueError(f"Unsupported metric: {self.metric_name}")
 
-            self._cached_dist_table = dist.to(device=device, dtype=dtype)
+            self._base_dist_table_cpu = dist_cpu
             self._cached_emb_weight = E
             self._cached_metric_name = self.metric_name
             self._cached_lp_order = float(self.lp_order)
+
+        base = self._base_dist_table_cpu
+        assert base is not None
+        if base.device != device or base.dtype != dtype:
+            base = base.to(device=device, dtype=dtype)
+        return base
+
+    def _build_distance_table(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        metric_module: Optional[MahalanobisTokenMetric] = None,
+        cache_result: bool = True,
+    ) -> Tensor:
+        base = self._get_base_distance_table(device=device, dtype=dtype)
+
+        module = metric_module if metric_module is not None else self.learnable_metric
+        learned_table = None
+        lam = float(self.metric_interp_lambda)
+        if module is not None and lam > 0.0:
+            learned_table = module.pairwise_distance_table(device=device, dtype=dtype)
+
+        if learned_table is None or lam <= 0.0:
+            dist = base
+        elif lam >= 1.0:
+            dist = learned_table
         else:
-            # Ensure correct device/dtype
-            if self._cached_dist_table.device != device or self._cached_dist_table.dtype != dtype:
-                self._cached_dist_table = self._cached_dist_table.to(device=device, dtype=dtype)
-            if self._cached_cos_norms is not None and (
-                self._cached_cos_norms.device != device or self._cached_cos_norms.dtype != dtype
-            ):
-                self._cached_cos_norms = self._cached_cos_norms.to(device=device, dtype=dtype)
+            dist = (1.0 - lam) * base + lam * learned_table
+
+        if cache_result and metric_module is None:
+            self._cached_dist_table = dist
+        return dist
 
     def distances_from_tokens(self, token_indices: Tensor) -> Tensor:
         """Return distances to all vocab tokens for each provided token index.
@@ -335,13 +495,11 @@ class MetricInducedGibbsProbPath(ProbPath):
         assert token_indices.dtype in (torch.int32, torch.int64)
         device = token_indices.device
         dtype = self.embedding.weight.dtype
-        self._ensure_tables(device=device, dtype=dtype)
+        dist_table = self._build_distance_table(device=device, dtype=dtype)
         # Gather rows for each token index
         K = self.vocab_size
         B, S = token_indices.shape[0], token_indices.view(token_indices.shape[0], -1).shape[1]
         flat = token_indices.view(-1)  # [B*S]
-        dist_table = self._cached_dist_table
-        assert dist_table is not None, "Distance table cache not initialized"
         dist_rows = dist_table.index_select(dim=0, index=flat)  # [B*S, K]
         return dist_rows.view(token_indices.shape + (K,))
 
@@ -352,6 +510,7 @@ class MetricInducedGibbsProbPath(ProbPath):
         *,
         beta_values: Optional[Tensor] = None,
         beta_schedule: Optional[BetaSchedule] = None,
+        metric_module: Optional[MahalanobisTokenMetric] = None,
     ) -> Tensor:
         """Fast probability path using token indices directly.
 
@@ -361,14 +520,21 @@ class MetricInducedGibbsProbPath(ProbPath):
             beta_values: optional precomputed β(t) values of shape [B].
             beta_schedule: optional schedule override used when ``beta_values`` is not
                 provided. When omitted, the path's current schedule is used.
+            metric_module: optional learned metric override (e.g., EMA teacher).
         Returns:
             probs: [B,S,K]
         """
         B = x1_tokens.shape[0]
         device = x1_tokens.device
         dtype = self.embedding.weight.dtype
-        self._ensure_tables(device=device, dtype=dtype)
-        d = self.distances_from_tokens(x1_tokens)  # [B,S,K]
+        dist_table = self._build_distance_table(
+            device=device,
+            dtype=dtype,
+            metric_module=metric_module,
+            cache_result=metric_module is None,
+        )
+        flat_indices = x1_tokens.view(-1)
+        d = dist_table.index_select(0, flat_indices).view(x1_tokens.shape + (self.vocab_size,))
         if beta_values is not None:
             beta_t = beta_values
         elif beta_schedule is not None:
@@ -391,12 +557,9 @@ class MetricInducedGibbsProbPath(ProbPath):
         assert x_tokens.shape == x1_tokens.shape
         device = x_tokens.device
         dtype = self.embedding.weight.dtype
-        self._ensure_tables(device=device, dtype=dtype)
+        dist_table = self._build_distance_table(device=device, dtype=dtype)
         flat = x_tokens.view(-1)             # [N]
         flat1 = x1_tokens.view(-1)           # [N]
-        # Use precomputed dist table rows and gather diag elements by index-select then take matching columns
-        dist_table = self._cached_dist_table
-        assert dist_table is not None, "Distance table cache not initialized"
         rows = dist_table.index_select(0, flat)  # [N,K]
         dist = rows.gather(1, flat1.view(-1, 1))              # [N,1]
         return dist.view(x_tokens.shape + (1,))
@@ -408,12 +571,8 @@ class MetricInducedGibbsProbPath(ProbPath):
         t: shape [B]
         returns probs [B, S, K] with last-dim softmax (vocab).
         """
-        B, S, _ = emb_x1.shape
-        d = self.metric(emb_x1)  # [B, S, K]
-        beta_t, _ = self.beta(t)  # [B]
-        beta_t = beta_t.view(B, 1, 1)
-        logits = -beta_t * d
-        return torch.softmax(logits, dim=-1)
+        tokens = self._embedding_to_tokens(emb_x1)
+        return self.get_prob_distribution_from_tokens(tokens, t)
 
     # ---------- API: sample() ----------
     def sample(self, x_0: Tensor, x_1: Tensor, t: Tensor) -> DiscretePathSample:

@@ -14,6 +14,7 @@ from .beta_schedules import (
     MonotoneRQConfig,
 )
 from .schedule_ema import BetaScheduleEMA
+from .metric_ema import LearnableMetricEMA
 from .mixture import MixtureDiscreteProbPath, MetricInducedGibbsProbPath
 from .path import ProbPath
 from .path_sample import DiscretePathSample, PathSample
@@ -34,4 +35,5 @@ __all__ = [
     "MonotoneRQConfig",
     "ExpMonotoneRQSConfig",
     "BetaScheduleEMA",
+    "LearnableMetricEMA",
 ]

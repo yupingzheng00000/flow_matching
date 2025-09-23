@@ -16,6 +16,7 @@ from flow_matching.path import (
     ExpMonotoneRQSConfig,
     ExpMonotoneRQSSchedule,
     BetaScheduleEMA,
+    LearnableMetricEMA,
     MonotoneRQBetaSchedule,
     MonotoneRQConfig,
 )
@@ -206,6 +207,54 @@ class TestMetricInducedProbPath(unittest.TestCase):
         probs = sample.x_t_soft.sum(dim=-1)
         self.assertTrue(torch.allclose(probs, torch.ones_like(probs)))
 
+    def test_learnable_metric_warm_start_matches_lp(self):
+        torch.manual_seed(0)
+        base_path = MetricInducedGibbsProbPath(
+            vocab_size=8,
+            emb_dim=1,
+            metric="lp",
+            lp_order=3.0,
+            embed_range="pm1",
+        )
+        learned_path = MetricInducedGibbsProbPath(
+            vocab_size=8,
+            emb_dim=1,
+            metric="lp",
+            lp_order=3.0,
+            embed_range="pm1",
+            learnable_metric_dim=4,
+            metric_interp_lambda=0.0,
+        )
+
+        tokens = torch.tensor([[0, 2, 4, 6]], dtype=torch.long)
+        t = torch.tensor([0.3])
+        base_probs = base_path.get_prob_distribution_from_tokens(tokens, t)
+        warm_probs = learned_path.get_prob_distribution_from_tokens(tokens, t)
+        self.assertTrue(torch.allclose(base_probs, warm_probs, atol=1e-6))
+
+        learned_path.set_metric_interpolation_lambda(1.0)
+        full_probs = learned_path.get_prob_distribution_from_tokens(tokens, t)
+        self.assertTrue(torch.allclose(base_probs, full_probs, atol=1e-6))
+
+    def test_learnable_metric_cache_refreshes_after_update(self):
+        torch.manual_seed(0)
+        path = MetricInducedGibbsProbPath(
+            vocab_size=6,
+            emb_dim=1,
+            metric="lp",
+            lp_order=3.0,
+            embed_range="pm1",
+            learnable_metric_dim=3,
+            metric_interp_lambda=1.0,
+        )
+        tokens = torch.tensor([[1, 3, 5]], dtype=torch.long)
+        dist_before = path.distances_from_tokens(tokens).detach()
+        with torch.no_grad():
+            assert path.learnable_metric is not None
+            path.learnable_metric.codes.mul_(1.1)
+        dist_after = path.distances_from_tokens(tokens).detach()
+        self.assertFalse(torch.allclose(dist_before, dist_after))
+
 
 class TestScheduleUtilities(unittest.TestCase):
     def test_metric_induced_beta_override_matches_manual(self):
@@ -263,6 +312,32 @@ class TestScheduleUtilities(unittest.TestCase):
         synced_beta, _ = ema.beta_and_derivative(t)
         schedule_beta, _ = schedule.beta_and_derivative(t)
         self.assertTrue(torch.allclose(synced_beta, schedule_beta, atol=1e-6))
+
+    def test_learnable_metric_ema_tracks_metric(self):
+        path = MetricInducedGibbsProbPath(
+            vocab_size=5,
+            emb_dim=1,
+            metric="lp",
+            lp_order=3.0,
+            embed_range="pm1",
+            learnable_metric_dim=2,
+            metric_interp_lambda=1.0,
+        )
+        assert path.learnable_metric is not None
+        metric_module = path.learnable_metric
+        ema = LearnableMetricEMA(metric_module, decay=0.5)
+        ema.synchronize_from(metric_module)
+
+        with torch.no_grad():
+            metric_module.codes.add_(0.5)
+        ema.update(metric_module)
+        self.assertEqual(int(ema.num_updates.item()), 1)
+        self.assertFalse(
+            torch.allclose(ema.teacher.codes, metric_module.codes, atol=1e-6)
+        )
+
+        ema.synchronize_from(metric_module)
+        self.assertTrue(torch.allclose(ema.teacher.codes, metric_module.codes, atol=1e-6))
 
 
 class TestMonotoneRQSchedule(unittest.TestCase):

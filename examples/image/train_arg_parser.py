@@ -371,6 +371,70 @@ def get_args_parser():
         help="Upper clamp for the adaptive schedule KL weight.",
     )
     parser.add_argument(
+        "--mi_beta_lr_scale",
+        default=1.0,
+        type=float,
+        help="Relative learning rate scale applied to the β schedule parameter group.",
+    )
+    parser.add_argument(
+        "--mi_learnable_metric",
+        action="store_true",
+        help="Enable a learnable Mahalanobis metric for the metric-induced path.",
+    )
+    parser.add_argument(
+        "--mi_metric_dim",
+        default=8,
+        type=int,
+        help="Dimension of the learnable Mahalanobis token codes when enabled.",
+    )
+    parser.add_argument(
+        "--mi_metric_diag_eps",
+        default=1e-4,
+        type=float,
+        help="Stability epsilon added to the Mahalanobis transform diagonal.",
+    )
+    parser.add_argument(
+        "--mi_metric_lr_scale",
+        default=0.1,
+        type=float,
+        help="Relative learning rate scale applied to the learnable metric parameter group.",
+    )
+    parser.add_argument(
+        "--mi_metric_use_ema",
+        action="store_true",
+        help="Track an EMA teacher of the learnable metric for KL regularization.",
+    )
+    parser.add_argument(
+        "--mi_metric_ema_decay",
+        default=0.999,
+        type=float,
+        help="Decay applied to the learnable metric EMA updates.",
+    )
+    parser.add_argument(
+        "--mi_metric_interp_start",
+        default=0.0,
+        type=float,
+        help="Initial interpolation weight between the fixed Lp distance and the learned metric.",
+    )
+    parser.add_argument(
+        "--mi_metric_interp_end",
+        default=1.0,
+        type=float,
+        help="Final interpolation weight between the fixed Lp distance and the learned metric.",
+    )
+    parser.add_argument(
+        "--mi_metric_interp_anneal_steps",
+        default=0,
+        type=int,
+        help="Number of optimizer steps used to anneal the metric interpolation weight.",
+    )
+    parser.add_argument(
+        "--mi_metric_interp_schedule",
+        default="cosine",
+        choices=["quadratic", "linear", "cosine"],
+        help="Schedule shape used to anneal the metric interpolation weight.",
+    )
+    parser.add_argument(
         "--mi_use_gumbel",
         action="store_true",
         help="Use straight-through Gumbel-Softmax sampling for metric-induced training inputs.",

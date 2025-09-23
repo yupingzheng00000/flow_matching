@@ -18,6 +18,7 @@ from flow_matching.path import (
     MetricInducedGibbsProbPath,
     ProbPath,
     BetaScheduleEMA,
+    LearnableMetricEMA,
 )
 from flow_matching.path.scheduler import PolynomialConvexScheduler
 from models.ema import EMA
@@ -101,10 +102,10 @@ class AdaptiveKLController(nn.Module):
         self.weight.copy_(torch.tensor(weight, device=self.weight.device))
 
 
-def _anneal_gumbel_tau(
+def _anneal_scalar(
     step: int, total_steps: int, start: float, end: float, schedule: str
 ) -> float:
-    """Return the annealed Gumbel-Softmax temperature for the given step."""
+    """Return an annealed scalar following the provided schedule."""
 
     if total_steps <= 0:
         return end
@@ -132,6 +133,7 @@ def train_one_epoch(
     args: argparse.Namespace,
     path: Optional[ProbPath] = None,
     schedule_ema: Optional[BetaScheduleEMA] = None,
+    metric_ema: Optional[LearnableMetricEMA] = None,
     kl_controller: Optional[AdaptiveKLController] = None,
 ):
     gc.collect()
@@ -159,14 +161,22 @@ def train_one_epoch(
     ):
         beta_schedule_module = path.beta_schedule
 
-    use_schedule_ema = schedule_ema is not None and beta_schedule_module is not None
-    use_schedule_trust_region = use_schedule_ema and kl_controller is not None
-    if kl_controller is not None and not use_schedule_ema:
+    teacher_schedule_available = (
+        schedule_ema is not None and beta_schedule_module is not None
+    )
+    teacher_metric_available = (
+        metric_ema is not None
+        and isinstance(path, MetricInducedGibbsProbPath)
+        and path.learnable_metric is not None
+    )
+    use_path_ema = teacher_schedule_available or teacher_metric_available
+    use_path_trust_region = use_path_ema and kl_controller is not None
+    if kl_controller is not None and not use_path_ema:
         logger.warning(
-            "Schedule KL controller was provided without an EMA teacher; disabling the controller."
+            "KL controller was provided without an EMA teacher; disabling the controller."
         )
         kl_controller = None
-        use_schedule_trust_region = False
+        use_path_trust_region = False
 
     kl_metric = kl_penalty_metric = None
     kl_updates_total = 0
@@ -180,9 +190,9 @@ def train_one_epoch(
             kl_avg_window,
         )
         kl_avg_window = 1
-    kl_window = deque(maxlen=kl_avg_window) if use_schedule_trust_region else None
+    kl_window = deque(maxlen=kl_avg_window) if use_path_trust_region else None
     kl_window_sum = 0.0
-    if use_schedule_trust_region:
+    if use_path_trust_region:
         kl_metric = MeanMetric().to(device, non_blocking=True)
         kl_penalty_metric = MeanMetric().to(device, non_blocking=True)
 
@@ -207,13 +217,31 @@ def train_one_epoch(
     )
     current_gumbel_tau = getattr(path, "gumbel_tau", None)
     updates_per_epoch = None
-    if gumbel_schedule_active and _dl_len is not None:
+    if _dl_len is not None:
         updates_per_epoch = (_dl_len + accum_iter - 1) // accum_iter
     gumbel_update_step = int(getattr(args, "_gumbel_update_step", 0))
     if gumbel_schedule_active and updates_per_epoch is not None:
         epoch_offset = epoch * updates_per_epoch
         if gumbel_update_step < epoch_offset:
             gumbel_update_step = epoch_offset
+
+    metric_interp_steps = int(getattr(args, "mi_metric_interp_anneal_steps", 0) or 0)
+    metric_interp_start = float(getattr(args, "mi_metric_interp_start", 0.0))
+    metric_interp_end = float(getattr(args, "mi_metric_interp_end", metric_interp_start))
+    metric_interp_schedule = getattr(args, "mi_metric_interp_schedule", "cosine")
+    metric_interp_active = (
+        metric_interp_steps > 0
+        and isinstance(path, MetricInducedGibbsProbPath)
+        and path.has_learnable_metric
+    )
+    current_metric_interp = (
+        path.get_metric_interpolation_lambda() if metric_interp_active else None
+    )
+    metric_interp_update_step = int(getattr(args, "_metric_interp_update_step", 0))
+    if metric_interp_active and updates_per_epoch is not None:
+        epoch_offset_interp = epoch * updates_per_epoch
+        if metric_interp_update_step < epoch_offset_interp:
+            metric_interp_update_step = epoch_offset_interp
 
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         if data_iter_step % accum_iter == 0:
@@ -253,12 +281,20 @@ def train_one_epoch(
                 logits.float().reshape([-1, 256]), samples.reshape([-1])
             ).mean()
 
-            if use_schedule_trust_region:
+            if use_path_trust_region:
                 x1_flat = samples.view(samples.shape[0], -1)
                 with torch.no_grad():
-                    teacher_beta, _ = schedule_ema.beta_and_derivative(t)
+                    teacher_beta = None
+                    if teacher_schedule_available and schedule_ema is not None:
+                        teacher_beta, _ = schedule_ema.beta_and_derivative(t)
+                    teacher_metric_module = (
+                        metric_ema.teacher if teacher_metric_available else None
+                    )
                     teacher_probs = path.get_prob_distribution_from_tokens(
-                        x1_flat, t, beta_values=teacher_beta
+                        x1_flat,
+                        t,
+                        beta_values=teacher_beta,
+                        metric_module=teacher_metric_module,
                     )
                 student_probs = path.get_prob_distribution_from_tokens(x1_flat, t)
                 eps = 1e-8
@@ -348,12 +384,20 @@ def train_one_epoch(
         if (
             apply_update
             and not grad_step_skipped
-            and use_schedule_ema
+            and teacher_schedule_available
             and beta_schedule_module is not None
         ):
             schedule_ema.update(beta_schedule_module)
+        if (
+            apply_update
+            and not grad_step_skipped
+            and teacher_metric_available
+            and isinstance(path, MetricInducedGibbsProbPath)
+            and path.learnable_metric is not None
+        ):
+            metric_ema.update(path.learnable_metric)
         if apply_update:
-            if use_schedule_trust_region:
+            if use_path_trust_region:
                 if grad_step_skipped:
                     kl_sum_for_step = 0.0
                     kl_micro_steps = 0
@@ -384,7 +428,7 @@ def train_one_epoch(
 
         if apply_update and gumbel_schedule_active:
             step_index = min(gumbel_update_step + 1, gumbel_tau_steps)
-            new_tau = _anneal_gumbel_tau(
+            new_tau = _anneal_scalar(
                 step_index,
                 gumbel_tau_steps,
                 gumbel_tau_start,
@@ -395,6 +439,19 @@ def train_one_epoch(
             current_gumbel_tau = float(new_tau)
             gumbel_update_step += 1
 
+        if apply_update and metric_interp_active:
+            step_index_lambda = min(metric_interp_update_step + 1, metric_interp_steps)
+            new_lambda = _anneal_scalar(
+                step_index_lambda,
+                metric_interp_steps,
+                metric_interp_start,
+                metric_interp_end,
+                metric_interp_schedule,
+            )
+            path.set_metric_interpolation_lambda(float(new_lambda))
+            current_metric_interp = float(new_lambda)
+            metric_interp_update_step += 1
+
         lr = optimizer.param_groups[0]["lr"]
         if data_iter_step % PRINT_FREQUENCY == 0:
             # Console log
@@ -402,7 +459,7 @@ def train_one_epoch(
             log_msg = (
                 f"Epoch {epoch} [{data_iter_step}/{dl_len_str}]: loss = {batch_loss.compute()}, lr = {lr}"
             )
-            if use_schedule_trust_region and schedule_kl_value is not None:
+            if use_path_trust_region and schedule_kl_value is not None:
                 log_msg += (
                     f", kl = {float(schedule_kl_value.detach().cpu()):.4g},"
                     f" kl_w = {kl_controller.current_weight():.4g}"
@@ -411,6 +468,8 @@ def train_one_epoch(
                     log_msg += f", kl_avg = {float(kl_avg_for_logging):.4g}"
             if gumbel_schedule_active and current_gumbel_tau is not None:
                 log_msg += f", tau = {float(current_gumbel_tau):.4g}"
+            if metric_interp_active and current_metric_interp is not None:
+                log_msg += f", lambda = {float(current_metric_interp):.4g}"
             logger.info(log_msg)
 
             # Optional Weights & Biases step-level logging (main process only)
@@ -449,7 +508,7 @@ def train_one_epoch(
                                         else {}
                                     ),
                                 }
-                                if use_schedule_trust_region and schedule_kl_value is not None
+                                if use_path_trust_region and schedule_kl_value is not None
                                 else {}
                             ),
                             **(
@@ -457,6 +516,16 @@ def train_one_epoch(
                                     "train/gumbel_tau": float(current_gumbel_tau)
                                 }
                                 if gumbel_schedule_active and current_gumbel_tau is not None
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "train/metric_interp_lambda": float(
+                                        current_metric_interp
+                                    )
+                                }
+                                if metric_interp_active
+                                and current_metric_interp is not None
                                 else {}
                             ),
                         },
@@ -467,7 +536,7 @@ def train_one_epoch(
 
     lr_schedule.step()
     stats = {"loss": float(epoch_loss.compute().detach().cpu())}
-    if use_schedule_trust_region and kl_updates_total > 0 and kl_metric and kl_penalty_metric:
+    if use_path_trust_region and kl_updates_total > 0 and kl_metric and kl_penalty_metric:
         stats.update(
             {
                 "schedule_kl": float(kl_metric.compute().detach().cpu()),
@@ -479,4 +548,10 @@ def train_one_epoch(
             stats["schedule_kl_avg"] = float(kl_avg_for_logging)
     if gumbel_schedule_active:
         setattr(args, "_gumbel_update_step", gumbel_update_step)
+        if current_gumbel_tau is not None:
+            stats["gumbel_tau"] = float(current_gumbel_tau)
+    if metric_interp_active:
+        setattr(args, "_metric_interp_update_step", metric_interp_update_step)
+        if current_metric_interp is not None:
+            stats["metric_interp_lambda"] = float(current_metric_interp)
     return stats
