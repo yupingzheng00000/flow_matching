@@ -36,6 +36,22 @@ MASK_TOKEN = 256
 PRINT_FREQUENCY = 10
 
 
+# Compatibility autocast wrapper: prefer torch.amp.autocast('cuda', ...) if available,
+# otherwise fall back to torch.cuda.amp.autocast(...).
+def _autocast(dtype: Optional[torch.dtype] = None):  # type: ignore[name-defined]
+    amp_mod = getattr(torch, "amp", None)
+    if amp_mod is not None and hasattr(amp_mod, "autocast"):
+        if dtype is None:
+            return amp_mod.autocast("cuda")  # type: ignore[attr-defined]
+        else:
+            return amp_mod.autocast("cuda", dtype=dtype)  # type: ignore[attr-defined]
+    # Fallback for older PyTorch
+    if dtype is None:
+        return torch.cuda.amp.autocast()
+    else:
+        return torch.cuda.amp.autocast(dtype=dtype)
+
+
 def skewed_timestep_sample(num_samples: int, device: torch.device) -> torch.Tensor:
     P_mean = -1.2
     P_std = 1.2
@@ -100,6 +116,40 @@ class AdaptiveKLController(nn.Module):
             weight = max(self.min_weight, weight / self.adapt_rate)
 
         self.weight.copy_(torch.tensor(weight, device=self.weight.device))
+
+def _load_kl_window_state(
+    args: argparse.Namespace, window_size: int
+) -> Tuple[deque, float]:
+    """Restore the rolling KL window from ``args`` and respect the new size."""
+
+    stored = getattr(args, "_schedule_kl_window", None)
+    if stored is not None:
+        kl_window = deque(stored, maxlen=window_size)
+    else:
+        kl_window = deque(maxlen=window_size)
+
+    stored_sum = getattr(args, "_schedule_kl_window_sum", None)
+    if len(kl_window) == 0:
+        window_sum = 0.0
+    elif stored_sum is not None:
+        window_sum = float(stored_sum)
+        actual_sum = float(sum(kl_window))
+        if not math.isfinite(window_sum) or abs(window_sum - actual_sum) > 1e-9:
+            window_sum = actual_sum
+    else:
+        # Recompute the sum in case the max length changed between epochs.
+        window_sum = float(sum(kl_window))
+
+    return kl_window, window_sum
+
+
+def _save_kl_window_state(
+    args: argparse.Namespace, kl_window: deque, window_sum: float
+) -> None:
+    """Persist the KL window so the next epoch continues the average."""
+
+    setattr(args, "_schedule_kl_window", list(kl_window))
+    setattr(args, "_schedule_kl_window_sum", float(window_sum))
 
 
 def _anneal_scalar(
@@ -171,6 +221,34 @@ def train_one_epoch(
     )
     use_path_ema = teacher_schedule_available or teacher_metric_available
     use_path_trust_region = use_path_ema and kl_controller is not None
+    if kl_controller is not None and not use_path_ema:
+        logger.warning(
+            "KL controller was provided without an EMA teacher; disabling the controller."
+        )
+        kl_controller = None
+        use_path_trust_region = False
+
+    kl_metric = kl_penalty_metric = None
+    kl_updates_total = 0
+    kl_sum_for_step = 0.0
+    kl_micro_steps = 0
+    kl_avg_for_logging: Optional[float] = None
+    kl_avg_window = int(getattr(args, "mi_beta_kl_avg_window", 1) or 1)
+    if kl_avg_window <= 0:
+        logger.warning(
+            "mi_beta_kl_avg_window must be positive; received %s. Falling back to 1.",
+            kl_avg_window,
+        )
+        kl_avg_window = 1
+    if use_path_trust_region:
+        kl_window, kl_window_sum = _load_kl_window_state(args, kl_avg_window)
+    else:
+        kl_window = None
+        kl_window_sum = 0.0
+    if use_path_trust_region:
+        kl_metric = MeanMetric().to(device, non_blocking=True)
+        kl_penalty_metric = MeanMetric().to(device, non_blocking=True)
+
     if kl_controller is not None and not use_path_ema:
         logger.warning(
             "KL controller was provided without an EMA teacher; disabling the controller."
@@ -273,7 +351,8 @@ def train_one_epoch(
 
             # Model should output logits with last dim = 256
             if getattr(args, "bf16", False):
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                # Use compatibility autocast wrapper
+                with _autocast(dtype=torch.bfloat16):
                     logits = model(x_t_model, t=t, extra=conditioning)
             else:
                 logits = model(x_t_model, t=t, extra=conditioning)
@@ -324,7 +403,8 @@ def train_one_epoch(
 
             # discrete flow matching loss (257-way: 256 tokens + MASK)
             if getattr(args, "bf16", False):
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                # Use compatibility autocast wrapper
+                with _autocast(dtype=torch.bfloat16):
                     logits = model(path_sample.x_t, t=t, extra=conditioning)
             else:
                 logits = model(path_sample.x_t, t=t, extra=conditioning)
@@ -343,7 +423,8 @@ def train_one_epoch(
             x_t = path_sample.x_t
             u_t = path_sample.dx_t  # type: ignore[attr-defined]
 
-            with torch.cuda.amp.autocast():
+            # Use compatibility autocast wrapper (default dtype)
+            with _autocast():
                 loss = torch.pow(model(x_t, t, extra=conditioning) - u_t, 2).mean()
 
         loss_value = loss.item()
@@ -402,6 +483,9 @@ def train_one_epoch(
                     kl_sum_for_step = 0.0
                     kl_micro_steps = 0
                     kl_avg_for_logging = None
+                    if kl_window is not None:
+                        kl_window.clear()
+                    kl_window_sum = 0.0
                 else:
                     mean_kl_step = (
                         kl_sum_for_step / kl_micro_steps if kl_micro_steps > 0 else None
@@ -554,4 +638,10 @@ def train_one_epoch(
         setattr(args, "_metric_interp_update_step", metric_interp_update_step)
         if current_metric_interp is not None:
             stats["metric_interp_lambda"] = float(current_metric_interp)
+    if use_path_trust_region and kl_window is not None:
+        _save_kl_window_state(args, kl_window, kl_window_sum)
+    else:
+        for attr in ("_schedule_kl_window", "_schedule_kl_window_sum"):
+            if hasattr(args, attr):
+                delattr(args, attr)
     return stats
