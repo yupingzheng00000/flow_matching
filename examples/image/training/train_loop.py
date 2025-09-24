@@ -119,7 +119,7 @@ class AdaptiveKLController(nn.Module):
 
 def _load_kl_window_state(
     args: argparse.Namespace, window_size: int
-) -> Tuple[deque, float]:
+) -> tuple[deque, float]:
     """Restore the rolling KL window from ``args`` and respect the new size."""
 
     stored = getattr(args, "_schedule_kl_window", None)
@@ -570,7 +570,6 @@ def train_one_epoch(
                             "train/inst_loss": float(loss_value),
                             "train/lr": float(lr),
                             "epoch": int(epoch),
-                            "step": int(data_iter_step),
                             **(
                                 {
                                     "train/schedule_kl": float(

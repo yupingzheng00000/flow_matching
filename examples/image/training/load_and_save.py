@@ -74,7 +74,7 @@ def load_model(
         else:
             # Prefer safe loading when supported; fall back for older PyTorch
             try:
-                checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)  # type: ignore[call-arg]
+                checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)  # type: ignore[call-arg]
             except TypeError:
                 checkpoint = torch.load(args.resume, map_location="cpu")
         model_without_ddp.load_state_dict(checkpoint["model"])
