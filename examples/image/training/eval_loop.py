@@ -17,13 +17,14 @@ if str(_pkg_root) not in _sys.path:
 #
 # This source code is licensed under the CC-by-NC license found in the
 # LICENSE file in the root directory of this source tree.
+import csv
 import gc
 import logging
 import math
 import os
 from argparse import Namespace
 from pathlib import Path
-from typing import Iterable, Optional, cast
+from typing import Callable, Iterable, Optional, Union, cast
 
 import PIL.Image
 
@@ -158,6 +159,139 @@ def eval_model(
     # Lazily constructed KO solver and path (once K is known)
     ko_solver = None
     ko_path = metric_path
+    schedule_snapshot_logged = False
+
+    def maybe_log_schedule_snapshot(path_obj: MetricInducedGibbsProbPath) -> None:
+        nonlocal schedule_snapshot_logged
+        if schedule_snapshot_logged:
+            return
+        if not getattr(args, "mi_beta_log_schedule", False):
+            schedule_snapshot_logged = True
+            return
+        if not distributed_mode.is_main_process():
+            schedule_snapshot_logged = True
+            return
+        output_dir = getattr(args, "output_dir", None)
+        if not output_dir:
+            logger.warning("Skipping β(t) snapshot logging because --output_dir is not set.")
+            schedule_snapshot_logged = True
+            return
+        num_points = int(getattr(args, "mi_beta_log_points", 256))
+        if num_points <= 1:
+            logger.warning(
+                "Skipping β(t) snapshot logging because --mi_beta_log_points must be > 1."
+            )
+            schedule_snapshot_logged = True
+            return
+
+        schedule_dir = Path(output_dir) / "beta_schedule_logs"
+        schedule_dir.mkdir(parents=True, exist_ok=True)
+        device = path_obj.embedding.weight.device
+        dtype = path_obj.embedding.weight.dtype
+        eps = max(float(path_obj.eps_t), 1e-8)
+        t = torch.linspace(eps, 1.0 - eps, steps=num_points, device=device, dtype=torch.float32)
+        if t.dtype != dtype:
+            t = t.to(dtype=dtype)
+
+        with torch.no_grad():
+            beta_curr, dot_curr = path_obj.beta(t)
+
+        t_cpu = t.detach().cpu().double()
+        beta_curr_cpu = beta_curr.detach().cpu().double()
+        dot_curr_cpu = dot_curr.detach().cpu().double()
+
+        denom = t_cpu * (1.0 - t_cpu)
+        beta_baseline = path_obj.c * torch.pow(t_cpu / (1.0 - t_cpu), path_obj.a)
+        dot_baseline = beta_baseline * path_obj.a / denom
+
+        data = torch.stack(
+            (
+                t_cpu,
+                beta_curr_cpu,
+                beta_baseline,
+                dot_curr_cpu,
+                dot_baseline,
+            ),
+            dim=-1,
+        )
+
+        data_rows = data.tolist()
+
+        output_path = schedule_dir / f"epoch_{epoch:04d}.csv"
+        header = [
+            "t",
+            "beta_current",
+            "beta_baseline",
+            "dot_beta_current",
+            "dot_beta_baseline",
+        ]
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(data_rows)
+
+        if getattr(args, "wandb", False):
+            try:
+                try:
+                    import swanlab as wandb  # type: ignore
+                except Exception:  # pragma: no cover - swanlab not installed
+                    import wandb  # type: ignore
+
+                wandb_payload = {}
+                try:
+                    schedule_table = wandb.Table(columns=header, rows=data_rows)  # type: ignore[attr-defined]
+                    wandb_payload["eval/beta_schedule_table"] = schedule_table
+                except Exception as table_exc:  # pragma: no cover - wandb table unavailable
+                    logger.debug("Unable to build wandb table for β(t): %s", table_exc)
+
+                try:
+                    beta_plot = wandb.plot.line_series(  # type: ignore[attr-defined]
+                        xs=t_cpu.tolist(),
+                        ys=[
+                            beta_curr_cpu.tolist(),
+                            beta_baseline.tolist(),
+                        ],
+                        keys=["beta_current", "beta_baseline"],
+                        title=f"β(t) epoch {epoch}",
+                        xname="t",
+                    )
+                    wandb_payload["eval/beta_schedule"] = beta_plot
+                except Exception as plot_exc:  # pragma: no cover - wandb plot unavailable
+                    logger.debug("Unable to build wandb β(t) plot: %s", plot_exc)
+
+                try:
+                    dot_beta_plot = wandb.plot.line_series(  # type: ignore[attr-defined]
+                        xs=t_cpu.tolist(),
+                        ys=[
+                            dot_curr_cpu.tolist(),
+                            dot_baseline.tolist(),
+                        ],
+                        keys=["dot_beta_current", "dot_beta_baseline"],
+                        title=f"β̇(t) epoch {epoch}",
+                        xname="t",
+                    )
+                    wandb_payload["eval/dot_beta_schedule"] = dot_beta_plot
+                except Exception as dot_plot_exc:  # pragma: no cover - wandb plot unavailable
+                    logger.debug("Unable to build wandb β̇(t) plot: %s", dot_plot_exc)
+
+                if wandb_payload:
+                    try:
+                        wandb.log(wandb_payload, step=epoch)  # type: ignore[attr-defined]
+                    except Exception as log_exc:  # pragma: no cover - wandb logging failure
+                        logger.warning("Failed to log β(t) snapshot to wandb: %s", log_exc)
+            except Exception as wandb_exc:  # pragma: no cover - wandb import failure
+                logger.debug("wandb not available for β(t) snapshot logging: %s", wandb_exc)
+
+        schedule_snapshot_logged = True
+        logger.info(
+            "Saved β(t) snapshot for epoch %d with %d samples to %s",
+            epoch,
+            num_points,
+            output_path,
+        )
+
+    if ko_path is not None:
+        maybe_log_schedule_snapshot(ko_path)
 
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         samples = samples.to(device, non_blocking=True)
@@ -171,6 +305,14 @@ def eval_model(
             cfg_scaled_model.reset_nfe_counter()
             if args.discrete_flow_matching:
                 # Discrete sampling
+                if args.sym_func:
+                    # Ensure a pure-Python function returning float for div_free / symmetrize coefficients
+                    def sym_schedule(tau: float) -> float:
+                        return 12.0 * (tau ** 2.0) * ((1.0 - tau) ** 0.25)
+
+                    sym: Union[float, Callable[[float], float]] = sym_schedule
+                else:
+                    sym: Union[float, Callable[[float], float]] = float(args.sym)
                 if getattr(args, "metric_induced", False):
                     # Metric-induced Gibbs path using dedicated KO solver
                     # Lazily build logits-wrapper and KO solver with correct vocab size K
@@ -212,6 +354,7 @@ def eval_model(
                                 device=device,
                                 dtype=torch.float32,
                             )
+                        maybe_log_schedule_snapshot(ko_path)
                         ko_solver = KODiscreteGibbsEulerSolver(
                             model=cfg_scaled_logits_model,
                             path=ko_path,
@@ -230,18 +373,13 @@ def eval_model(
                         label=labels,
                         # IMPORTANT: disable CFG scaling when using discrete logits
                         cfg_scale=0.0,
+                        symmetrize=sym,
                     )
                 else:
                     x_0 = (
                         torch.zeros(samples.shape, dtype=torch.long, device=device)
                         + MASK_TOKEN
                     )
-                    if args.sym_func:
-                        # Ensure a pure-Python function returning float for div_free
-                        def sym(tau: float) -> float:
-                            return 12.0 * (tau ** 2.0) * ((1.0 - tau) ** 0.25)
-                    else:
-                        sym = args.sym
                     dtype = torch.float32 if args.sampling_dtype == "float32" else torch.float64
 
                     # Guard against missing solver (should never be None in this branch)

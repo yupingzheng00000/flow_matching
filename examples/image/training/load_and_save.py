@@ -72,7 +72,11 @@ def load_model(
                 args.resume, map_location="cpu", check_hash=True
             )
         else:
-            checkpoint = torch.load(args.resume, map_location="cpu")
+            # Prefer safe loading when supported; fall back for older PyTorch
+            try:
+                checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)  # type: ignore[call-arg]
+            except TypeError:
+                checkpoint = torch.load(args.resume, map_location="cpu")
         model_without_ddp.load_state_dict(checkpoint["model"])
         print("Resume checkpoint %s" % args.resume)
         if extra_modules and "extra_modules" in checkpoint:
@@ -80,6 +84,16 @@ def load_model(
                 state_dict = checkpoint["extra_modules"].get(name)
                 if state_dict is not None:
                     module.load_state_dict(state_dict)
+        checkpoint_args = checkpoint.get("args")
+        if checkpoint_args is not None:
+            for attr in (
+                "_gumbel_update_step",
+                "_metric_interp_update_step",
+                "_schedule_kl_window",
+                "_schedule_kl_window_sum",
+            ):
+                if hasattr(checkpoint_args, attr):
+                    setattr(args, attr, getattr(checkpoint_args, attr))
         if (
             "optimizer" in checkpoint
             and "epoch" in checkpoint
