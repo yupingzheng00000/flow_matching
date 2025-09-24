@@ -425,6 +425,7 @@ def main(args):
                 fid_samples=fid_samples,
                 args=args,
                 metric_path=metric_path,
+                metric_ema=metric_ema,
             )
             log_stats.update({f"eval_{k}": v for k, v in eval_stats.items()})
 

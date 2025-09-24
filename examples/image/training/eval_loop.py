@@ -24,7 +24,7 @@ import math
 import os
 from argparse import Namespace
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Union, cast
+from typing import Callable, Dict, Iterable, Optional, Union, cast
 
 import PIL.Image
 
@@ -38,6 +38,7 @@ def _autocast_cuda():
     except Exception:  # pragma: no cover
         return torch.cuda.amp.autocast()
 from flow_matching.path import MixtureDiscreteProbPath, MetricInducedGibbsProbPath
+from flow_matching.path.metric_ema import LearnableMetricEMA
 from flow_matching.path.scheduler import PolynomialConvexScheduler
 from flow_matching.solver import MixtureDiscreteEulerSolver, KODiscreteGibbsEulerSolver
 from flow_matching.solver.ode_solver import ODESolver
@@ -47,7 +48,7 @@ from models.ema import EMA
 from torch.nn.modules import Module
 from torch.nn.parallel import DistributedDataParallel
 from torchmetrics.image.fid import FrechetInceptionDistance
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 from training import distributed_mode
 from training.edm_time_discretization import get_time_discretization
 from training.train_loop import MASK_TOKEN
@@ -56,6 +57,430 @@ logger = logging.getLogger(__name__)
 
 PRINT_FREQUENCY = 50
 
+
+def _save_sampling_gif(
+    trajectories: torch.Tensor,
+    output_root: Path,
+    epoch: int,
+    step: int,
+    *,
+    is_discrete: bool,
+    max_batch: int,
+    stride: int,
+    fps: int,
+    log_to_wandb: bool,
+    wandb_step: int,
+) -> Optional[Path]:
+    """Persist a GIF visualizing sampling trajectories as a tiled grid."""
+
+    if trajectories.ndim < 4:
+        logger.debug(
+            "Skipping GIF export because trajectory tensor has unexpected rank %d",
+            trajectories.ndim,
+        )
+        return None
+
+    max_batch = max(1, int(max_batch))
+    stride = max(1, int(stride))
+    fps = max(1, int(fps))
+
+    frames = trajectories.detach().to(device="cpu", dtype=torch.float32)[::stride]
+    if frames.shape[0] == 0:
+        logger.debug("Skipping GIF export because no frames remain after striding")
+        return None
+
+    frames = frames[:, :max_batch]
+    if frames.shape[1] == 0:
+        logger.debug(
+            "Skipping GIF export because max_batch=%d removed all samples", max_batch
+        )
+        return None
+
+    if frames.ndim == 4:
+        frames = frames.unsqueeze(2)
+
+    if is_discrete:
+        frames = frames / 255.0
+    else:
+        frames = torch.clamp(frames, -1.0, 1.0) * 0.5 + 0.5
+    frames = torch.clamp(frames, 0.0, 1.0)
+
+    num_samples = frames.shape[1]
+    nrow = int(math.sqrt(num_samples))
+    if nrow * nrow < num_samples:
+        nrow += 1
+    nrow = max(1, nrow)
+
+    frame_images = []
+    for frame in frames:
+        grid = make_grid(frame, nrow=nrow, padding=2)
+        if grid.shape[0] == 1:
+            grid = grid.repeat(3, 1, 1)
+        elif grid.shape[0] == 2:
+            grid = torch.cat((grid, grid[:1]), dim=0)
+        elif grid.shape[0] > 3:
+            grid = grid[:3]
+        grid = torch.clamp(grid, 0.0, 1.0)
+        grid_np = (
+            (grid * 255.0)
+            .round()
+            .to(torch.uint8)
+            .permute(1, 2, 0)
+            .cpu()
+            .numpy()
+        )
+        frame_images.append(PIL.Image.fromarray(grid_np))
+
+    if not frame_images:
+        logger.debug("Skipping GIF export because no frame images were generated")
+        return None
+
+    gif_dir = output_root / "gifs"
+    gif_dir.mkdir(parents=True, exist_ok=True)
+    gif_path = gif_dir / f"epoch_{epoch:04d}_step_{step:04d}.gif"
+    duration_ms = max(1, int(1000 / fps))
+    frame_images[0].save(
+        gif_path,
+        save_all=True,
+        append_images=frame_images[1:],
+        duration=duration_ms,
+        loop=0,
+    )
+
+    if log_to_wandb:
+        try:
+            try:
+                import swanlab as wandb  # type: ignore
+            except Exception:  # pragma: no cover - swanlab not installed
+                import wandb  # type: ignore
+
+            if hasattr(wandb, "Video"):
+                wandb.log(  # type: ignore[attr-defined]
+                    {
+                        "eval/sample_gif": wandb.Video(  # type: ignore[attr-defined]
+                            str(gif_path), fps=fps, format="gif"
+                        )
+                    },
+                    step=wandb_step,
+                )
+        except Exception as wandb_exc:  # pragma: no cover - wandb unavailable
+            logger.debug("Unable to log evaluation GIF to wandb: %s", wandb_exc)
+
+    logger.info("Saved evaluation GIF to %s", gif_path)
+    return gif_path
+
+
+def _select_metric_eval_indices(vocab_size: int, subset: int) -> torch.Tensor:
+    subset = int(subset)
+    if subset <= 0 or subset >= vocab_size:
+        return torch.arange(vocab_size, dtype=torch.long)
+    return torch.arange(subset, dtype=torch.long)
+
+
+def _upper_triangle_values(matrix: torch.Tensor) -> torch.Tensor:
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("matrix must be square")
+    n = matrix.shape[0]
+    if n <= 1:
+        return matrix.new_empty(0)
+    idx = torch.triu_indices(n, n, offset=1, device=matrix.device)
+    return matrix[idx[0], idx[1]]
+
+
+def _rankdata(values: torch.Tensor) -> torch.Tensor:
+    order = torch.argsort(values, stable=True)
+    ranks = torch.empty_like(values, dtype=torch.float64)
+    ranks[order] = torch.arange(values.numel(), dtype=torch.float64, device=values.device)
+    unique_vals, inverse, counts = torch.unique(
+        values, sorted=True, return_inverse=True, return_counts=True
+    )
+    if torch.any(counts > 1):
+        cumsum = torch.cumsum(counts, dim=0)
+        start = torch.cat((counts.new_zeros(1), cumsum[:-1]), dim=0)
+        avg = (start + cumsum - 1).to(torch.float64) / 2.0
+        ranks += avg[inverse] - ranks
+    return ranks
+
+
+def _spearman_corrcoef(x: torch.Tensor, y: torch.Tensor) -> Optional[float]:
+    if x.numel() != y.numel() or x.numel() < 2:
+        return None
+    x_rank = _rankdata(x)
+    y_rank = _rankdata(y)
+    x_rank = x_rank - x_rank.mean()
+    y_rank = y_rank - y_rank.mean()
+    x_std = x_rank.std(unbiased=False)
+    y_std = y_rank.std(unbiased=False)
+    denom = x_std * y_std
+    denom_val = float(denom.item()) if denom.numel() == 1 else float(denom)
+    if denom_val <= 0.0 or not math.isfinite(denom_val):
+        return None
+    cov = torch.mean(x_rank * y_rank)
+    cov_val = float(cov.item()) if cov.numel() == 1 else float(cov)
+    if not math.isfinite(cov_val):
+        return None
+    return cov_val / denom_val
+
+
+def _knn_indices(dist: torch.Tensor, k: int) -> Optional[torch.Tensor]:
+    if dist.ndim != 2 or dist.shape[0] != dist.shape[1]:
+        raise ValueError("dist must be square")
+    n = dist.shape[0]
+    if n <= 1 or k <= 0:
+        return None
+    k = min(k, n - 1)
+    dist_clone = dist.clone()
+    eye = torch.eye(n, dtype=torch.bool, device=dist_clone.device)
+    dist_clone[eye] = float("inf")
+    _, indices = torch.topk(dist_clone, k=k, dim=1, largest=False)
+    return indices
+
+
+def _knn_overlap(base: torch.Tensor, other: torch.Tensor, k: int) -> Optional[float]:
+    base_idx = _knn_indices(base, k)
+    other_idx = _knn_indices(other, k)
+    if base_idx is None or other_idx is None:
+        return None
+    n = base_idx.shape[0]
+    device = base_idx.device
+    mask_base = torch.zeros(n, base.shape[0], dtype=torch.bool, device=device)
+    rows = torch.arange(n, device=device).unsqueeze(1).expand_as(base_idx)
+    mask_base[rows, base_idx] = True
+    mask_other = torch.zeros_like(mask_base)
+    mask_other[rows, other_idx] = True
+    intersection = torch.logical_and(mask_base, mask_other).sum(dim=1)
+    union = torch.logical_or(mask_base, mask_other).sum(dim=1).clamp_min(1)
+    overlap = (intersection.to(torch.float64) / union.to(torch.float64)).mean()
+    return float(overlap.item())
+
+
+def _export_metric_heatmap(
+    base: torch.Tensor,
+    other: torch.Tensor,
+    *,
+    output_dir: Path,
+    epoch: int,
+    label: str,
+    log_to_wandb: bool,
+    wandb_step: int,
+) -> Optional[Path]:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - matplotlib optional
+        logger.warning(
+            "Skipping metric heatmap for %s because matplotlib is unavailable: %s",
+            label,
+            exc,
+        )
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    base_np = base.detach().cpu().numpy()
+    other_np = other.detach().cpu().numpy()
+    delta_np = other_np - base_np
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    for ax, data, title in zip(
+        axes,
+        (base_np, other_np, delta_np),
+        ("baseline", label, f"{label} - baseline"),
+    ):
+        im = ax.imshow(data, cmap="magma")
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle(f"Metric geometry ({label}) epoch {epoch}")
+    fig.tight_layout()
+
+    file_path = output_dir / f"epoch_{epoch:04d}_{label}.png"
+    fig.savefig(file_path, bbox_inches="tight")
+    plt.close(fig)
+
+    if log_to_wandb:
+        try:
+            try:
+                import swanlab as wandb  # type: ignore
+            except Exception:  # pragma: no cover - swanlab not installed
+                import wandb  # type: ignore
+
+            if hasattr(wandb, "Image"):
+                wandb.log(  # type: ignore[attr-defined]
+                    {f"eval/metric_heatmap_{label}": wandb.Image(str(file_path))},  # type: ignore[attr-defined]
+                    step=wandb_step,
+                )
+        except Exception as wandb_exc:  # pragma: no cover - wandb unavailable
+            logger.debug(
+                "Unable to log metric heatmap %s to wandb: %s", label, wandb_exc
+            )
+
+    logger.info("Saved metric heatmap (%s) to %s", label, file_path)
+    return file_path
+
+
+def _evaluate_metric_geometry(
+    path: MetricInducedGibbsProbPath,
+    *,
+    args: Namespace,
+    epoch: int,
+    metric_ema: Optional[LearnableMetricEMA],
+    output_root: Optional[Path],
+) -> Dict[str, float]:
+    stats: Dict[str, float] = {}
+    vocab_size = int(path.vocab_size)
+    subset_cfg = int(getattr(args, "mi_metric_eval_subset", 0))
+    subset_idx = _select_metric_eval_indices(vocab_size, subset_cfg)
+    subset_count = int(subset_idx.numel())
+
+    stats["metric_geom_vocab"] = float(vocab_size)
+    stats["metric_geom_tokens"] = float(subset_count)
+    lam = float(path.get_metric_interpolation_lambda())
+    stats["metric_geom_lambda"] = lam
+
+    eval_device = torch.device("cpu")
+    eval_dtype = torch.float32
+
+    base_full = path._get_base_distance_table(device=eval_device, dtype=eval_dtype)
+    base_subset = (
+        base_full.index_select(0, subset_idx)
+        .index_select(1, subset_idx)
+        .to(dtype=torch.float64)
+    )
+
+    tables: Dict[str, torch.Tensor] = {}
+    student_full = path._scaled_learned_distance_table(
+        device=eval_device, dtype=eval_dtype
+    )
+    if student_full is not None:
+        tables["student"] = (
+            student_full.index_select(0, subset_idx)
+            .index_select(1, subset_idx)
+            .to(dtype=torch.float64)
+        )
+
+    teacher_module = getattr(metric_ema, "teacher", None) if metric_ema else None
+    if isinstance(teacher_module, torch.nn.Module):
+        teacher_full = path._scaled_learned_distance_table(
+            device=eval_device,
+            dtype=eval_dtype,
+            metric_module=teacher_module,
+        )
+        if teacher_full is not None:
+            tables["teacher"] = (
+                teacher_full.index_select(0, subset_idx)
+                .index_select(1, subset_idx)
+                .to(dtype=torch.float64)
+            )
+
+    if lam > 0.0:
+        if "student" in tables:
+            if lam >= 1.0:
+                tables["blended"] = tables["student"]
+            else:
+                tables["blended"] = (
+                    (1.0 - lam) * base_subset + lam * tables["student"]
+                )
+        else:
+            tables["blended"] = base_subset
+
+    base_pairs_all = _upper_triangle_values(base_subset)
+    pair_total = int(base_pairs_all.numel())
+    stats["metric_geom_pairs_total"] = float(pair_total)
+
+    pair_sample_cfg = max(0, int(getattr(args, "mi_metric_eval_pair_samples", 0)))
+    sample_indices = None
+    if pair_total >= 2 and 0 < pair_sample_cfg < pair_total:
+        generator = torch.Generator(device=base_pairs_all.device)
+        generator.manual_seed(int(getattr(args, "mi_metric_eval_seed", 0)))
+        perm = torch.randperm(pair_total, generator=generator)
+        sample_indices = perm[:pair_sample_cfg]
+        stats["metric_geom_pairs_used"] = float(sample_indices.numel())
+    else:
+        stats["metric_geom_pairs_used"] = float(pair_total)
+
+    if pair_total < 2:
+        logger.warning(
+            "Not enough off-diagonal pairs (%d) to compute Spearman correlation.",
+            pair_total,
+        )
+    else:
+        base_pairs = (
+            base_pairs_all
+            if sample_indices is None
+            else base_pairs_all.index_select(0, sample_indices)
+        )
+        for name, table in tables.items():
+            other_pairs = _upper_triangle_values(table)
+            if sample_indices is not None:
+                other_pairs = other_pairs.index_select(0, sample_indices)
+            rho = _spearman_corrcoef(base_pairs, other_pairs)
+            if rho is not None:
+                stats[f"metric_geom_spearman_{name}"] = rho
+
+    k_cfg = max(0, int(getattr(args, "mi_metric_eval_knn_k", 5)))
+    if subset_count > 1 and k_cfg > 0:
+        k_eff = min(k_cfg, subset_count - 1)
+        stats["metric_geom_knn_k"] = float(k_eff)
+        for key in ("student", "teacher", "blended"):
+            table = tables.get(key)
+            if table is None:
+                continue
+            overlap = _knn_overlap(base_subset, table, k_eff)
+            if overlap is not None:
+                stats[f"metric_geom_knn_overlap_{key}@{k_eff}"] = overlap
+    else:
+        stats["metric_geom_knn_k"] = 0.0
+
+    if getattr(args, "mi_metric_eval_heatmap", False):
+        if output_root is None:
+            logger.warning(
+                "Skipping metric geometry heatmaps because --output_dir is not set."
+            )
+        elif subset_count < 2:
+            logger.warning(
+                "Skipping metric geometry heatmaps because the evaluated subset has < 2 tokens."
+            )
+        else:
+            heatmap_limit = int(getattr(args, "mi_metric_eval_heatmap_subset", 0))
+            heatmap_count = (
+                subset_count if heatmap_limit <= 0 else min(heatmap_limit, subset_count)
+            )
+            heatmap_dir = output_root / "metric_geometry"
+            base_heatmap = base_subset[:heatmap_count, :heatmap_count].to(torch.float32)
+            for key in ("student", "teacher"):
+                table = tables.get(key)
+                if table is None:
+                    continue
+                _export_metric_heatmap(
+                    base_heatmap,
+                    table[:heatmap_count, :heatmap_count].to(torch.float32),
+                    output_dir=heatmap_dir,
+                    epoch=epoch,
+                    label=key,
+                    log_to_wandb=bool(getattr(args, "wandb", False)),
+                    wandb_step=epoch,
+                )
+
+    metric_keys = [
+        key
+        for key in stats.keys()
+        if key.startswith("metric_geom_spearman")
+        or key.startswith("metric_geom_knn_overlap")
+    ]
+    if metric_keys:
+        summary = ", ".join(
+            f"{key}={stats[key]:.4f}" for key in sorted(metric_keys)
+        )
+        logger.info(
+            "Metric geometry diagnostics (tokens=%d, λ=%.4f): %s",
+            subset_count,
+            lam,
+            summary,
+        )
+
+    return stats
 
 class CFGScaledModel(ModelWrapper):
     def __init__(self, model: Module, return_logits: bool = False):
@@ -112,6 +537,7 @@ def eval_model(
     fid_samples: int,
     args: Namespace,
     metric_path: Optional[MetricInducedGibbsProbPath] = None,
+    metric_ema: Optional[LearnableMetricEMA] = None,
 ):
     gc.collect()
     cfg_scaled_model = CFGScaledModel(model=model)
@@ -146,7 +572,9 @@ def eval_model(
     )
 
     num_synthetic = 0
+    num_real = 0
     snapshots_saved = False
+    gif_logged = False
     if args.output_dir:
         (Path(args.output_dir) / "snapshots").mkdir(parents=True, exist_ok=True)
 
@@ -160,6 +588,38 @@ def eval_model(
     ko_solver = None
     ko_path = metric_path
     schedule_snapshot_logged = False
+    geometry_stats: Dict[str, float] = {}
+    geometry_logged = False
+
+    def maybe_run_metric_geometry(path_obj: Optional[MetricInducedGibbsProbPath]) -> None:
+        nonlocal geometry_logged, geometry_stats
+        if geometry_logged:
+            return
+        if not getattr(args, "mi_metric_eval_geometry", False):
+            geometry_logged = True
+            return
+        if path_obj is None:
+            return
+        if not distributed_mode.is_main_process():
+            geometry_logged = True
+            return
+
+        output_root = (
+            Path(getattr(args, "output_dir"))
+            if getattr(args, "output_dir", None)
+            else None
+        )
+        try:
+            geometry_stats = _evaluate_metric_geometry(
+                path_obj,
+                args=args,
+                epoch=epoch,
+                metric_ema=metric_ema,
+                output_root=output_root,
+            )
+        except Exception as geom_exc:  # pragma: no cover - diagnostic failures
+            logger.warning("Metric geometry evaluation failed: %s", geom_exc)
+        geometry_logged = True
 
     def maybe_log_schedule_snapshot(path_obj: MetricInducedGibbsProbPath) -> None:
         nonlocal schedule_snapshot_logged
@@ -292,17 +752,50 @@ def eval_model(
 
     if ko_path is not None:
         maybe_log_schedule_snapshot(ko_path)
+        maybe_run_metric_geometry(ko_path)
 
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        fid_metric.update(samples, real=True)
 
-        if num_synthetic < fid_samples:
+        # Limit the contribution of real samples so we do not process more than fid_samples
+        remaining_real = max(fid_samples - num_real, 0)
+        real_batch = samples
+        real_labels = labels
+        if remaining_real <= 0:
+            real_batch = samples[:0]
+            real_labels = labels[:0]
+        elif real_batch.shape[0] > remaining_real:
+            real_batch = real_batch[:remaining_real]
+            real_labels = real_labels[:remaining_real]
+
+        if real_batch.shape[0] > 0:
+            fid_metric.update(real_batch, real=True)
+            num_real += real_batch.shape[0]
+
+        remaining_fake = max(fid_samples - num_synthetic, 0)
+        conditioning_samples = real_batch if real_batch.shape[0] > 0 else samples
+        conditioning_labels = real_labels if real_labels.shape[0] > 0 else labels
+        if remaining_fake <= 0:
+            conditioning_samples = conditioning_samples[:0]
+            conditioning_labels = conditioning_labels[:0]
+        elif conditioning_samples.shape[0] > remaining_fake:
+            conditioning_samples = conditioning_samples[:remaining_fake]
+            conditioning_labels = conditioning_labels[:remaining_fake]
+
+        if conditioning_samples.shape[0] > 0 and num_synthetic < fid_samples:
             # Reset NFE counter on the wrapper that will actually be used
             # For mixture/continuous branches we use cfg_scaled_model; for metric-induced we use cfg_scaled_logits_model
             # Note: metric-induced branch performs a dummy forward to infer K; we reset AFTER that to avoid +1 in the count
             cfg_scaled_model.reset_nfe_counter()
+            record_gif = (
+                bool(getattr(args, "save_eval_gif", False))
+                and bool(getattr(args, "output_dir", None))
+                and not gif_logged
+                and distributed_mode.is_main_process()
+            )
+            gif_trajectories: Optional[torch.Tensor] = None
+
             if args.discrete_flow_matching:
                 # Discrete sampling
                 if args.sym_func:
@@ -313,6 +806,7 @@ def eval_model(
                     sym: Union[float, Callable[[float], float]] = sym_schedule
                 else:
                     sym: Union[float, Callable[[float], float]] = float(args.sym)
+
                 if getattr(args, "metric_induced", False):
                     # Metric-induced Gibbs path using dedicated KO solver
                     # Lazily build logits-wrapper and KO solver with correct vocab size K
@@ -320,13 +814,15 @@ def eval_model(
                         cfg_scaled_logits_model = CFGScaledModel(model=model, return_logits=True)
                     if ko_solver is None or ko_path is None:
                         # infer K by one forward pass at t=0
-                        x_dummy = torch.zeros(samples.shape, dtype=torch.long, device=device)
+                        x_dummy = torch.zeros(
+                            conditioning_samples.shape, dtype=torch.long, device=device
+                        )
                         # IMPORTANT: do not apply CFG scaling with discrete logits
                         logits_dummy = cfg_scaled_logits_model(
                             x=x_dummy,
                             t=torch.tensor(0.0, device=device),
                             cfg_scale=0.0,
-                            label=labels,
+                            label=conditioning_labels,
                         )
                         K = int(logits_dummy.shape[-1])
                         # Build path
@@ -355,48 +851,72 @@ def eval_model(
                                 dtype=torch.float32,
                             )
                         maybe_log_schedule_snapshot(ko_path)
+                        maybe_run_metric_geometry(ko_path)
                         ko_solver = KODiscreteGibbsEulerSolver(
                             model=cfg_scaled_logits_model,
                             path=ko_path,
                             vocabulary_size=K,
                         )
                     # Reset NFE counter on the logits wrapper before stepping to avoid counting the dummy forward
-                    cfg_scaled_logits_model.reset_nfe_counter()
+                    if cfg_scaled_logits_model is not None:
+                        cfg_scaled_logits_model.reset_nfe_counter()
                     # Start tokens: uniform over [0, K) since β(0)=0 ⇒ p0 is uniform
                     K_init = ko_solver.vocabulary_size
-                    x_0 = torch.randint(0, K_init, samples.shape, device=device, dtype=torch.long)
+                    x_0 = torch.randint(
+                        0,
+                        K_init,
+                        conditioning_samples.shape,
+                        device=device,
+                        dtype=torch.long,
+                    )
                     dtype_cat = torch.float32 if args.sampling_dtype == "float32" else torch.float64
-                    synthetic_samples = ko_solver.sample(
+                    sample_result = ko_solver.sample(
                         x_init=x_0,
                         step_size=1.0 / args.discrete_fm_steps,
                         dtype_categorical=dtype_cat,
-                        label=labels,
+                        label=conditioning_labels,
                         # IMPORTANT: disable CFG scaling when using discrete logits
                         cfg_scale=0.0,
                         symmetrize=sym,
+                        return_intermediates=record_gif,
                     )
+                    if record_gif:
+                        gif_trajectories = sample_result
+                        synthetic_samples = sample_result[-1]
+                    else:
+                        synthetic_samples = sample_result
                 else:
                     x_0 = (
-                        torch.zeros(samples.shape, dtype=torch.long, device=device)
+                        torch.zeros(
+                            conditioning_samples.shape, dtype=torch.long, device=device
+                        )
                         + MASK_TOKEN
                     )
                     dtype = torch.float32 if args.sampling_dtype == "float32" else torch.float64
 
                     # Guard against missing solver (should never be None in this branch)
                     assert disc_solver is not None, "Discrete solver not initialized"
-                    synthetic_samples = disc_solver.sample(
+                    sample_result = disc_solver.sample(
                         x_init=x_0,
                         step_size=1.0 / args.discrete_fm_steps,
                         verbose=False,
                         div_free=sym,
                         dtype_categorical=dtype,
-                        label=labels,
+                        label=conditioning_labels,
                         # Disable CFG scaling for discrete models (logits)
                         cfg_scale=0.0,
+                        return_intermediates=record_gif,
                     )
+                    if record_gif:
+                        gif_trajectories = sample_result
+                        synthetic_samples = sample_result[-1]
+                    else:
+                        synthetic_samples = sample_result
             else:
                 # Continuous sampling
-                x_0 = torch.randn(samples.shape, dtype=torch.float32, device=device)
+                x_0 = torch.randn(
+                    conditioning_samples.shape, dtype=torch.float32, device=device
+                )
 
                 # Safe defaults for ODE options
                 nfe_default = 50
@@ -421,22 +941,26 @@ def eval_model(
 
                 # Guard against missing solver
                 assert cont_solver is not None, "Continuous solver not initialized"
-                synthetic_samples = cont_solver.sample(
+                sample_result = cont_solver.sample(
                     time_grid=time_grid,
                     x_init=x_0,
                     method=args.ode_method,
-                    return_intermediates=False,
+                    return_intermediates=record_gif,
                     atol=ode_atol,
                     rtol=ode_rtol,
                     step_size=ode_step,
-                    label=labels,
+                    label=conditioning_labels,
                     cfg_scale=args.cfg_scale,
                 )
 
                 # Scaling to [0, 1] from [-1, 1]
-                if isinstance(synthetic_samples, (list, tuple)):
-                    synthetic_samples = synthetic_samples[-1]
+                if isinstance(sample_result, (list, tuple)):
+                    synthetic_samples = sample_result[-1]
+                else:
+                    synthetic_samples = sample_result
                 synthetic_samples = cast(torch.Tensor, synthetic_samples)
+                if record_gif and isinstance(sample_result, torch.Tensor):
+                    gif_trajectories = sample_result
                 synthetic_samples = torch.clamp(
                     synthetic_samples * 0.5 + 0.5, min=0.0, max=1.0
                 )
@@ -446,8 +970,9 @@ def eval_model(
             _nfe_model = (
                 cfg_scaled_logits_model if getattr(args, "metric_induced", False) and 'cfg_scaled_logits_model' in locals() and cfg_scaled_logits_model is not None else cfg_scaled_model
             )
+            batch_generated = synthetic_samples.shape[0]
             logger.info(
-                f"{samples.shape[0]} samples generated in {_nfe_model.get_nfe()} evaluations."
+                f"{batch_generated} samples generated in {_nfe_model.get_nfe()} evaluations."
             )
             if num_synthetic + synthetic_samples.shape[0] > fid_samples:
                 synthetic_samples = synthetic_samples[: fid_samples - num_synthetic]
@@ -480,6 +1005,30 @@ def eval_model(
                     )
                     PIL.Image.fromarray(image_np, "RGB").save(image_path)
 
+            if (
+                gif_trajectories is not None
+                and getattr(args, "output_dir", None)
+                and not gif_logged
+                and distributed_mode.is_main_process()
+            ):
+                try:
+                    _save_sampling_gif(
+                        gif_trajectories,
+                        Path(args.output_dir),
+                        epoch,
+                        data_iter_step,
+                        is_discrete=args.discrete_flow_matching,
+                        max_batch=getattr(args, "eval_gif_max_batch", 8),
+                        stride=getattr(args, "eval_gif_stride", 16),
+                        fps=getattr(args, "eval_gif_fps", 8),
+                        log_to_wandb=getattr(args, "wandb", False),
+                        wandb_step=epoch,
+                    )
+                except Exception as gif_exc:  # pragma: no cover - PIL/image errors
+                    logger.warning("Failed to save evaluation GIF: %s", gif_exc)
+                finally:
+                    gif_logged = True
+
         if not args.compute_fid:
             return {}
 
@@ -492,10 +1041,18 @@ def eval_model(
             else:
                 _len_str = "?"
             logger.info(
-                f"Evaluating [{data_iter_step}/{_len_str}] samples generated [{num_synthetic}/{fid_samples}] running fid {running_fid}"
+                "Evaluating ["
+                f"{data_iter_step}/{_len_str}] samples generated [{num_synthetic}/{fid_samples}] "
+                f"reals [{num_real}/{fid_samples}] running fid {running_fid}"
             )
 
         if args.test_run:
             break
 
-    return {"fid": float(fid_metric.compute().detach().cpu())}
+        if num_real >= fid_samples and num_synthetic >= fid_samples:
+            break
+
+    fid_value = float(fid_metric.compute().detach().cpu())
+    stats = {"fid": fid_value}
+    stats.update(geometry_stats)
+    return stats

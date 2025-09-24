@@ -109,12 +109,6 @@ def get_args_parser():
         help="Symmetric term coefficient for discrete sampling (mixture or metric-induced).",
     )
     parser.add_argument(
-        "--temp",
-        default=1.0,
-        type=float,
-        help="Temperature for sampling the discrete flow.",
-    )
-    parser.add_argument(
         "--sym_func",
         action="store_true",
         help="Use a fixed function for the symmetric term in the discrete sampler.",
@@ -173,6 +167,29 @@ def get_args_parser():
         "--save_fid_samples",
         action="store_true",
         help="Save all samples generated for FID computation.",
+    )
+    parser.add_argument(
+        "--save_eval_gif",
+        action="store_true",
+        help="Save GIF animations of sampling trajectories during evaluation.",
+    )
+    parser.add_argument(
+        "--eval_gif_max_batch",
+        default=8,
+        type=int,
+        help="Maximum number of samples to tile in an evaluation GIF.",
+    )
+    parser.add_argument(
+        "--eval_gif_stride",
+        default=16,
+        type=int,
+        help="Stride applied when subsampling trajectory frames for GIF logging.",
+    )
+    parser.add_argument(
+        "--eval_gif_fps",
+        default=8,
+        type=int,
+        help="Playback speed (frames per second) for saved evaluation GIFs.",
     )
     parser.add_argument("--num_workers", default=10, type=int)
     parser.add_argument(
@@ -409,6 +426,61 @@ def get_args_parser():
         default=0.999,
         type=float,
         help="Decay applied to the learnable metric EMA updates.",
+    )
+    parser.add_argument(
+        "--mi_metric_eval_geometry",
+        action="store_true",
+        help=(
+            "When using a metric-induced path, compute geometry agreement diagnostics "
+            "(Spearman correlation, k-NN overlap, optional heatmaps) during evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--mi_metric_eval_subset",
+        default=0,
+        type=int,
+        help=(
+            "Optional number of tokens to include when probing metric geometry. "
+            "Set to 0 to evaluate the full vocabulary."
+        ),
+    )
+    parser.add_argument(
+        "--mi_metric_eval_pair_samples",
+        default=0,
+        type=int,
+        help=(
+            "Optional number of off-diagonal pairs sampled when computing Spearman "
+            "correlation. Set to 0 to use all pairs."
+        ),
+    )
+    parser.add_argument(
+        "--mi_metric_eval_knn_k",
+        default=5,
+        type=int,
+        help="Neighborhood size k used for the k-NN overlap diagnostic.",
+    )
+    parser.add_argument(
+        "--mi_metric_eval_seed",
+        default=0,
+        type=int,
+        help="Seed for any random subsampling performed by the metric geometry probes.",
+    )
+    parser.add_argument(
+        "--mi_metric_eval_heatmap",
+        action="store_true",
+        help=(
+            "Export baseline/learned/difference heatmaps for the probed token subset "
+            "during metric geometry evaluation (requires matplotlib)."
+        ),
+    )
+    parser.add_argument(
+        "--mi_metric_eval_heatmap_subset",
+        default=64,
+        type=int,
+        help=(
+            "Maximum number of tokens visualized in metric heatmaps. "
+            "Set to 0 to reuse the evaluation subset size."
+        ),
     )
     parser.add_argument(
         "--mi_metric_interp_start",

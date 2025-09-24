@@ -253,7 +253,8 @@ class TestMetricInducedProbPath(unittest.TestCase):
             assert path.learnable_metric is not None
             path.learnable_metric.codes.mul_(1.1)
         dist_after = path.distances_from_tokens(tokens).detach()
-        self.assertFalse(torch.allclose(dist_before, dist_after))
+        diff = (dist_after - dist_before).abs().sum()
+        self.assertGreater(diff.item(), 0.0)
 
 
 class TestScheduleUtilities(unittest.TestCase):

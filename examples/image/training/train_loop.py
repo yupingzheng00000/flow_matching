@@ -249,31 +249,6 @@ def train_one_epoch(
         kl_metric = MeanMetric().to(device, non_blocking=True)
         kl_penalty_metric = MeanMetric().to(device, non_blocking=True)
 
-    if kl_controller is not None and not use_path_ema:
-        logger.warning(
-            "KL controller was provided without an EMA teacher; disabling the controller."
-        )
-        kl_controller = None
-        use_path_trust_region = False
-
-    kl_metric = kl_penalty_metric = None
-    kl_updates_total = 0
-    kl_sum_for_step = 0.0
-    kl_micro_steps = 0
-    kl_avg_for_logging: Optional[float] = None
-    kl_avg_window = int(getattr(args, "mi_beta_kl_avg_window", 1) or 1)
-    if kl_avg_window <= 0:
-        logger.warning(
-            "mi_beta_kl_avg_window must be positive; received %s. Falling back to 1.",
-            kl_avg_window,
-        )
-        kl_avg_window = 1
-    kl_window = deque(maxlen=kl_avg_window) if use_path_trust_region else None
-    kl_window_sum = 0.0
-    if use_path_trust_region:
-        kl_metric = MeanMetric().to(device, non_blocking=True)
-        kl_penalty_metric = MeanMetric().to(device, non_blocking=True)
-
     # Try to get dataloader length for global step computation
     try:
         _dl_len = len(data_loader)  # type: ignore[arg-type]

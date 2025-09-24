@@ -403,14 +403,6 @@ class MetricInducedGibbsProbPath(ProbPath):
         d_beta_t = self.c * self.a * (y ** (self.a - 1.0)) * dy_dt
         return beta_t, d_beta_t
 
-    def learnable_parameters(self) -> Iterable[nn.Parameter]:
-        params: list[nn.Parameter] = []
-        if isinstance(self.beta_schedule, nn.Module):
-            params.extend(self.beta_schedule.parameters())
-        if self.learnable_metric is not None:
-            params.extend(self.learnable_metric.parameters())
-        return params
-
     def schedule_parameters(self) -> Iterable[nn.Parameter]:
         if isinstance(self.beta_schedule, nn.Module):
             yield from self.beta_schedule.parameters()
@@ -482,6 +474,35 @@ class MetricInducedGibbsProbPath(ProbPath):
             base = base.to(device=device, dtype=dtype)
         return base
 
+    def _scaled_learned_distance_table(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        metric_module: Optional[MahalanobisTokenMetric] = None,
+    ) -> Optional[Tensor]:
+        module = metric_module if metric_module is not None else self.learnable_metric
+        if module is None:
+            return None
+
+        learned_table = module.pairwise_distance_table(device=device, dtype=dtype)
+        base_scale = self._base_dist_offdiag_scale
+        if base_scale is not None and base_scale > 0.0:
+            try:
+                learned_scale = _offdiag_mad_float(learned_table)
+            except ValueError:
+                learned_scale = None
+            if learned_scale is not None and learned_scale > 0.0:
+                scale_value = base_scale / max(learned_scale, 1e-12)
+                if math.isfinite(scale_value) and scale_value > 0.0:
+                    scale_tensor = torch.as_tensor(
+                        scale_value,
+                        device=learned_table.device,
+                        dtype=learned_table.dtype,
+                    )
+                    learned_table = learned_table * scale_tensor
+        return learned_table
+
     def _build_distance_table(
         self,
         device: torch.device,
@@ -492,26 +513,12 @@ class MetricInducedGibbsProbPath(ProbPath):
     ) -> Tensor:
         base = self._get_base_distance_table(device=device, dtype=dtype)
 
-        module = metric_module if metric_module is not None else self.learnable_metric
-        learned_table = None
         lam = float(self.metric_interp_lambda)
-        if module is not None and lam > 0.0:
-            learned_table = module.pairwise_distance_table(device=device, dtype=dtype)
-            base_scale = self._base_dist_offdiag_scale
-            if base_scale is not None and base_scale > 0.0:
-                try:
-                    learned_scale = _offdiag_mad_float(learned_table)
-                except ValueError:
-                    learned_scale = None
-                if learned_scale is not None and learned_scale > 0.0:
-                    scale_value = base_scale / max(learned_scale, 1e-12)
-                    if math.isfinite(scale_value) and scale_value > 0.0:
-                        scale_tensor = torch.as_tensor(
-                            scale_value,
-                            device=learned_table.device,
-                            dtype=learned_table.dtype,
-                        )
-                        learned_table = learned_table * scale_tensor
+        learned_table = None
+        if lam > 0.0:
+            learned_table = self._scaled_learned_distance_table(
+                device=device, dtype=dtype, metric_module=metric_module
+            )
 
         if learned_table is None or lam <= 0.0:
             dist = base
