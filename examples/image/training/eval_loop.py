@@ -29,6 +29,7 @@ from typing import Callable, Dict, Iterable, Optional, Union, cast
 import PIL.Image
 
 import torch
+import torch.distributed as dist
 
 def _autocast_cuda():
     """Return an autocast context manager for CUDA with torch.amp if available, else torch.cuda.amp."""
@@ -168,6 +169,31 @@ def _save_sampling_gif(
 
     logger.info("Saved evaluation GIF to %s", gif_path)
     return gif_path
+
+
+def _pad_samples_to_square_grid(samples: torch.Tensor) -> torch.Tensor:
+    """Pad a batch of images by repeating early samples to fill a square grid."""
+
+    if samples.ndim != 4:
+        return samples
+    batch = samples.shape[0]
+    if batch == 0:
+        return samples
+
+    grid = int(math.ceil(math.sqrt(batch)))
+    target = grid * grid
+    if target <= batch:
+        return samples
+
+    pad = target - batch
+    if pad <= 0:
+        return samples
+
+    repeat = samples[:pad]
+    if repeat.numel() == 0:
+        return samples
+
+    return torch.cat((samples, repeat), dim=0)
 
 
 def _select_metric_eval_indices(vocab_size: int, subset: int) -> torch.Tensor:
@@ -758,30 +784,16 @@ def eval_model(
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        # Limit the contribution of real samples so we do not process more than fid_samples
-        remaining_real = max(fid_samples - num_real, 0)
-        real_batch = samples
-        real_labels = labels
-        if remaining_real <= 0:
-            real_batch = samples[:0]
-            real_labels = labels[:0]
-        elif real_batch.shape[0] > remaining_real:
-            real_batch = real_batch[:remaining_real]
-            real_labels = real_labels[:remaining_real]
-
-        if real_batch.shape[0] > 0:
-            fid_metric.update(real_batch, real=True)
-            num_real += real_batch.shape[0]
+        fid_metric.update(samples, real=True)
+        num_real = min(num_real + samples.shape[0], fid_samples)
 
         remaining_fake = max(fid_samples - num_synthetic, 0)
-        conditioning_samples = real_batch if real_batch.shape[0] > 0 else samples
-        conditioning_labels = real_labels if real_labels.shape[0] > 0 else labels
-        if remaining_fake <= 0:
-            conditioning_samples = conditioning_samples[:0]
-            conditioning_labels = conditioning_labels[:0]
-        elif conditioning_samples.shape[0] > remaining_fake:
-            conditioning_samples = conditioning_samples[:remaining_fake]
-            conditioning_labels = conditioning_labels[:remaining_fake]
+        if remaining_fake > 0 and samples.shape[0] > 0:
+            conditioning_samples = samples[:remaining_fake]
+            conditioning_labels = labels[:remaining_fake]
+        else:
+            conditioning_samples = samples[:0]
+            conditioning_labels = labels[:0]
 
         if conditioning_samples.shape[0] > 0 and num_synthetic < fid_samples:
             # Reset NFE counter on the wrapper that will actually be used
@@ -977,10 +989,13 @@ def eval_model(
             if num_synthetic + synthetic_samples.shape[0] > fid_samples:
                 synthetic_samples = synthetic_samples[: fid_samples - num_synthetic]
             fid_metric.update(synthetic_samples, real=False)
-            num_synthetic += synthetic_samples.shape[0]
+            num_synthetic = min(num_synthetic + synthetic_samples.shape[0], fid_samples)
             if not snapshots_saved and args.output_dir:
+                snapshot_batch = synthetic_samples
+                if snapshot_batch.ndim == 4:
+                    snapshot_batch = _pad_samples_to_square_grid(snapshot_batch)
                 save_image(
-                    synthetic_samples,
+                    snapshot_batch,
                     fp=Path(args.output_dir)
                     / "snapshots"
                     / f"{epoch}_{data_iter_step}.png",
@@ -1036,14 +1051,35 @@ def eval_model(
             # Sync fid metric to ensure that the processes dont deviate much.
             gc.collect()
             running_fid = fid_metric.compute()
+            if distributed_mode.is_dist_avail_and_initialized():
+                counts = torch.tensor(
+                    [num_real, num_synthetic],
+                    dtype=torch.float64,
+                    device=device,
+                )
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+                total_real = float(counts[0].item())
+                total_fake = float(counts[1].item())
+                target_total = float(
+                    getattr(
+                        args,
+                        "fid_samples",
+                        fid_samples * distributed_mode.get_world_size(),
+                    )
+                )
+            else:
+                total_real = float(num_real)
+                total_fake = float(num_synthetic)
+                target_total = float(fid_samples)
+            target_total = max(target_total, 1.0)
             if _data_loader_len_for_log is not None:
                 _len_str = str(_data_loader_len_for_log)
             else:
                 _len_str = "?"
             logger.info(
                 "Evaluating ["
-                f"{data_iter_step}/{_len_str}] samples generated [{num_synthetic}/{fid_samples}] "
-                f"reals [{num_real}/{fid_samples}] running fid {running_fid}"
+                f"{data_iter_step}/{_len_str}] samples generated [{total_fake:.0f}/{target_total}] "
+                f"reals [{total_real:.0f}/{target_total}] running fid {running_fid}"
             )
 
         if args.test_run:
