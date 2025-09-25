@@ -45,6 +45,44 @@ python submitit_train.py --data_path=${IMAGENET_DIR}train_blurred_$IMAGENET_RES/
 python submitit_train.py --data_path=${IMAGENET_DIR}train_blurred_$IMAGENET_RES/box/ --resume=./output_dir/checkpoint-899.pth --compute_fid --eval_only
 ```
 
+### Metric-induced geometry diagnostics
+
+When you enable the metric-induced Gibbs path (`--discrete_flow_matching --ko_metric_induced`), you can ask the evaluation loop to measure how far the learned Mahalanobis metric drifts from the baseline distances. Typical settings that balance coverage and runtime are:
+
+```bash
+python train.py \
+  --eval_only --compute_fid --discrete_flow_matching --ko_metric_induced \
+  --resume=./output_dir/checkpoint-899.pth \
+  --mi_learnable_metric --mi_metric_use_ema \
+  --mi_metric_eval_geometry --mi_metric_eval_subset=128 \
+  --mi_metric_eval_pair_samples=20000 --mi_metric_eval_knn_k=5 \
+  --mi_metric_eval_seed=0 --mi_metric_eval_heatmap \
+  --mi_metric_eval_heatmap_subset=64
+```
+
+- `--mi_metric_eval_subset=128` probes a 128-token slice of the vocabulary (set `0` to use everything; useful for CIFAR/ImageNet scales).
+- `--mi_metric_eval_pair_samples=20000` randomly samples 20k off-diagonal pairs when computing Spearman ρ, which keeps memory low but gives a stable estimate.
+- `--mi_metric_eval_knn_k=5` matches the defaults used in the literature for k-NN overlap probes.
+- Heatmaps require `matplotlib`; lowering `--mi_metric_eval_heatmap_subset` keeps the figure legible.
+
+The diagnostics run once per evaluation and log the Spearman/k-NN scores alongside FID. Heatmaps and CSVs land under `${output_dir}/metric_geometry/`.
+
+### Evaluation GIF logging
+
+To capture the full sampling trajectories as animated GIFs during evaluation, toggle `--save_eval_gif`. A typical configuration that trades detail for file size is:
+
+```bash
+python train.py \
+  --eval_only --compute_fid --resume=./output_dir/checkpoint-899.pth \
+  --save_eval_gif --eval_gif_max_batch=16 --eval_gif_stride=8 --eval_gif_fps=12
+```
+
+- `--eval_gif_max_batch=16` tiles up to 16 samples (4×4 grid) per frame; increase for wider grids.
+- `--eval_gif_stride=8` stores every 8th solver step to keep animations compact.
+- `--eval_gif_fps=12` plays the GIF at 12 frames per second for smooth but concise playback.
+
+GIFs are written to `${output_dir}/gifs/` and, if Weights & Biases is enabled, are uploaded as videos to the run dashboard.
+
 
 ## Results
 | Data                  | Model type                       | Epochs | FID  | Command                                                                                                                                                                                                                                                                                                                                                   |
