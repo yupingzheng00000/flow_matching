@@ -4,7 +4,6 @@
 # This source code is licensed under the CC-by-NC license found in the
 # LICENSE file in the root directory of this source tree.
 
-import math
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -94,26 +93,6 @@ from flow_matching.path.path import ProbPath
 from flow_matching.path.path_sample import DiscretePathSample
 from flow_matching.path.scheduler import ConvexScheduler
 from flow_matching.utils import expand_tensor_like, unsqueeze_to_match
-    
-def _offdiag_mad_float(matrix: Tensor) -> float:
-    """Return the off-diagonal median absolute deviation of a square matrix."""
-
-    if matrix.ndim != 2 or matrix.size(0) != matrix.size(1):
-        raise ValueError("matrix must be square")
-    if matrix.size(0) <= 1:
-        return 0.0
-
-    mat = matrix.detach().to(dtype=torch.float64)
-    n = mat.size(0)
-    mask = ~torch.eye(n, dtype=torch.bool, device=mat.device)
-    values = mat.masked_select(mask)
-    if values.numel() == 0:
-        return 0.0
-
-    median = torch.median(values)
-    deviations = (values - median).abs()
-    mad = torch.median(deviations)
-    return float(mad)
 
 
 class MixtureDiscreteProbPath(ProbPath):
@@ -463,10 +442,6 @@ class MetricInducedGibbsProbPath(ProbPath):
             self._cached_emb_weight = E
             self._cached_metric_name = self.metric_name
             self._cached_lp_order = float(self.lp_order)
-            try:
-                self._base_dist_offdiag_scale = _offdiag_mad_float(dist_cpu)
-            except ValueError:
-                self._base_dist_offdiag_scale = None
 
         base = self._base_dist_table_cpu
         assert base is not None
@@ -474,7 +449,7 @@ class MetricInducedGibbsProbPath(ProbPath):
             base = base.to(device=device, dtype=dtype)
         return base
 
-    def _scaled_learned_distance_table(
+    def _learned_distance_table(
         self,
         *,
         device: torch.device,
@@ -485,23 +460,7 @@ class MetricInducedGibbsProbPath(ProbPath):
         if module is None:
             return None
 
-        learned_table = module.pairwise_distance_table(device=device, dtype=dtype)
-        base_scale = self._base_dist_offdiag_scale
-        if base_scale is not None and base_scale > 0.0:
-            try:
-                learned_scale = _offdiag_mad_float(learned_table)
-            except ValueError:
-                learned_scale = None
-            if learned_scale is not None and learned_scale > 0.0:
-                scale_value = base_scale / max(learned_scale, 1e-12)
-                if math.isfinite(scale_value) and scale_value > 0.0:
-                    scale_tensor = torch.as_tensor(
-                        scale_value,
-                        device=learned_table.device,
-                        dtype=learned_table.dtype,
-                    )
-                    learned_table = learned_table * scale_tensor
-        return learned_table
+        return module.pairwise_distance_table(device=device, dtype=dtype)
 
     def _build_distance_table(
         self,
@@ -516,7 +475,7 @@ class MetricInducedGibbsProbPath(ProbPath):
         lam = float(self.metric_interp_lambda)
         learned_table = None
         if lam > 0.0:
-            learned_table = self._scaled_learned_distance_table(
+            learned_table = self._learned_distance_table(
                 device=device, dtype=dtype, metric_module=metric_module
             )
 

@@ -350,7 +350,7 @@ def _evaluate_metric_geometry(
     )
 
     tables: Dict[str, torch.Tensor] = {}
-    student_full = path._scaled_learned_distance_table(
+    student_full = path._learned_distance_table(
         device=eval_device, dtype=eval_dtype
     )
     if student_full is not None:
@@ -362,7 +362,7 @@ def _evaluate_metric_geometry(
 
     teacher_module = getattr(metric_ema, "teacher", None) if metric_ema else None
     if isinstance(teacher_module, torch.nn.Module):
-        teacher_full = path._scaled_learned_distance_table(
+        teacher_full = path._learned_distance_table(
             device=eval_device,
             dtype=eval_dtype,
             metric_module=teacher_module,

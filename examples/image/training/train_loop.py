@@ -471,10 +471,13 @@ def train_one_epoch(
                             kl_window_sum -= removed
                         kl_window.append(mean_kl_step)
                         kl_window_sum += mean_kl_step
-                        if len(kl_window) == kl_window.maxlen:
+                        if len(kl_window) > 0:
                             averaged_kl = kl_window_sum / len(kl_window)
-                            kl_controller.update(averaged_kl)
-                            kl_avg_for_logging = averaged_kl
+                            if math.isfinite(averaged_kl):
+                                kl_controller.update(averaged_kl)
+                                kl_avg_for_logging = averaged_kl
+                            else:
+                                kl_avg_for_logging = None
                         else:
                             kl_avg_for_logging = None
                     else:
