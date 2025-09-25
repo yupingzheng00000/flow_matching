@@ -784,8 +784,11 @@ def eval_model(
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        fid_metric.update(samples, real=True)
-        num_real = min(num_real + samples.shape[0], fid_samples)
+        remaining_real = max(fid_samples - num_real, 0)
+        if remaining_real > 0 and samples.shape[0] > 0:
+            real_batch = samples[:remaining_real]
+            fid_metric.update(real_batch, real=True)
+            num_real += real_batch.shape[0]
 
         remaining_fake = max(fid_samples - num_synthetic, 0)
         if remaining_fake > 0 and samples.shape[0] > 0:
