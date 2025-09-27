@@ -53,6 +53,20 @@ def _autocast(dtype: Optional[torch.dtype] = None):  # type: ignore[name-defined
         return torch.cuda.amp.autocast(dtype=dtype)
 
 
+def _importance_weighted_mean(
+    values: torch.Tensor, weights: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Return the mean of ``values`` with optional importance weights."""
+
+    if weights is None:
+        return values.mean()
+
+    weight_tensor = weights.to(device=values.device, dtype=values.dtype)
+    while weight_tensor.dim() < values.dim():
+        weight_tensor = weight_tensor.unsqueeze(-1)
+    return (values * weight_tensor).mean()
+
+
 def skewed_timestep_sample(num_samples: int, device: torch.device) -> torch.Tensor:
     P_mean = -1.2
     P_std = 1.2
@@ -375,14 +389,7 @@ def train_one_epoch(
                 logits_flat, targets_flat, reduction="none"
             )
             per_sample_loss = token_loss.view(samples.shape[0], -1).mean(dim=1)
-            if logbeta_weights is None:
-                weighted_loss = per_sample_loss
-            else:
-                logbeta_weights = logbeta_weights.to(
-                    device=per_sample_loss.device, dtype=per_sample_loss.dtype
-                )
-                weighted_loss = per_sample_loss * logbeta_weights
-            loss = weighted_loss.mean()
+            loss = _importance_weighted_mean(per_sample_loss, logbeta_weights)
 
             if use_path_trust_region:
                 x1_flat = samples.view(samples.shape[0], -1)
@@ -407,10 +414,9 @@ def train_one_epoch(
                     teacher_probs
                     * (torch.log(teacher_probs) - torch.log(student_probs))
                 ).sum(dim=-1)
-                if logbeta_weights is not None:
-                    schedule_kl_value = (kl_tensor * logbeta_weights).mean()
-                else:
-                    schedule_kl_value = kl_tensor.mean()
+                schedule_kl_value = _importance_weighted_mean(
+                    kl_tensor, logbeta_weights
+                )
                 schedule_kl_penalty = kl_controller.compute_penalty(schedule_kl_value)
                 loss = loss + schedule_kl_penalty
                 kl_metric.update(schedule_kl_value.detach())
