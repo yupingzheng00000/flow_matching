@@ -424,6 +424,8 @@ class ExpMonotoneRQSSchedule(BetaSchedule):
         device = self.y0.device
         ell = torch.empty(batch_shape, dtype=dtype, device=device).uniform_(lmin, lmax)
 
+        interval = max(lmax - lmin, float(torch.finfo(dtype).eps))
+
         a = self.a
         y = (ell - self.y0) / a
         s, dr_ds = self.rqs.inverse(y)
@@ -431,7 +433,7 @@ class ExpMonotoneRQSSchedule(BetaSchedule):
         t = t.clamp_(self.config.t_eps, 1.0 - self.config.t_eps)
 
         denom = (a * dr_ds).clamp_min(1e-6)
-        weight = (t * (1.0 - t)) / denom
+        weight = interval * (t * (1.0 - t)) / denom
         return t, weight
 
     def beta_and_derivative(self, t: Tensor) -> Tuple[Tensor, Tensor]:

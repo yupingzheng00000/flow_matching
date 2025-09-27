@@ -415,7 +415,8 @@ class TestExpMonotoneRQSchedule(unittest.TestCase):
         self.assertTrue(torch.all(ell_recovered >= lmin - 1e-6))
         self.assertTrue(torch.all(ell_recovered <= lmax + 1e-6))
 
-        expected_weight = beta / d_beta
+        interval = max(lmax - lmin, torch.finfo(beta.dtype).eps)
+        expected_weight = interval * (beta / d_beta)
         self.assertTrue(torch.all(expected_weight > 0))
         self.assertTrue(
             torch.allclose(weight, expected_weight, atol=1e-6, rtol=1e-5)
