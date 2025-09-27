@@ -20,6 +20,7 @@ from flow_matching.path import (
     BetaScheduleEMA,
     LearnableMetricEMA,
 )
+from flow_matching.path.beta_schedules import ExpMonotoneRQSSchedule
 from flow_matching.path.scheduler import PolynomialConvexScheduler
 from models.ema import EMA
 from torch.nn.parallel import DistributedDataParallel
@@ -317,7 +318,43 @@ def train_one_epoch(
         if getattr(args, "ko_metric_induced", False):
             # KO: 256-way classification; no mask token
             samples = (samples * 255.0).to(torch.long)
-            t = torch.rand(samples.shape[0], device=device)
+            logbeta_weights: Optional[torch.Tensor] = None
+            schedule = getattr(path, "beta_schedule", None)
+            lmin = getattr(args, "mi_logbeta_min", None)
+            lmax = getattr(args, "mi_logbeta_max", None)
+            use_logbeta_sampling = (
+                isinstance(schedule, ExpMonotoneRQSSchedule)
+                and hasattr(schedule, "sample_t_uniform_logbeta")
+                and lmin is not None
+                and lmax is not None
+            )
+            if use_logbeta_sampling and lmax <= lmin:
+                if not getattr(args, "_mi_logbeta_interval_warned", False):
+                    logger.warning(
+                        "Ignoring log-β sampling interval with l_min >= l_max (%.4f, %.4f)",
+                        lmin,
+                        lmax,
+                    )
+                    setattr(args, "_mi_logbeta_interval_warned", True)
+                use_logbeta_sampling = False
+
+            if use_logbeta_sampling:
+                t_samples, weights = schedule.sample_t_uniform_logbeta(
+                    batch_shape=(samples.shape[0],),
+                    lmin=float(lmin),
+                    lmax=float(lmax),
+                )
+                t = t_samples.to(device=device)
+                logbeta_weights = weights.to(device=device, dtype=torch.float32)
+                if not getattr(args, "_mi_logbeta_sampling_announced", False):
+                    logger.info(
+                        "Using uniform log-β sampling with interval [%.4f, %.4f]",
+                        float(lmin),
+                        float(lmax),
+                    )
+                    setattr(args, "_mi_logbeta_sampling_announced", True)
+            else:
+                t = torch.rand(samples.shape[0], device=device)
 
             # Provide dummy x_0 for signature compatibility (not used by metric-induced path)
             x_0 = torch.zeros_like(samples)
@@ -331,9 +368,21 @@ def train_one_epoch(
                     logits = model(x_t_model, t=t, extra=conditioning)
             else:
                 logits = model(x_t_model, t=t, extra=conditioning)
-            loss = torch.nn.functional.cross_entropy(
-                logits.float().reshape([-1, 256]), samples.reshape([-1])
-            ).mean()
+            vocab_size = logits.shape[-1]
+            logits_flat = logits.float().reshape(-1, vocab_size)
+            targets_flat = samples.reshape(-1)
+            token_loss = torch.nn.functional.cross_entropy(
+                logits_flat, targets_flat, reduction="none"
+            )
+            per_sample_loss = token_loss.view(samples.shape[0], -1).mean(dim=1)
+            if logbeta_weights is None:
+                weighted_loss = per_sample_loss
+            else:
+                logbeta_weights = logbeta_weights.to(
+                    device=per_sample_loss.device, dtype=per_sample_loss.dtype
+                )
+                weighted_loss = per_sample_loss * logbeta_weights
+            loss = weighted_loss.mean()
 
             if use_path_trust_region:
                 x1_flat = samples.view(samples.shape[0], -1)
@@ -358,7 +407,10 @@ def train_one_epoch(
                     teacher_probs
                     * (torch.log(teacher_probs) - torch.log(student_probs))
                 ).sum(dim=-1)
-                schedule_kl_value = kl_tensor.mean()
+                if logbeta_weights is not None:
+                    schedule_kl_value = (kl_tensor * logbeta_weights).mean()
+                else:
+                    schedule_kl_value = kl_tensor.mean()
                 schedule_kl_penalty = kl_controller.compute_penalty(schedule_kl_value)
                 loss = loss + schedule_kl_penalty
                 kl_metric.update(schedule_kl_value.detach())

@@ -434,6 +434,33 @@ class TestExpMonotoneRQSchedule(unittest.TestCase):
         with self.assertRaises(ValueError):
             schedule.sample_t_uniform_logbeta((4,), 1.0, 0.0)
 
+    def test_sample_uniform_logbeta_with_default_bounds(self):
+        config = ExpMonotoneRQSConfig(
+            num_bins=3,
+            tail_bound=4.0,
+            init_c=1.1,
+            init_a=2.7,
+            t_eps=1e-4,
+            logit_eps=1e-6,
+        )
+        schedule = ExpMonotoneRQSSchedule(config=config)
+        with torch.no_grad():
+            t_bounds = torch.tensor(
+                [config.t_eps, 1.0 - config.t_eps], dtype=schedule.y0.dtype
+            )
+            beta_bounds, _ = schedule.beta_and_derivative(t_bounds)
+            beta_bounds = beta_bounds.clamp_min(1e-12)
+            lmin, lmax = beta_bounds.log().tolist()
+
+        self.assertLess(lmin, lmax)
+
+        t, weight = schedule.sample_t_uniform_logbeta((8,), lmin, lmax)
+        self.assertEqual(t.shape, torch.Size([8]))
+        self.assertEqual(weight.shape, torch.Size([8]))
+        self.assertTrue(torch.all(t >= config.t_eps))
+        self.assertTrue(torch.all(t <= 1.0 - config.t_eps))
+        self.assertTrue(torch.all(weight > 0))
+
 
 class TestExpRQSInverse(unittest.TestCase):
     def test_inverse_round_trip(self):

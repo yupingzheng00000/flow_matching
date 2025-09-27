@@ -332,6 +332,24 @@ def get_args_parser():
         help="Number of time samples to evaluate when exporting β(t) snapshots.",
     )
     parser.add_argument(
+        "--mi_logbeta_min",
+        default=None,
+        type=float,
+        help=(
+            "Lower bound for uniform log-β sampling when using the exponential spline schedule. "
+            "Defaults to log β evaluated at t=mi_t_eps if unspecified."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_max",
+        default=None,
+        type=float,
+        help=(
+            "Upper bound for uniform log-β sampling when using the exponential spline schedule. "
+            "Defaults to log β evaluated at t=1-mi_t_eps if unspecified."
+        ),
+    )
+    parser.add_argument(
         "--mi_beta_use_ema",
         action="store_true",
         help="Track an exponential moving average teacher of the learnable β(t) schedule",
