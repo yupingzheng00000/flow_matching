@@ -22,6 +22,7 @@ from flow_matching.path import (
 )
 from flow_matching.path.scheduler import CondOTScheduler
 from flow_matching.utils.manifolds import FlatTorus, Sphere
+from flow_matching.path.beta_schedules import _ExpRQS1D
 
 
 class TestAffineProbPath(unittest.TestCase):
@@ -385,6 +386,30 @@ class TestExpMonotoneRQSchedule(unittest.TestCase):
         self.assertTrue(torch.allclose(beta, baseline, atol=1e-7, rtol=1e-5))
         self.assertTrue(torch.allclose(d_beta, baseline_deriv, atol=1e-7, rtol=1e-5))
         self.assertTrue(torch.all(d_beta > 0))
+
+
+class TestExpRQSInverse(unittest.TestCase):
+    def test_inverse_round_trip(self):
+        torch.manual_seed(0)
+        rqs = _ExpRQS1D(num_bins=5, tail_bound=2.5).to(dtype=torch.float64)
+        with torch.no_grad():
+            rqs.theta_w.copy_(torch.randn_like(rqs.theta_w))
+            rqs.theta_h.copy_(torch.randn_like(rqs.theta_h))
+            if rqs.theta_d.numel() > 0:
+                rqs.theta_d.copy_(torch.randn_like(rqs.theta_d))
+
+        inputs = torch.linspace(-3.0, 3.0, steps=41, dtype=torch.float64)
+        outputs, derivatives = rqs(inputs)
+        recovered, recovered_derivatives = rqs.inverse(outputs)
+
+        max_error = (recovered - inputs).abs().max().item()
+        self.assertLessEqual(max_error, 5e-6)
+        self.assertTrue(torch.all(recovered_derivatives > 0.0))
+        self.assertTrue(
+            torch.allclose(
+                recovered_derivatives, derivatives, atol=1e-6, rtol=1e-5
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -216,6 +216,7 @@ class _ExpRQS1D(nn.Module):
         widths = F.softmax(self.theta_w, dim=0) * (2.0 * B)
         heights = F.softmax(self.theta_h, dim=0) * (2.0 * B)
         eps = torch.finfo(widths.dtype).eps
+        eps_val = torch.finfo(dtype).eps
         internal = F.softplus(self.theta_d) + eps
 
         cumsum_widths = torch.cumsum(widths, dim=0)
@@ -275,6 +276,91 @@ class _ExpRQS1D(nn.Module):
             derivatives[center_mask] = derivatives_mid
 
         return outputs.view_as(inputs), derivatives.view_as(inputs)
+
+    @torch.no_grad()
+    def inverse(self, outputs: Tensor) -> Tuple[Tensor, Tensor]:
+        device = outputs.device
+        dtype = outputs.dtype
+        B = self.tail_bound
+
+        widths = F.softmax(self.theta_w, dim=0) * (2.0 * B)
+        heights = F.softmax(self.theta_h, dim=0) * (2.0 * B)
+        eps = torch.finfo(widths.dtype).eps
+        eps_val = torch.finfo(dtype).eps
+        internal = F.softplus(self.theta_d) + eps
+
+        cumsum_widths = torch.cumsum(widths, dim=0)
+        cumsum_heights = torch.cumsum(heights, dim=0)
+
+        left = torch.tensor([-B], device=device, dtype=dtype)
+        xk = torch.cat((left, (left + cumsum_widths).to(device=device, dtype=dtype)))
+        yk = torch.cat((left, (left + cumsum_heights).to(device=device, dtype=dtype)))
+
+        delta_left = torch.ones(1, device=device, dtype=dtype)
+        delta_right = torch.ones(1, device=device, dtype=dtype)
+        if self.num_bins > 1:
+            delta_mid = internal.to(device=device, dtype=dtype)
+            delta = torch.cat((delta_left, delta_mid, delta_right))
+        else:
+            delta = torch.cat((delta_left, delta_right))
+
+        flat_outputs = outputs.reshape(-1)
+        s_flat = flat_outputs.clone()
+
+        left_mask = flat_outputs <= -B
+        right_mask = flat_outputs >= B
+        center_mask = (~left_mask) & (~right_mask)
+
+        if center_mask.any():
+            y = flat_outputs[center_mask]
+            bin_idx = torch.bucketize(y, yk[1:])
+            bin_idx = bin_idx.clamp(min=0, max=self.num_bins - 1)
+
+            x0 = xk[bin_idx]
+            x1 = xk[bin_idx + 1]
+            y0 = yk[bin_idx]
+            y1 = yk[bin_idx + 1]
+            d0 = delta[bin_idx]
+            d1 = delta[bin_idx + 1]
+
+            w = x1 - x0
+            h = y1 - y0
+            slope = h / w
+            z = (y - y0) / h
+
+            coeff = d0 + d1 - 2.0 * slope
+            a = slope - d0 + z * coeff
+            b = d0 - z * coeff
+            c = -z * slope
+
+            discriminant = torch.clamp(b * b - 4.0 * a * c, min=0.0)
+            sqrt_disc = torch.sqrt(discriminant)
+
+            denom = 2.0 * a
+            # Handle near-linear bins by falling back to linear solution
+            linear_mask = torch.isclose(
+                denom, torch.zeros_like(denom), atol=1e-12, rtol=0.0
+            )
+
+            eps_denom = torch.full_like(denom, eps_val)
+            denom_safe = denom + torch.where(denom >= 0, eps_denom, -eps_denom)
+            xi_quad1 = (-b - sqrt_disc) / denom_safe
+            xi_quad2 = (-b + sqrt_disc) / denom_safe
+            xi_quad = torch.where(
+                (xi_quad1 >= 0.0) & (xi_quad1 <= 1.0), xi_quad1, xi_quad2
+            )
+            eps_b = torch.full_like(b, eps_val)
+            b_safe = b + torch.where(b >= 0, eps_b, -eps_b)
+            xi_linear = (-c) / b_safe
+            xi = torch.where(linear_mask, xi_linear, xi_quad)
+            xi = xi.clamp(0.0, 1.0)
+
+            s_center = x0 + w * xi
+            s_flat[center_mask] = s_center
+
+        s = s_flat.view_as(outputs)
+        _, derivatives = self.forward(s)
+        return s, derivatives
 
 
 class ExpMonotoneRQSSchedule(BetaSchedule):
