@@ -400,6 +400,40 @@ class ExpMonotoneRQSSchedule(BetaSchedule):
             _inv_softplus(torch.tensor(float(a), dtype=dtype, device=device))
         )
 
+    @torch.no_grad()
+    def sample_t_uniform_logbeta(
+        self, batch_shape, lmin: float, lmax: float
+    ) -> Tuple[Tensor, Tensor]:
+        """Sample ``log beta`` uniformly, invert to ``t``, and return ``(t, dt/dℓ)``.
+
+        Args:
+            batch_shape: Shape of the samples to draw (same semantics as ``torch.empty``).
+            lmin: Lower bound of the uniform distribution over ``log beta``.
+            lmax: Upper bound of the uniform distribution over ``log beta``.
+
+        Returns:
+            A tuple ``(t, weight)`` where ``t`` are the recovered time values and
+            ``weight`` is the Jacobian ``dt/dℓ`` that preserves expectations when
+            importance-sampling with uniform ``log beta`` draws.
+        """
+
+        if lmax < lmin:
+            raise ValueError("lmax must be >= lmin")
+
+        dtype = self.y0.dtype
+        device = self.y0.device
+        ell = torch.empty(batch_shape, dtype=dtype, device=device).uniform_(lmin, lmax)
+
+        a = self.a
+        y = (ell - self.y0) / a
+        s, dr_ds = self.rqs.inverse(y)
+        t = torch.sigmoid(s)
+        t = t.clamp_(self.config.t_eps, 1.0 - self.config.t_eps)
+
+        denom = (a * dr_ds).clamp_min(1e-6)
+        weight = (t * (1.0 - t)) / denom
+        return t, weight
+
     def beta_and_derivative(self, t: Tensor) -> Tuple[Tensor, Tensor]:
         cfg = self.config
         t_clamped = t.clamp(min=cfg.t_eps, max=1.0 - cfg.t_eps)

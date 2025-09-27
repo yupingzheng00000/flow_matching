@@ -387,6 +387,53 @@ class TestExpMonotoneRQSchedule(unittest.TestCase):
         self.assertTrue(torch.allclose(d_beta, baseline_deriv, atol=1e-7, rtol=1e-5))
         self.assertTrue(torch.all(d_beta > 0))
 
+    def test_sample_uniform_logbeta_round_trip_and_weight(self):
+        seed = 1234
+        torch.manual_seed(seed)
+        config = ExpMonotoneRQSConfig(
+            num_bins=4,
+            tail_bound=3.0,
+            init_c=1.2,
+            init_a=2.3,
+            t_eps=1e-5,
+            logit_eps=1e-6,
+        )
+        schedule = ExpMonotoneRQSSchedule(config=config).to(dtype=torch.float64)
+
+        batch_shape = (16,)
+        lmin, lmax = -1.5, 1.8
+        t, weight = schedule.sample_t_uniform_logbeta(batch_shape, lmin, lmax)
+
+        self.assertEqual(t.shape, torch.Size(batch_shape))
+        self.assertEqual(weight.shape, torch.Size(batch_shape))
+        self.assertTrue(torch.all(t >= config.t_eps))
+        self.assertTrue(torch.all(t <= 1.0 - config.t_eps))
+
+        beta, d_beta = schedule.beta_and_derivative(t)
+        ell_recovered = beta.log()
+
+        self.assertTrue(torch.all(ell_recovered >= lmin - 1e-6))
+        self.assertTrue(torch.all(ell_recovered <= lmax + 1e-6))
+
+        expected_weight = beta / d_beta
+        self.assertTrue(torch.all(expected_weight > 0))
+        self.assertTrue(
+            torch.allclose(weight, expected_weight, atol=1e-6, rtol=1e-5)
+        )
+
+        torch.manual_seed(seed)
+        expected_ell = torch.empty(
+            batch_shape, dtype=ell_recovered.dtype, device=ell_recovered.device
+        ).uniform_(lmin, lmax)
+        self.assertTrue(
+            torch.allclose(ell_recovered, expected_ell, atol=1e-6, rtol=1e-5)
+        )
+
+    def test_sample_uniform_logbeta_interval_validation(self):
+        schedule = ExpMonotoneRQSSchedule()
+        with self.assertRaises(ValueError):
+            schedule.sample_t_uniform_logbeta((4,), 1.0, 0.0)
+
 
 class TestExpRQSInverse(unittest.TestCase):
     def test_inverse_round_trip(self):
