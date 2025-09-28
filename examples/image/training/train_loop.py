@@ -8,6 +8,7 @@ import gc
 import logging
 import math
 from collections import deque
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 import torch
@@ -65,6 +66,173 @@ def _importance_weighted_mean(
     while weight_tensor.dim() < values.dim():
         weight_tensor = weight_tensor.unsqueeze(-1)
     return (values * weight_tensor).mean()
+
+
+def _compute_gap_quantiles(distances: torch.Tensor) -> tuple[float, float]:
+    """Return the 10th and 90th percentile of two-nearest distance gaps."""
+
+    if distances.numel() == 0:
+        raise ValueError("Cannot compute quantiles from an empty tensor")
+
+    top2 = torch.topk(distances, k=2, dim=-1, largest=False).values
+    gaps = (top2[..., 1] - top2[..., 0]).clamp_min(1e-12)
+    gaps_flat = gaps.view(-1).to(dtype=torch.float32)
+    quantiles = torch.quantile(
+        gaps_flat,
+        torch.tensor([0.10, 0.90], device=gaps_flat.device, dtype=gaps_flat.dtype),
+    )
+    return float(quantiles[0].item()), float(quantiles[1].item())
+
+
+def _map_gaps_to_logbeta_band(
+    q10: float,
+    q90: float,
+    ratio_min: float,
+    ratio_max: float,
+    *,
+    beta_min_clip: float = 1e-3,
+    beta_max_clip: float = 1e3,
+) -> Optional[tuple[float, float]]:
+    """Convert gap quantiles into a log-β interval."""
+
+    if not (math.isfinite(q10) and math.isfinite(q90)):
+        return None
+
+    eps = 1e-12
+    q10 = max(q10, eps)
+    q90 = max(q90, eps)
+
+    clamp_ratio = lambda r: max(1e-6, min(r, 1.0 - 1e-6))
+    r_min = clamp_ratio(ratio_min)
+    r_max = clamp_ratio(ratio_max)
+
+    beta_min = math.log(1.0 / r_min) / q90
+    beta_max = math.log(1.0 / r_max) / q10
+
+    beta_min = min(max(beta_min, beta_min_clip), beta_max_clip)
+    beta_max = min(max(beta_max, beta_min_clip), beta_max_clip)
+
+    if beta_max < beta_min:
+        beta_min, beta_max = beta_max, beta_min
+
+    if beta_min <= 0.0 or beta_max <= 0.0:
+        return None
+    if not (math.isfinite(beta_min) and math.isfinite(beta_max)):
+        return None
+
+    return math.log(beta_min), math.log(beta_max)
+
+
+@dataclass
+class DifficultyBandState:
+    """Tracks adaptive log-β bounds driven by batch difficulty statistics."""
+
+    lmin: float
+    lmax: float
+    q10: Optional[float] = None
+    q90: Optional[float] = None
+    last_refresh_step: int = -1
+    has_stats: bool = False
+
+    def interval(self) -> float:
+        return max(self.lmax - self.lmin, 1e-6)
+
+    def should_refresh(self, step: int, interval: int) -> bool:
+        if interval <= 0:
+            return False
+        if self.last_refresh_step < 0:
+            return True
+        return (step - self.last_refresh_step) >= interval
+
+    def refresh(
+        self,
+        *,
+        tokens: torch.Tensor,
+        path: MetricInducedGibbsProbPath,
+        step: int,
+        sample_fraction: float,
+        max_positions: int,
+        ratio_min: float,
+        ratio_max: float,
+        beta_min_clip: float = 1e-3,
+        beta_max_clip: float = 1e3,
+    ) -> bool:
+        if tokens.numel() == 0:
+            return False
+
+        sample_fraction = float(max(0.0, min(sample_fraction, 1.0)))
+        max_positions = max(1, int(max_positions))
+
+        with torch.no_grad():
+            flat_tokens = tokens.view(-1)
+            num_positions = flat_tokens.numel()
+            if num_positions == 0:
+                return False
+
+            sample_count = int(math.ceil(num_positions * sample_fraction))
+            sample_count = max(1, min(sample_count, num_positions, max_positions))
+
+            if sample_count >= num_positions:
+                sampled = flat_tokens
+            else:
+                indices = torch.randperm(num_positions, device=flat_tokens.device)[:sample_count]
+                sampled = flat_tokens.index_select(0, indices)
+
+            sampled = sampled.view(-1, 1)
+            distances = path.distances_from_tokens(sampled).squeeze(1).to(dtype=torch.float32)
+            if distances.numel() == 0:
+                return False
+
+            try:
+                q10, q90 = _compute_gap_quantiles(distances)
+            except ValueError:
+                return False
+
+            band = _map_gaps_to_logbeta_band(
+                q10,
+                q90,
+                ratio_min,
+                ratio_max,
+                beta_min_clip=beta_min_clip,
+                beta_max_clip=beta_max_clip,
+            )
+            if band is None:
+                return False
+
+            self.lmin, self.lmax = band
+            self.q10 = q10
+            self.q90 = q90
+            self.last_refresh_step = int(step)
+            self.has_stats = True
+
+            beta_bounds = (math.exp(self.lmin), math.exp(self.lmax))
+            logger.info(
+                "Refreshed log-β band: q10=%.4e, q90=%.4e, β∈[%.4f, %.4f], ℓ∈[%.4f, %.4f]",
+                q10,
+                q90,
+                beta_bounds[0],
+                beta_bounds[1],
+                self.lmin,
+                self.lmax,
+            )
+        return True
+
+
+def _logbeta_density(
+    schedule: ExpMonotoneRQSSchedule, t: torch.Tensor, lmin: float, lmax: float
+) -> torch.Tensor:
+    """Evaluate q_{logβ}(t) for the provided schedule and bounds."""
+
+    interval = max(lmax - lmin, 1e-6)
+    with torch.no_grad():
+        device = schedule.y0.device
+        dtype = schedule.y0.dtype
+        t_sched = t.to(device=device, dtype=dtype)
+        beta_vals, d_beta_vals = schedule.beta_and_derivative(t_sched)
+        beta_vals = beta_vals.clamp_min(1e-12)
+        density = (d_beta_vals / beta_vals) / interval
+        density = density.to(device=t.device, dtype=t.dtype)
+    return density.clamp_min(1e-12).detach()
 
 
 def skewed_timestep_sample(num_samples: int, device: torch.device) -> torch.Tensor:
@@ -334,41 +502,88 @@ def train_one_epoch(
             samples = (samples * 255.0).to(torch.long)
             logbeta_weights: Optional[torch.Tensor] = None
             schedule = getattr(path, "beta_schedule", None)
-            lmin = getattr(args, "mi_logbeta_min", None)
-            lmax = getattr(args, "mi_logbeta_max", None)
-            use_logbeta_sampling = (
-                isinstance(schedule, ExpMonotoneRQSSchedule)
-                and hasattr(schedule, "sample_t_uniform_logbeta")
-                and lmin is not None
-                and lmax is not None
-            )
-            if use_logbeta_sampling and lmax <= lmin:
-                if not getattr(args, "_mi_logbeta_interval_warned", False):
-                    logger.warning(
-                        "Ignoring log-β sampling interval with l_min >= l_max (%.4f, %.4f)",
-                        lmin,
-                        lmax,
+            difficulty_state: Optional[DifficultyBandState] = None
+            diff_step = int(getattr(args, "_mi_difficulty_step", 0))
+            alpha = float(getattr(args, "mi_difficulty_alpha", 0.5))
+            alpha = max(0.0, min(alpha, 1.0))
+            if isinstance(schedule, ExpMonotoneRQSSchedule):
+                difficulty_state = getattr(args, "_mi_difficulty_state", None)
+                if difficulty_state is None:
+                    fallback_min = float(getattr(args, "mi_difficulty_fallback_min", 0.5))
+                    fallback_max = float(getattr(args, "mi_difficulty_fallback_max", 2.2))
+                    if fallback_max < fallback_min:
+                        fallback_min, fallback_max = fallback_max, fallback_min
+                    difficulty_state = DifficultyBandState(fallback_min, fallback_max)
+                refresh_interval = int(getattr(args, "mi_difficulty_refresh_interval", 128))
+                sample_fraction = float(getattr(args, "mi_difficulty_sample_fraction", 0.05))
+                max_positions = int(getattr(args, "mi_difficulty_max_positions", 8192))
+                ratio_min = float(getattr(args, "mi_difficulty_ratio_min", 0.5))
+                ratio_max = float(getattr(args, "mi_difficulty_ratio_max", 0.05))
+                if difficulty_state.should_refresh(diff_step, refresh_interval):
+                    refreshed = difficulty_state.refresh(
+                        tokens=samples,
+                        path=path,
+                        step=diff_step,
+                        sample_fraction=sample_fraction,
+                        max_positions=max_positions,
+                        ratio_min=ratio_min,
+                        ratio_max=ratio_max,
                     )
-                    setattr(args, "_mi_logbeta_interval_warned", True)
-                use_logbeta_sampling = False
+                    if refreshed:
+                        setattr(args, "mi_logbeta_min", float(difficulty_state.lmin))
+                        setattr(args, "mi_logbeta_max", float(difficulty_state.lmax))
+                setattr(args, "_mi_difficulty_state", difficulty_state)
+            setattr(args, "_mi_difficulty_step", diff_step + 1)
 
-            if use_logbeta_sampling:
-                t_samples, weights = schedule.sample_t_uniform_logbeta(
-                    batch_shape=(samples.shape[0],),
-                    lmin=float(lmin),
-                    lmax=float(lmax),
-                )
-                t = t_samples.to(device=device)
-                logbeta_weights = weights.to(device=device, dtype=torch.float32)
-                if not getattr(args, "_mi_logbeta_sampling_announced", False):
-                    logger.info(
-                        "Using uniform log-β sampling with interval [%.4f, %.4f]",
-                        float(lmin),
-                        float(lmax),
+            use_difficulty_sampling = (
+                isinstance(schedule, ExpMonotoneRQSSchedule)
+                and isinstance(difficulty_state, DifficultyBandState)
+                and difficulty_state.interval() > 0.0
+            )
+
+            if use_difficulty_sampling:
+                batch_size = samples.shape[0]
+                t = torch.empty(batch_size, device=device, dtype=torch.float32)
+                if alpha <= 0.0:
+                    uniform_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                elif alpha >= 1.0:
+                    uniform_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+                else:
+                    uniform_mask = torch.rand(batch_size, device=device) < alpha
+
+                num_uniform = int(uniform_mask.sum().item())
+                if num_uniform > 0:
+                    t_uniform = torch.rand(num_uniform, device=device, dtype=torch.float32)
+                    t[uniform_mask] = t_uniform
+
+                num_logbeta = batch_size - num_uniform
+                if num_logbeta > 0:
+                    t_samples, _weights = schedule.sample_t_uniform_logbeta(
+                        batch_shape=(num_logbeta,),
+                        lmin=float(difficulty_state.lmin),
+                        lmax=float(difficulty_state.lmax),
                     )
-                    setattr(args, "_mi_logbeta_sampling_announced", True)
+                    t[~uniform_mask] = t_samples.to(device=device, dtype=torch.float32)
+
+                t_eps = float(getattr(schedule.config, "t_eps", 1e-4))
+                t = t.clamp_(t_eps, 1.0 - t_eps)
+
+                q_logbeta_vals = _logbeta_density(
+                    schedule,
+                    t,
+                    float(difficulty_state.lmin),
+                    float(difficulty_state.lmax),
+                )
+                q_mix = alpha + (1.0 - alpha) * q_logbeta_vals
+                weights = (1.0 / q_mix.clamp_min(1e-6)).to(dtype=torch.float32)
+                logbeta_weights = weights.detach()
             else:
-                t = torch.rand(samples.shape[0], device=device)
+                t = torch.rand(samples.shape[0], device=device, dtype=torch.float32)
+                if isinstance(schedule, ExpMonotoneRQSSchedule):
+                    t_eps = float(getattr(schedule.config, "t_eps", 1e-4))
+                else:
+                    t_eps = float(getattr(path, "eps_t", 1e-4)) if hasattr(path, "eps_t") else 1e-4
+                t = t.clamp_(t_eps, 1.0 - t_eps)
 
             # Provide dummy x_0 for signature compatibility (not used by metric-induced path)
             x_0 = torch.zeros_like(samples)

@@ -179,10 +179,36 @@ def main(args):
                         defaults = beta_vals.log().tolist()
                     if logbeta_min is None:
                         logbeta_min = float(defaults[0])
-                    if logbeta_max is None:
-                        logbeta_max = float(defaults[1])
-                args.mi_logbeta_min = float(logbeta_min)
-                args.mi_logbeta_max = float(logbeta_max)
+                if logbeta_max is None:
+                    logbeta_max = float(defaults[1])
+            args.mi_logbeta_min = float(logbeta_min)
+            args.mi_logbeta_max = float(logbeta_max)
+
+        args.mi_difficulty_refresh_interval = max(
+            1, int(getattr(args, "mi_difficulty_refresh_interval", 128))
+        )
+        sample_frac = float(getattr(args, "mi_difficulty_sample_fraction", 0.05))
+        args.mi_difficulty_sample_fraction = float(max(0.0, min(sample_frac, 1.0)))
+        args.mi_difficulty_max_positions = max(
+            1, int(getattr(args, "mi_difficulty_max_positions", 8192))
+        )
+        alpha = float(getattr(args, "mi_difficulty_alpha", 0.5))
+        args.mi_difficulty_alpha = float(max(0.0, min(alpha, 1.0)))
+        ratio_min = float(getattr(args, "mi_difficulty_ratio_min", 0.5))
+        ratio_max = float(getattr(args, "mi_difficulty_ratio_max", 0.05))
+        eps_ratio = 1e-6
+        args.mi_difficulty_ratio_min = float(
+            max(eps_ratio, min(ratio_min, 1.0 - eps_ratio))
+        )
+        args.mi_difficulty_ratio_max = float(
+            max(eps_ratio, min(ratio_max, 1.0 - eps_ratio))
+        )
+        fallback_min = float(getattr(args, "mi_difficulty_fallback_min", 0.5))
+        fallback_max = float(getattr(args, "mi_difficulty_fallback_max", 2.2))
+        if fallback_max < fallback_min:
+            fallback_min, fallback_max = fallback_max, fallback_min
+        args.mi_difficulty_fallback_min = float(fallback_min)
+        args.mi_difficulty_fallback_max = float(fallback_max)
 
         gumbel_tau_default = float(getattr(args, "mi_gumbel_tau", 1.0))
         tau_start = getattr(args, "mi_gumbel_tau_start", None)
