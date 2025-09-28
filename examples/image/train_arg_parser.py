@@ -350,6 +350,54 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_difficulty_refresh_interval",
+        default=128,
+        type=int,
+        help="Micro-batch interval (in training steps) between log-β band refreshes.",
+    )
+    parser.add_argument(
+        "--mi_difficulty_sample_fraction",
+        default=0.05,
+        type=float,
+        help="Fraction of target-token positions to sample when estimating the difficulty band.",
+    )
+    parser.add_argument(
+        "--mi_difficulty_max_positions",
+        default=8192,
+        type=int,
+        help="Maximum number of token positions to include when refreshing the difficulty band.",
+    )
+    parser.add_argument(
+        "--mi_difficulty_alpha",
+        default=0.5,
+        type=float,
+        help="Mixture weight α for the uniform-t component in the MIS timestep sampler.",
+    )
+    parser.add_argument(
+        "--mi_difficulty_ratio_min",
+        default=0.5,
+        type=float,
+        help="Desired easy-case posterior ratio r_min used to set the lower log-β bound.",
+    )
+    parser.add_argument(
+        "--mi_difficulty_ratio_max",
+        default=0.05,
+        type=float,
+        help="Desired hard-case posterior ratio r_max used to set the upper log-β bound.",
+    )
+    parser.add_argument(
+        "--mi_difficulty_fallback_min",
+        default=0.5,
+        type=float,
+        help="Fallback lower log-β bound (ℓ_min) before difficulty statistics are available.",
+    )
+    parser.add_argument(
+        "--mi_difficulty_fallback_max",
+        default=2.2,
+        type=float,
+        help="Fallback upper log-β bound (ℓ_max) before difficulty statistics are available.",
+    )
+    parser.add_argument(
         "--mi_beta_use_ema",
         action="store_true",
         help="Track an exponential moving average teacher of the learnable β(t) schedule",
