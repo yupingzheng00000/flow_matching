@@ -56,7 +56,7 @@ from training.train_loop import MASK_TOKEN
 
 logger = logging.getLogger(__name__)
 
-PRINT_FREQUENCY = 50
+PRINT_FREQUENCY = 1
 
 
 def _save_sampling_gif(

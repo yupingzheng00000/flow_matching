@@ -383,7 +383,7 @@ def main(args):
                 )
                 if getattr(args, "wandb_offline", False):
                     os.environ.setdefault("WANDB_MODE", "offline")
-                wandb_run = wandb.init(**{k: v for k, v in wandb_kwargs.items() if v is not None})
+                wandb_run = wandb.init(**{k: v for k, v in wandb_kwargs.items() if v is not None}, mode="offline" if getattr(args, "wandb_offline", False) else "online")
         except Exception as e:
             logger.warning(f"wandb not enabled ({e})")
 

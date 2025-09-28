@@ -388,7 +388,23 @@ def train_one_epoch(
             token_loss = torch.nn.functional.cross_entropy(
                 logits_flat, targets_flat, reduction="none"
             )
+            target_tokens = samples.view(samples.shape[0], -1)
+            token_counts = torch.zeros(
+                target_tokens.shape[0],
+                vocab_size,
+                device=target_tokens.device,
+                dtype=torch.float32,
+            )
+            token_counts.scatter_add_(
+                1,
+                target_tokens,
+                torch.ones_like(target_tokens, dtype=torch.float32),
+            )
+            token_probs = token_counts / token_counts.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            token_probs = token_probs.clamp_min(1e-12)
+            target_entropy = -(token_probs * token_probs.log()).sum(dim=1)
             per_sample_loss = token_loss.view(samples.shape[0], -1).mean(dim=1)
+            uw_loss = per_sample_loss.mean().item()
             loss = _importance_weighted_mean(per_sample_loss, logbeta_weights)
 
             if use_path_trust_region:
@@ -424,6 +440,88 @@ def train_one_epoch(
                 kl_updates_total += 1
                 kl_sum_for_step += float(schedule_kl_value.detach())
                 kl_micro_steps += 1
+
+            wandb_logger = None
+            if getattr(args, "wandb", False) and distributed_mode.is_main_process():
+                try:
+                    import swanlab as wandb  # type: ignore
+                    wandb_logger = wandb
+                except ImportError:
+                    wandb_logger = None
+
+            if wandb_logger is not None:
+                wandb_log_data = {
+                    "diag/target_entropy_mean": float(target_entropy.mean().detach().cpu().item()),
+                }
+                if logbeta_weights is not None:
+                    w = logbeta_weights.detach()
+                    ess_num = (w.sum() ** 2) / (w.square().sum() + 1e-12)
+                    wandb_log_data["diag/ess_frac"] = float((ess_num / (w.numel() + 1e-12)).item())
+
+                entropy_table = getattr(args, "_entropy_vs_t_table", None)
+                entropy_rows = getattr(args, "_entropy_vs_t_rows", None)
+                if entropy_table is None or entropy_rows is None:
+                    entropy_table = wandb_logger.echarts.Table()
+                    entropy_rows = []
+                    setattr(args, "_entropy_vs_t_table", entropy_table)
+                    setattr(args, "_entropy_vs_t_rows", entropy_rows)
+
+                t_cpu = t.detach().cpu().float()
+                entropy_cpu = target_entropy.detach().cpu().float()
+                new_rows = [
+                    [float(t_val), float(entropy_val)]
+                    for t_val, entropy_val in zip(t_cpu.tolist(), entropy_cpu.tolist())
+                ]
+                entropy_rows.extend(new_rows)
+                max_points = int(getattr(args, "wandb_entropy_max_points", 4096) or 4096)
+                if len(entropy_rows) > max_points:
+                    del entropy_rows[:-max_points]
+
+                entropy_table.add(["t", "entropy"], entropy_rows)
+
+                scatter_chart = wandb_logger.echarts.Scatter()
+                scatter_chart.add_xaxis([row[0] for row in entropy_rows])
+                scatter_chart.add_yaxis(
+                    "entropy",
+                    [row[1] for row in entropy_rows],
+                    symbol_size=6,
+                )
+                echarts_opts = getattr(wandb_logger.echarts, "options", None)
+                if echarts_opts is not None:
+                    tooltip_fmt = getattr(
+                        echarts_opts.TooltipOpts,
+                        "formatter",
+                        None,
+                    )
+                    tooltip_kwargs = {}
+                    if tooltip_fmt is None:
+                        tooltip_kwargs["formatter"] = "t: {c0}<br/>entropy: {c1}"
+                    else:
+                        tooltip_kwargs = {"formatter": "t: {c0}<br/>entropy: {c1}"}
+                    scatter_chart.set_global_opts(
+                        title_opts=echarts_opts.TitleOpts(
+                            title="Target Entropy vs t",
+                            pos_left="center",
+                        ),
+                        xaxis_opts=echarts_opts.AxisOpts(
+                            name="t",
+                            type_="value",
+                            min_=0.0,
+                            max_=1.0,
+                        ),
+                        yaxis_opts=echarts_opts.AxisOpts(
+                            name="entropy",
+                            type_="value",
+                        ),
+                        tooltip_opts=echarts_opts.TooltipOpts(**tooltip_kwargs),
+                    )
+                    scatter_chart.set_series_opts(
+                        itemstyle_opts=echarts_opts.ItemStyleOpts(opacity=0.6),
+                    )
+
+                wandb_log_data["diag/entropy_vs_t_table"] = entropy_table
+                wandb_log_data["diag/entropy_vs_t"] = scatter_chart
+                wandb_logger.log(wandb_log_data)
         elif args.discrete_flow_matching:
             samples = (samples * 255.0).to(torch.long)
             t = torch.rand(samples.shape[0]).to(device)
@@ -604,6 +702,7 @@ def train_one_epoch(
                         {
                             "train/step_loss": float(batch_loss.compute().detach().cpu()),
                             "train/inst_loss": float(loss_value),
+                            "train/uw_loss": float(uw_loss) if 'uw_loss' in locals() else float(loss_value),
                             "train/lr": float(lr),
                             "epoch": int(epoch),
                             **(
