@@ -458,69 +458,157 @@ def train_one_epoch(
                     ess_num = (w.sum() ** 2) / (w.square().sum() + 1e-12)
                     wandb_log_data["diag/ess_frac"] = float((ess_num / (w.numel() + 1e-12)).item())
 
-                entropy_table = getattr(args, "_entropy_vs_t_table", None)
-                entropy_rows = getattr(args, "_entropy_vs_t_rows", None)
-                if entropy_table is None or entropy_rows is None:
-                    entropy_table = wandb_logger.echarts.Table()
-                    entropy_rows = []
-                    setattr(args, "_entropy_vs_t_table", entropy_table)
-                    setattr(args, "_entropy_vs_t_rows", entropy_rows)
+                if data_iter_step % (PRINT_FREQUENCY * 2) == 0:
+                    max_points = int(getattr(args, "wandb_entropy_max_points", 4096) or 4096)
+                    entropy_table = getattr(args, "_entropy_vs_t_table", None)
+                    entropy_rows = getattr(args, "_entropy_vs_t_rows", None)
+                    if not isinstance(entropy_rows, deque):
+                        existing_rows = list(entropy_rows) if entropy_rows is not None else []
+                        entropy_rows = deque(existing_rows[-max_points:], maxlen=max_points)
+                        setattr(args, "_entropy_vs_t_rows", entropy_rows)
+                    elif entropy_rows.maxlen != max_points:
+                        entropy_rows = deque(list(entropy_rows)[-max_points:], maxlen=max_points)
+                        setattr(args, "_entropy_vs_t_rows", entropy_rows)
+                    if entropy_table is None:
+                        entropy_table = wandb_logger.echarts.Table()
+                        setattr(args, "_entropy_vs_t_table", entropy_table)
 
-                t_cpu = t.detach().cpu().float()
-                entropy_cpu = target_entropy.detach().cpu().float()
-                new_rows = [
-                    [float(t_val), float(entropy_val)]
-                    for t_val, entropy_val in zip(t_cpu.tolist(), entropy_cpu.tolist())
-                ]
-                entropy_rows.extend(new_rows)
-                max_points = int(getattr(args, "wandb_entropy_max_points", 4096) or 4096)
-                if len(entropy_rows) > max_points:
-                    del entropy_rows[:-max_points]
+                    t_cpu = t.detach().float().cpu()
+                    entropy_cpu = target_entropy.detach().float().cpu()
+                    counter = int(getattr(args, "_entropy_vs_t_counter", 0))
+                    new_rows = []
+                    for t_val, entropy_val in zip(t_cpu.tolist(), entropy_cpu.tolist()):
+                        # Track arrival order in column 2 so visualMap can encode recency with color.
+                        new_rows.append([
+                            float(t_val),
+                            float(entropy_val),
+                            float(counter),
+                        ])
+                        counter += 1
+                    setattr(args, "_entropy_vs_t_counter", counter)
+                    entropy_rows.extend(new_rows)
 
-                entropy_table.add(["t", "entropy"], entropy_rows)
+                    rows_list = list(entropy_rows)
+                    entropy_table.add(["t", "entropy", "index"], rows_list)
 
-                scatter_chart = wandb_logger.echarts.Scatter()
-                scatter_chart.add_xaxis([row[0] for row in entropy_rows])
-                scatter_chart.add_yaxis(
-                    "entropy",
-                    [row[1] for row in entropy_rows],
-                    symbol_size=6,
-                )
-                echarts_opts = getattr(wandb_logger.echarts, "options", None)
-                if echarts_opts is not None:
-                    tooltip_fmt = getattr(
-                        echarts_opts.TooltipOpts,
-                        "formatter",
-                        None,
+                    scatter_chart = wandb_logger.echarts.Scatter()
+                    scatter_chart.add_xaxis([])
+                    options_mod = getattr(wandb_logger.echarts, "options", None)
+                    label_opts = (
+                        options_mod.LabelOpts(is_show=False)
+                        if options_mod is not None
+                        else None
                     )
-                    tooltip_kwargs = {}
-                    if tooltip_fmt is None:
-                        tooltip_kwargs["formatter"] = "t: {c0}<br/>entropy: {c1}"
+                    scatter_chart.add_yaxis(
+                        "entropy",
+                        rows_list,
+                        symbol_size=3.5,
+                        label_opts=label_opts,
+                        encode={"x": 0, "y": 1},
+                    )
+                    palette = [
+                        "#003f5c",
+                        "#2f4b7c",
+                        "#665191",
+                        "#a05195",
+                        "#d45087",
+                        "#f95d6a",
+                    ]
+                    if rows_list:
+                        min_t = min(row[0] for row in rows_list)
+                        max_t = max(row[0] for row in rows_list)
+                        if math.isfinite(min_t) and math.isfinite(max_t):
+                            if abs(max_t - min_t) < 1e-9:
+                                pad = max(abs(min_t), 1.0) * 1e-3
+                                min_axis = min_t - pad
+                                max_axis = max_t + pad
+                            else:
+                                min_axis = min_t
+                                max_axis = max_t
+                        else:
+                            min_axis = 0.0
+                            max_axis = 1.0
+                        color_min = min(row[2] for row in rows_list)
+                        color_max = max(row[2] for row in rows_list)
+                        if abs(color_max - color_min) < 1e-9:
+                            color_pad = max(abs(color_min), 1.0)
+                            color_min -= color_pad * 0.5
+                            color_max += color_pad * 0.5
                     else:
-                        tooltip_kwargs = {"formatter": "t: {c0}<br/>entropy: {c1}"}
-                    scatter_chart.set_global_opts(
-                        title_opts=echarts_opts.TitleOpts(
-                            title="Target Entropy vs t",
-                            pos_left="center",
-                        ),
-                        xaxis_opts=echarts_opts.AxisOpts(
-                            name="t",
-                            type_="value",
-                            min_=0.0,
-                            max_=1.0,
-                        ),
-                        yaxis_opts=echarts_opts.AxisOpts(
-                            name="entropy",
-                            type_="value",
-                        ),
-                        tooltip_opts=echarts_opts.TooltipOpts(**tooltip_kwargs),
-                    )
-                    scatter_chart.set_series_opts(
-                        itemstyle_opts=echarts_opts.ItemStyleOpts(opacity=0.6),
-                    )
+                        min_axis = 0.0
+                        max_axis = 1.0
+                        color_min = 0.0
+                        color_max = float(len(rows_list))
 
-                wandb_log_data["diag/entropy_vs_t_table"] = entropy_table
-                wandb_log_data["diag/entropy_vs_t"] = scatter_chart
+                    diff = max(color_max - color_min, 1e-6)
+                    segment_count = len(palette)
+                    pieces = []
+                    for idx, color_hex in enumerate(palette):
+                        start_ratio = idx / segment_count
+                        end_ratio = (idx + 1) / segment_count
+                        piece_min = color_min + diff * start_ratio
+                        piece_max = (
+                            color_min + diff * end_ratio
+                            if idx < segment_count - 1
+                            else color_max
+                        )
+                        pieces.append(
+                            {
+                                "min": piece_min,
+                                "max": piece_max,
+                                "color": color_hex,
+                            }
+                        )
+
+                    echarts_opts = options_mod
+                    if echarts_opts is not None:
+                        tooltip_fmt = getattr(
+                            echarts_opts.TooltipOpts,
+                            "formatter",
+                            None,
+                        )
+                        tooltip_kwargs = {}
+                        if tooltip_fmt is None:
+                            tooltip_kwargs["formatter"] = "t: {c0}<br/>entropy: {c1}<br/>idx: {c2}"
+                        else:
+                            tooltip_kwargs = {"formatter": "t: {c0}<br/>entropy: {c1}<br/>idx: {c2}"}
+                        scatter_chart.set_global_opts(
+                            title_opts=echarts_opts.TitleOpts(
+                                title="Target Entropy vs t",
+                                pos_left="center",
+                            ),
+                            xaxis_opts=echarts_opts.AxisOpts(
+                                name="t",
+                                type_="value",
+                                min_=min_axis,
+                                max_=max_axis,
+                            ),
+                            yaxis_opts=echarts_opts.AxisOpts(
+                                name="entropy",
+                                type_="value",
+                            ),
+                            tooltip_opts=echarts_opts.TooltipOpts(**tooltip_kwargs),
+                            datazoom_opts=[
+                                echarts_opts.DataZoomOpts(type_="slider"),
+                                echarts_opts.DataZoomOpts(type_="inside"),
+                            ],
+                            visualmap_opts=echarts_opts.VisualMapOpts(
+                                dimension=2,
+                                is_piecewise=True,
+                                pieces=pieces,
+                                min_=color_min,
+                                max_=color_max,
+                                orient="horizontal",
+                                pos_top="5%",
+                                pos_left="center",
+                            ),
+                        )
+                        scatter_chart.set_series_opts(
+                            itemstyle_opts=echarts_opts.ItemStyleOpts(opacity=0.35),
+                        )
+
+                    wandb_log_data["diag/entropy_vs_t_table"] = entropy_table
+                    wandb_log_data["diag/entropy_vs_t"] = scatter_chart
                 wandb_logger.log(wandb_log_data)
         elif args.discrete_flow_matching:
             samples = (samples * 255.0).to(torch.long)
