@@ -350,6 +350,15 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_logbeta_mis_alpha",
+        default=0.3,
+        type=float,
+        help=(
+            "Mixture coefficient α for MIS between uniform-t and log-β proposals. "
+            "Set to 0 to disable; recommended range is [0.1, 0.5]."
+        ),
+    )
+    parser.add_argument(
         "--mi_beta_use_ema",
         action="store_true",
         help="Track an exponential moving average teacher of the learnable β(t) schedule",

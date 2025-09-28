@@ -333,6 +333,7 @@ def train_one_epoch(
             # KO: 256-way classification; no mask token
             samples = (samples * 255.0).to(torch.long)
             logbeta_weights: Optional[torch.Tensor] = None
+            mis_uniform_frac: Optional[float] = None
             schedule = getattr(path, "beta_schedule", None)
             lmin = getattr(args, "mi_logbeta_min", None)
             lmax = getattr(args, "mi_logbeta_max", None)
@@ -352,14 +353,22 @@ def train_one_epoch(
                     setattr(args, "_mi_logbeta_interval_warned", True)
                 use_logbeta_sampling = False
 
+            mix_alpha_raw = float(getattr(args, "mi_logbeta_mis_alpha", 0.0))
+            mix_alpha = float(min(max(mix_alpha_raw, 0.0), 1.0))
+
             if use_logbeta_sampling:
-                t_samples, weights = schedule.sample_t_uniform_logbeta(
-                    batch_shape=(samples.shape[0],),
+                batch_size = samples.shape[0]
+                # Draw proposals from both distributions (log-β and uniform) and mix via MIS.
+                t_logbeta, _ = schedule.sample_t_uniform_logbeta(
+                    batch_shape=(batch_size,),
                     lmin=float(lmin),
                     lmax=float(lmax),
                 )
-                t = t_samples.to(device=device)
-                logbeta_weights = weights.to(device=device, dtype=torch.float32)
+                t_logbeta = t_logbeta.to(device=device)
+                t_uniform = torch.rand(batch_size, device=device)
+                selector = torch.rand(batch_size, device=device) < mix_alpha
+                t = torch.where(selector, t_uniform, t_logbeta)
+
                 if not getattr(args, "_mi_logbeta_sampling_announced", False):
                     logger.info(
                         "Using uniform log-β sampling with interval [%.4f, %.4f]",
@@ -367,6 +376,23 @@ def train_one_epoch(
                         float(lmax),
                     )
                     setattr(args, "_mi_logbeta_sampling_announced", True)
+                if 0.0 < mix_alpha < 1.0 and not getattr(args, "_mi_logbeta_mis_announced", False):
+                    logger.info(
+                        "Using MIS with α=%.3f (uniform-t) and %.3f (log-β proposal)",
+                        mix_alpha,
+                        1.0 - mix_alpha,
+                    )
+                    setattr(args, "_mi_logbeta_mis_announced", True)
+
+                interval = max(float(lmax) - float(lmin), 1e-6)
+                t_for_schedule = t.to(device=t_logbeta.device, dtype=t_logbeta.dtype)
+                beta_vals, beta_deriv = schedule.beta_and_derivative(t_for_schedule)
+                beta_vals = beta_vals.clamp_min(1e-12)
+                q_logbeta = (beta_deriv / beta_vals).clamp_min(1e-12) / interval
+                q_logbeta = q_logbeta.to(device=device, dtype=torch.float32)
+                q_mix = mix_alpha + (1.0 - mix_alpha) * q_logbeta
+                logbeta_weights = (1.0 / q_mix.clamp_min(1e-12)).to(device=device)
+                mis_uniform_frac = float(selector.float().mean().detach().cpu().item())
             else:
                 t = torch.rand(samples.shape[0], device=device)
 
@@ -457,6 +483,8 @@ def train_one_epoch(
                     w = logbeta_weights.detach()
                     ess_num = (w.sum() ** 2) / (w.square().sum() + 1e-12)
                     wandb_log_data["diag/ess_frac"] = float((ess_num / (w.numel() + 1e-12)).item())
+                if mis_uniform_frac is not None:
+                    wandb_log_data["diag/mis_uniform_frac"] = mis_uniform_frac
 
                 if data_iter_step % (PRINT_FREQUENCY * 2) == 0:
                     max_points = int(getattr(args, "wandb_entropy_max_points", 4096) or 4096)
