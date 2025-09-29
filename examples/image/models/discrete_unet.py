@@ -60,6 +60,8 @@ class DiscreteUNetModel(nn.Module):
     resblock_updown: bool = False
     use_new_attention_order: bool = False
     with_fourier_features: bool = False
+    use_cosine_attention: bool = False
+    use_output_head_weight_norm: bool = False
 
     def __post_init__(self):
         super().__init__()
@@ -95,7 +97,10 @@ class DiscreteUNetModel(nn.Module):
             with_fourier_features=self.with_fourier_features,
             ignore_time=False, # enable this for doing metric-induced prob paths
             input_projection=False,
+            use_cosine_attention=self.use_cosine_attention,
+            use_output_head_weight_norm=self.use_output_head_weight_norm,
         )
+        self.weight_norm_targets = self.unet.weight_norm_targets
 
     def forward(
         self, x_t: torch.Tensor, t: torch.Tensor, extra: Mapping[str, torch.Tensor]

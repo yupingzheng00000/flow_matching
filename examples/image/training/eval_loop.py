@@ -39,6 +39,7 @@ def _autocast_cuda():
     except Exception:  # pragma: no cover
         return torch.cuda.amp.autocast()
 from flow_matching.path import MixtureDiscreteProbPath, MetricInducedGibbsProbPath
+from flow_matching.path.beta_schedules import ExpMonotoneRQSSchedule
 from flow_matching.path.metric_ema import LearnableMetricEMA
 from flow_matching.path.scheduler import PolynomialConvexScheduler
 from flow_matching.solver import MixtureDiscreteEulerSolver, KODiscreteGibbsEulerSolver
@@ -52,6 +53,7 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torchvision.utils import save_image, make_grid
 from training import distributed_mode
 from training.edm_time_discretization import get_time_discretization
+from training.model_diagnostics import DiagnosticsRunner
 from training.train_loop import MASK_TOKEN
 
 logger = logging.getLogger(__name__)
@@ -169,6 +171,64 @@ def _save_sampling_gif(
 
     logger.info("Saved evaluation GIF to %s", gif_path)
     return gif_path
+
+
+def _build_metric_infer_time_grid(
+    args: Namespace,
+    path: MetricInducedGibbsProbPath,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, str]:
+    grid_type = str(getattr(args, "mi_infer_grid", "uniform_t"))
+    steps_cfg = getattr(args, "mi_infer_steps", None)
+    if steps_cfg is None:
+        steps = int(getattr(args, "discrete_fm_steps", 1024))
+    else:
+        steps = int(steps_cfg)
+    steps = max(1, steps)
+    num_points = steps + 1
+
+    if grid_type == "uniform_logbeta":
+        schedule = getattr(path, "beta_schedule", None)
+        if isinstance(schedule, ExpMonotoneRQSSchedule):
+            ell_min = getattr(args, "mi_logbeta_min", None)
+            ell_max = getattr(args, "mi_logbeta_max", None)
+            with torch.no_grad():
+                if ell_min is None or ell_max is None:
+                    t_bounds = torch.tensor(
+                        [schedule.config.t_eps, 1.0 - schedule.config.t_eps],
+                        device=schedule.y0.device,
+                        dtype=schedule.y0.dtype,
+                    )
+                    ell_bounds = schedule.ell_from_t(t_bounds)
+                    if ell_min is None:
+                        ell_min = float(ell_bounds[0].item())
+                    if ell_max is None:
+                        ell_max = float(ell_bounds[1].item())
+            ell_min = float(ell_min)
+            ell_max = float(ell_max)
+            if not math.isfinite(ell_min) or not math.isfinite(ell_max):
+                raise ValueError("mi_logbeta_min/max must be finite when using uniform_logbeta grid")
+            if ell_max <= ell_min:
+                raise ValueError("mi_logbeta_max must exceed mi_logbeta_min for uniform_logbeta grid")
+            ell_grid = torch.linspace(
+                ell_min,
+                ell_max,
+                steps=num_points,
+                device=schedule.y0.device,
+                dtype=schedule.y0.dtype,
+            )
+            t_vals, _ = schedule.t_from_ell(ell_grid)
+            t_vals = t_vals.clamp(schedule.config.t_eps, 1.0 - schedule.config.t_eps)
+            t_vals = torch.sort(t_vals)[0]
+            return t_vals.to(device=device, dtype=torch.float32), grid_type
+        else:
+            logger.warning(
+                "mi_infer_grid=uniform_logbeta requested but β schedule is not ExpMonotoneRQSSchedule; falling back to uniform_t."
+            )
+
+    t_vals = torch.linspace(0.0, 1.0, steps=num_points, device=device, dtype=torch.float32)
+    return t_vals, "uniform_t"
 
 
 def _pad_samples_to_square_grid(samples: torch.Tensor) -> torch.Tensor:
@@ -571,6 +631,32 @@ def eval_model(
     cfg_scaled_logits_model = None
     cfg_scaled_model.train(False)
 
+    infer_time_grid: Optional[torch.Tensor] = None
+    infer_grid_label: Optional[str] = None
+    infer_grid_logged = False
+
+    def get_infer_time_grid(
+        batch_device: torch.device, path_obj: MetricInducedGibbsProbPath
+    ) -> torch.Tensor:
+        nonlocal infer_time_grid, infer_grid_label, infer_grid_logged
+        if infer_time_grid is None or infer_time_grid.device != batch_device:
+            time_grid, label = _build_metric_infer_time_grid(
+                args,
+                path_obj,
+                device=batch_device,
+            )
+            infer_time_grid = time_grid
+            infer_grid_label = label
+            infer_grid_logged = False
+        if not infer_grid_logged and infer_time_grid is not None and infer_grid_label is not None:
+            logger.info(
+                "Metric-induced inference grid '%s' using %d steps",
+                infer_grid_label,
+                max(int(infer_time_grid.numel()) - 1, 0),
+            )
+            infer_grid_logged = True
+        return infer_time_grid
+
     if args.discrete_flow_matching:
         # Branch between mixture path (Meta) and metric-induced path (KO-style)
         if getattr(args, "metric_induced", False):
@@ -616,6 +702,20 @@ def eval_model(
     schedule_snapshot_logged = False
     geometry_stats: Dict[str, float] = {}
     geometry_logged = False
+
+    diagnostics_enabled = bool(getattr(args, "diag_enable", False))
+    if diagnostics_enabled and distributed_mode.is_main_process():
+        try:
+            DiagnosticsRunner(
+                model=model,
+                device=device,
+                args=args,
+                data_loader=data_loader,
+            ).run(metric_path=ko_path)
+        except Exception as diag_exc:  # pragma: no cover - diagnostics failures should not crash eval
+            logger.warning("Diagnostics run failed: %s", diag_exc)
+    if diagnostics_enabled and distributed_mode.is_dist_avail_and_initialized():
+        dist.barrier()
 
     def maybe_run_metric_geometry(path_obj: Optional[MetricInducedGibbsProbPath]) -> None:
         nonlocal geometry_logged, geometry_stats
@@ -885,10 +985,12 @@ def eval_model(
                         dtype=torch.long,
                     )
                     dtype_cat = torch.float32 if args.sampling_dtype == "float32" else torch.float64
+                    time_grid = get_infer_time_grid(conditioning_samples.device, ko_solver.path)
                     sample_result = ko_solver.sample(
                         x_init=x_0,
-                        step_size=1.0 / args.discrete_fm_steps,
+                        step_size=None,
                         dtype_categorical=dtype_cat,
+                        time_grid=time_grid,
                         label=conditioning_labels,
                         # IMPORTANT: disable CFG scaling when using discrete logits
                         cfg_scale=0.0,

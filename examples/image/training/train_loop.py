@@ -53,6 +53,31 @@ def _autocast(dtype: Optional[torch.dtype] = None):  # type: ignore[name-defined
         return torch.cuda.amp.autocast(dtype=dtype)
 
 
+def _collect_weight_norm_modules(module: nn.Module) -> list[nn.Module]:
+    cached = getattr(module, "_cached_weight_norm_targets", None)
+    if cached is not None:
+        return cached
+
+    targets: list[nn.Module] = []
+    seen: set[int] = set()
+
+    attr = getattr(module, "weight_norm_targets", None)
+    if isinstance(attr, (list, tuple)):
+        for candidate in attr:
+            if isinstance(candidate, nn.Module) and id(candidate) not in seen:
+                targets.append(candidate)
+                seen.add(id(candidate))
+
+    for submodule in module.modules():
+        if hasattr(submodule, "force_weight_renorm") and id(submodule) not in seen:
+            targets.append(submodule)
+            seen.add(id(submodule))
+
+    setattr(module, "_cached_weight_norm_targets", targets)
+    setattr(module, "weight_norm_targets", targets)
+    return targets
+
+
 def _importance_weighted_mean(
     values: torch.Tensor, weights: Optional[torch.Tensor]
 ) -> torch.Tensor:
@@ -203,6 +228,13 @@ def train_one_epoch(
 ):
     gc.collect()
     model.train(True)
+    weight_norm_modules = _collect_weight_norm_modules(model)
+
+    def _renorm_weight_norm_modules() -> None:
+        for module in weight_norm_modules:
+            if hasattr(module, "force_weight_renorm"):
+                module.force_weight_renorm()
+
     batch_loss = MeanMetric().to(device, non_blocking=True)
     epoch_loss = MeanMetric().to(device, non_blocking=True)
 
@@ -313,7 +345,7 @@ def train_one_epoch(
 
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         if data_iter_step % accum_iter == 0:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             batch_loss.reset()
             if data_iter_step > 0 and args.test_run:
                 break
@@ -486,7 +518,7 @@ def train_one_epoch(
                 if mis_uniform_frac is not None:
                     wandb_log_data["diag/mis_uniform_frac"] = mis_uniform_frac
 
-                if data_iter_step % (PRINT_FREQUENCY * 2) == 0:
+                if data_iter_step % (PRINT_FREQUENCY * 10) == 0:
                     max_points = int(getattr(args, "wandb_entropy_max_points", 4096) or 4096)
                     entropy_table = getattr(args, "_entropy_vs_t_table", None)
                     entropy_rows = getattr(args, "_entropy_vs_t_rows", None)
@@ -691,6 +723,7 @@ def train_one_epoch(
             optimizer,
             parameters=model.parameters(),
             update_grad=apply_update,
+            pre_step_fn=_renorm_weight_norm_modules if weight_norm_modules else None,
         )
         grad_step_skipped = False
         if apply_update:
@@ -700,6 +733,7 @@ def train_one_epoch(
                 grad_step_skipped = not torch.isfinite(grad_norm.detach()).all().item()
             else:
                 grad_step_skipped = not math.isfinite(float(grad_norm))
+            optimizer.zero_grad(set_to_none=True)
         if apply_update and isinstance(model, EMA):
             model.update_ema()
         elif (

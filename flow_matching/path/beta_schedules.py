@@ -52,7 +52,7 @@ def _rational_quadratic_spline(
     outputs_flat = torch.empty_like(inputs_flat)
 
     cumwidths = torch.cumsum(widths, dim=-1)
-    cumheights = torch.cumsum(heights, dim=-1)
+    cumheights = torch
 
     cumwidths = F.pad(cumwidths, (1, 0), value=0.0)
     cumheights = F.pad(cumheights, (1, 0), value=0.0)
@@ -400,6 +400,39 @@ class ExpMonotoneRQSSchedule(BetaSchedule):
             _inv_softplus(torch.tensor(float(a), dtype=dtype, device=device))
         )
 
+    def _ell_and_derivative(self, t: Tensor) -> Tuple[Tensor, Tensor]:
+        cfg = self.config
+        t_clamped = t.clamp(min=cfg.t_eps, max=1.0 - cfg.t_eps)
+        s = torch.logit(t_clamped, eps=cfg.logit_eps)
+        r_s, dr_ds = self.rqs(s)
+        a = self.a
+        ell = self.y0 + a * r_s
+        denom = (t_clamped * (1.0 - t_clamped)).clamp_min(1e-8)
+        dell_dt = (a * dr_ds) / denom
+        return ell.view_as(t_clamped), dell_dt.view_as(t_clamped)
+
+    def ell_from_t(self, t: Tensor) -> Tensor:
+        ell, _ = self._ell_and_derivative(t)
+        return ell
+
+    def dtdell(self, t: Tensor) -> Tensor:
+        _, dell_dt = self._ell_and_derivative(t)
+        return dell_dt.reciprocal()
+
+    @torch.no_grad()
+    def t_from_ell(self, ell: Tensor) -> Tuple[Tensor, Tensor]:
+        dtype = self.y0.dtype
+        device = self.y0.device
+        ell = ell.to(device=device, dtype=dtype)
+        a = self.a
+        y = (ell - self.y0) / a
+        s, dr_ds = self.rqs.inverse(y)
+        t = torch.sigmoid(s)
+        t = t.clamp_(self.config.t_eps, 1.0 - self.config.t_eps)
+        denom = (a * dr_ds).clamp_min(1e-8)
+        dt_dell = (t * (1.0 - t)) / denom
+        return t, dt_dell
+
     @torch.no_grad()
     def sample_t_uniform_logbeta(
         self, batch_shape, lmin: float, lmax: float
@@ -423,17 +456,9 @@ class ExpMonotoneRQSSchedule(BetaSchedule):
         dtype = self.y0.dtype
         device = self.y0.device
         ell = torch.empty(batch_shape, dtype=dtype, device=device).uniform_(lmin, lmax)
-
         interval = max(lmax - lmin, float(torch.finfo(dtype).eps))
-
-        a = self.a
-        y = (ell - self.y0) / a
-        s, dr_ds = self.rqs.inverse(y)
-        t = torch.sigmoid(s)
-        t = t.clamp_(self.config.t_eps, 1.0 - self.config.t_eps)
-
-        denom = (a * dr_ds).clamp_min(1e-6)
-        weight = interval * (t * (1.0 - t)) / denom
+        t, dt_dell = self.t_from_ell(ell)
+        weight = interval * dt_dell
         return t, weight
 
     def beta_and_derivative(self, t: Tensor) -> Tuple[Tensor, Tensor]:

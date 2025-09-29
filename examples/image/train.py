@@ -272,6 +272,8 @@ def main(args):
         is_discrete=args.discrete_flow_matching,
         ko=getattr(args, "ko_metric_induced", False),
         use_ema=args.use_ema,
+        use_cosine_attention=getattr(args, "cosine_attention", False),
+        use_head_weight_norm=getattr(args, "head_weight_norm", False),
     )
 
     model.to(device)
@@ -293,6 +295,7 @@ def main(args):
             model, device_ids=[args.gpu], find_unused_parameters=False
         )
         model_without_ddp = model.module
+        setattr(model, "weight_norm_targets", getattr(model_without_ddp, "weight_norm_targets", []))
 
     optimizer_param_groups = [{"params": list(model_without_ddp.parameters())}]
     extra_modules = {}

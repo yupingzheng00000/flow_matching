@@ -220,6 +220,32 @@ def get_args_parser():
     )
 
     parser.add_argument(
+        "--cosine_attention",
+        action="store_true",
+        help="L2-normalize Q and K before computing attention logits (cosine attention).",
+    )
+    parser.add_argument(
+        "--no_cosine_attention",
+        action="store_false",
+        dest="cosine_attention",
+        help="Disable cosine attention (default).",
+    )
+    parser.set_defaults(cosine_attention=False)
+
+    parser.add_argument(
+        "--head_weight_norm",
+        action="store_true",
+        help="Apply per-forward RMS normalization to the output head weights.",
+    )
+    parser.add_argument(
+        "--no_head_weight_norm",
+        action="store_false",
+        dest="head_weight_norm",
+        help="Disable output head weight normalization (default).",
+    )
+    parser.set_defaults(head_weight_norm=False)
+
+    parser.add_argument(
         "--discrete_fm_steps",
         default=1024,
         type=int,
@@ -359,6 +385,25 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_infer_grid",
+        default="uniform_t",
+        choices=["uniform_t", "uniform_logbeta"],
+        type=str,
+        help=(
+            "Time grid used by the metric-induced evaluator. "
+            "'uniform_logbeta' builds a grid uniform in log β."
+        ),
+    )
+    parser.add_argument(
+        "--mi_infer_steps",
+        default=None,
+        type=int,
+        help=(
+            "Number of intervals for the inference grid. "
+            "Defaults to --discrete_fm_steps when unspecified."
+        ),
+    )
+    parser.add_argument(
         "--mi_beta_use_ema",
         action="store_true",
         help="Track an exponential moving average teacher of the learnable β(t) schedule",
@@ -413,6 +458,41 @@ def get_args_parser():
         default=1e4,
         type=float,
         help="Upper clamp for the adaptive schedule KL weight.",
+    )
+    parser.add_argument(
+        "--diag_enable",
+        action="store_true",
+        help="Run stability diagnostics (weights, activations, attention) during evaluation.",
+    )
+    parser.add_argument(
+        "--diag_checkpoint",
+        action="append",
+        default=[],
+        help="Checkpoint path to include in diagnostics. Provide multiple times for a sequence.",
+    )
+    parser.add_argument(
+        "--diag_batch_size",
+        default=32,
+        type=int,
+        help="Batch size used for activation diagnostics hooks.",
+    )
+    parser.add_argument(
+        "--diag_time",
+        default=0.5,
+        type=float,
+        help="Time value in [0,1] used when probing activations for diagnostics.",
+    )
+    parser.add_argument(
+        "--diag_power_iters",
+        default=8,
+        type=int,
+        help="Number of power-iteration steps for spectral norm estimation.",
+    )
+    parser.add_argument(
+        "--diag_output_dir",
+        default=None,
+        type=str,
+        help="Optional override for the diagnostics CSV output directory.",
     )
     parser.add_argument(
         "--mi_beta_lr_scale",
