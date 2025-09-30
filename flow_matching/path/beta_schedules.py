@@ -52,7 +52,7 @@ def _rational_quadratic_spline(
     outputs_flat = torch.empty_like(inputs_flat)
 
     cumwidths = torch.cumsum(widths, dim=-1)
-    cumheights = torch
+    cumheights = torch.cumsum(heights, dim=-1)
 
     cumwidths = F.pad(cumwidths, (1, 0), value=0.0)
     cumheights = F.pad(cumheights, (1, 0), value=0.0)
@@ -208,15 +208,13 @@ class _ExpRQS1D(nn.Module):
                 target = torch.tensor(1.0)
                 self.theta_d.copy_(_inv_softplus(target).expand_as(self.theta_d))
 
-    def forward(self, inputs: Tensor) -> Tuple[Tensor, Tensor]:
-        device = inputs.device
-        dtype = inputs.dtype
+    def _knot_tensors(
+        self, *, dtype: torch.dtype, device: torch.device
+    ) -> tuple[Tensor, Tensor, Tensor]:
         B = self.tail_bound
-
         widths = F.softmax(self.theta_w, dim=0) * (2.0 * B)
         heights = F.softmax(self.theta_h, dim=0) * (2.0 * B)
         eps = torch.finfo(widths.dtype).eps
-        eps_val = torch.finfo(dtype).eps
         internal = F.softplus(self.theta_d) + eps
 
         cumsum_widths = torch.cumsum(widths, dim=0)
@@ -233,6 +231,15 @@ class _ExpRQS1D(nn.Module):
             delta = torch.cat((delta_left, delta_mid, delta_right))
         else:
             delta = torch.cat((delta_left, delta_right))
+        return xk, yk, delta
+
+    def forward(self, inputs: Tensor) -> Tuple[Tensor, Tensor]:
+        device = inputs.device
+        dtype = inputs.dtype
+        B = self.tail_bound
+        eps_val = torch.finfo(dtype).eps
+
+        xk, yk, delta = self._knot_tensors(dtype=dtype, device=device)
 
         flat_inputs = inputs.reshape(-1)
         outputs = flat_inputs.clone()
@@ -282,27 +289,9 @@ class _ExpRQS1D(nn.Module):
         device = outputs.device
         dtype = outputs.dtype
         B = self.tail_bound
-
-        widths = F.softmax(self.theta_w, dim=0) * (2.0 * B)
-        heights = F.softmax(self.theta_h, dim=0) * (2.0 * B)
-        eps = torch.finfo(widths.dtype).eps
         eps_val = torch.finfo(dtype).eps
-        internal = F.softplus(self.theta_d) + eps
 
-        cumsum_widths = torch.cumsum(widths, dim=0)
-        cumsum_heights = torch.cumsum(heights, dim=0)
-
-        left = torch.tensor([-B], device=device, dtype=dtype)
-        xk = torch.cat((left, (left + cumsum_widths).to(device=device, dtype=dtype)))
-        yk = torch.cat((left, (left + cumsum_heights).to(device=device, dtype=dtype)))
-
-        delta_left = torch.ones(1, device=device, dtype=dtype)
-        delta_right = torch.ones(1, device=device, dtype=dtype)
-        if self.num_bins > 1:
-            delta_mid = internal.to(device=device, dtype=dtype)
-            delta = torch.cat((delta_left, delta_mid, delta_right))
-        else:
-            delta = torch.cat((delta_left, delta_right))
+        xk, yk, delta = self._knot_tensors(dtype=dtype, device=device)
 
         flat_outputs = outputs.reshape(-1)
         s_flat = flat_outputs.clone()
@@ -460,6 +449,89 @@ class ExpMonotoneRQSSchedule(BetaSchedule):
         t, dt_dell = self.t_from_ell(ell)
         weight = interval * dt_dell
         return t, weight
+
+    def logbeta_regularization(
+        self,
+        *,
+        t_lo: float | None = None,
+        t_hi: float | None = None,
+        power: float = 0.0,
+    ) -> dict[str, Tensor]:
+        dtype = self.y0.dtype
+        device = self.y0.device
+        zero = torch.zeros((), dtype=dtype, device=device)
+
+        xk, yk, _ = self.rqs._knot_tensors(dtype=dtype, device=device)
+        if xk.numel() < 2:
+            return {"delta": zero, "delta2": zero, "endpoint": zero}
+
+        cfg = self.config
+        default_lo = float(cfg.t_eps)
+        default_hi = float(1.0 - cfg.t_eps)
+        lo_val = max(default_lo, float(t_lo) if t_lo is not None else default_lo)
+        hi_val = min(default_hi, float(t_hi) if t_hi is not None else default_hi)
+        if hi_val <= lo_val:
+            hi_val = lo_val + 1e-6
+        t_lo_tensor = torch.tensor(lo_val, dtype=dtype, device=device)
+        t_hi_tensor = torch.tensor(hi_val, dtype=dtype, device=device)
+
+        t_knots = torch.sigmoid(xk)
+        t_knots = t_knots.clamp(cfg.t_eps, 1.0 - cfg.t_eps)
+        ell_knots = self.y0 + self.a * yk
+
+        delta_s = xk[1:] - xk[:-1]
+        delta_s = delta_s.clamp_min(1e-6)
+        delta_ell = ell_knots[1:] - ell_knots[:-1]
+        first_slopes = delta_ell / delta_s
+        centers = 0.5 * (t_knots[1:] + t_knots[:-1])
+        interval_mask = (centers >= t_lo_tensor) & (centers <= t_hi_tensor)
+        weights = torch.ones_like(centers)
+        if power != 0.0:
+            weights = torch.pow((centers * (1.0 - centers)).clamp_min(1e-6), power)
+
+        if interval_mask.any():
+            weighted = weights[interval_mask]
+            slopes = first_slopes[interval_mask]
+            denom = weighted.sum().clamp_min(1.0)
+            first_penalty = (weighted * slopes.square()).sum() / denom
+        else:
+            first_penalty = zero
+
+        if first_slopes.numel() >= 2:
+            h_prev = delta_s[:-1]
+            h_next = delta_s[1:]
+            diff_slopes = first_slopes[1:] - first_slopes[:-1]
+            denom = (h_prev + h_next).clamp_min(1e-6)
+            second_est = 2.0 * diff_slopes / denom
+            interior_t = t_knots[1:-1]
+            interior_mask = (interior_t >= t_lo_tensor) & (interior_t <= t_hi_tensor)
+            interior_weights = torch.ones_like(interior_t)
+            if power != 0.0:
+                interior_weights = torch.pow(
+                    (interior_t * (1.0 - interior_t)).clamp_min(1e-6), power
+                )
+            if interior_mask.any():
+                w2 = interior_weights[interior_mask]
+                s2 = second_est[interior_mask]
+                denom2 = w2.sum().clamp_min(1.0)
+                second_penalty = (w2 * s2.square()).sum() / denom2
+            else:
+                second_penalty = zero
+        else:
+            second_penalty = zero
+
+        if first_slopes.numel() >= 1:
+            endpoint_penalty = 0.5 * (
+                first_slopes[0].square() + first_slopes[-1].square()
+            )
+        else:
+            endpoint_penalty = zero
+
+        return {
+            "delta": first_penalty,
+            "delta2": second_penalty,
+            "endpoint": endpoint_penalty,
+        }
 
     def beta_and_derivative(self, t: Tensor) -> Tuple[Tensor, Tensor]:
         cfg = self.config

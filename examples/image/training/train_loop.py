@@ -343,6 +343,23 @@ def train_one_epoch(
         if metric_interp_update_step < epoch_offset_interp:
             metric_interp_update_step = epoch_offset_interp
 
+    logbeta_delta_weight = float(getattr(args, "mi_logbeta_reg_delta_weight", 0.0))
+    logbeta_delta2_weight = float(getattr(args, "mi_logbeta_reg_delta2_weight", 0.0))
+    logbeta_endpoint_weight = float(getattr(args, "mi_logbeta_endpoint_weight", 0.0))
+    logbeta_reg_power = float(getattr(args, "mi_logbeta_reg_power", 0.0))
+    logbeta_reg_steps = int(getattr(args, "mi_logbeta_reg_anneal_steps", 0) or 0)
+    logbeta_reg_update_step = int(getattr(args, "_mi_logbeta_reg_step", 0))
+
+    def _logbeta_annealed_weight(base: float) -> float:
+        if base <= 0.0:
+            return 0.0
+        if logbeta_reg_steps <= 0:
+            return base
+        progress = min(
+            max(logbeta_reg_update_step / float(logbeta_reg_steps), 0.0), 1.0
+        )
+        return base * (1.0 - progress)
+
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         if data_iter_step % accum_iter == 0:
             optimizer.zero_grad(set_to_none=True)
@@ -367,45 +384,174 @@ def train_one_epoch(
             logbeta_weights: Optional[torch.Tensor] = None
             mis_uniform_frac: Optional[float] = None
             schedule = getattr(path, "beta_schedule", None)
-            lmin = getattr(args, "mi_logbeta_min", None)
-            lmax = getattr(args, "mi_logbeta_max", None)
-            use_logbeta_sampling = (
-                isinstance(schedule, ExpMonotoneRQSSchedule)
-                and hasattr(schedule, "sample_t_uniform_logbeta")
-                and lmin is not None
-                and lmax is not None
-            )
-            if use_logbeta_sampling and lmax <= lmin:
-                if not getattr(args, "_mi_logbeta_interval_warned", False):
+            schedule_is_exp = isinstance(schedule, ExpMonotoneRQSSchedule)
+            lmin_cfg = getattr(args, "mi_logbeta_min", None)
+            lmax_cfg = getattr(args, "mi_logbeta_max", None)
+            band_lo_cfg = getattr(args, "mi_logbeta_band_t_lo", None)
+            band_hi_cfg = getattr(args, "mi_logbeta_band_t_hi", None)
+            trunc_t_cfg = getattr(args, "mi_logbeta_trunc_t", None)
+
+            lmin_val = float(lmin_cfg) if lmin_cfg is not None else None
+            lmax_val = float(lmax_cfg) if lmax_cfg is not None else None
+            band_lo: Optional[float] = None
+            band_hi: Optional[float] = None
+
+            if schedule_is_exp:
+                cfg_t_eps = float(schedule.config.t_eps)
+                default_lo = cfg_t_eps
+                default_hi = 1.0 - cfg_t_eps
+                band_lo = max(
+                    default_lo,
+                    float(band_lo_cfg) if band_lo_cfg is not None else default_lo,
+                )
+                band_hi = min(
+                    default_hi,
+                    float(band_hi_cfg) if band_hi_cfg is not None else default_hi,
+                )
+                if band_hi <= band_lo:
+                    if not getattr(args, "_mi_logbeta_band_warned", False):
+                        logger.warning(
+                            "Adjusted log-β t-band to maintain ordering (received %.4f, %.4f)",
+                            float(band_lo),
+                            float(band_hi),
+                        )
+                        setattr(args, "_mi_logbeta_band_warned", True)
+                    band_hi = min(default_hi, band_lo + 1e-6)
+
+            uniform_lo = 0.0
+            uniform_hi = 1.0
+            if band_lo is not None and band_hi is not None:
+                uniform_lo = band_lo
+                uniform_hi = band_hi
+
+            trunc_t: Optional[float] = None
+            if trunc_t_cfg is not None:
+                trunc_t = float(trunc_t_cfg)
+                min_trunc = max(
+                    0.0,
+                    float(schedule.config.t_eps) if schedule_is_exp else float(getattr(args, "mi_t_eps", 0.0)),
+                )
+                if trunc_t <= min_trunc:
+                    if not getattr(args, "_mi_logbeta_trunc_warned", False):
+                        logger.warning(
+                            "mi_logbeta_trunc_t=%.4f must exceed %.4f; ignoring truncation.",
+                            trunc_t,
+                            min_trunc,
+                        )
+                        setattr(args, "_mi_logbeta_trunc_warned", True)
+                    trunc_t = None
+                elif trunc_t >= 0.5:
+                    if not getattr(args, "_mi_logbeta_trunc_clip_warned", False):
+                        logger.warning(
+                            "mi_logbeta_trunc_t=%.4f is too close to 0.5; clipping to 0.499.",
+                            trunc_t,
+                        )
+                        setattr(args, "_mi_logbeta_trunc_clip_warned", True)
+                    trunc_t = 0.499
+            if trunc_t is not None:
+                uniform_lo = max(uniform_lo, trunc_t)
+                uniform_hi = min(uniform_hi, 1.0 - trunc_t)
+
+            if uniform_hi <= uniform_lo:
+                if not getattr(args, "_mi_logbeta_uniform_warned", False):
                     logger.warning(
-                        "Ignoring log-β sampling interval with l_min >= l_max (%.4f, %.4f)",
-                        lmin,
-                        lmax,
+                        "Falling back to full [0,1] uniform support because bounds collapsed (%.4f, %.4f).",
+                        uniform_lo,
+                        uniform_hi,
                     )
-                    setattr(args, "_mi_logbeta_interval_warned", True)
-                use_logbeta_sampling = False
+                    setattr(args, "_mi_logbeta_uniform_warned", True)
+                uniform_lo = 0.0
+                uniform_hi = 1.0
+
+            if (uniform_lo > 0.0 or uniform_hi < 1.0) and not getattr(
+                args, "_mi_logbeta_uniform_announced", False
+            ):
+                logger.info(
+                    "MIS uniform support set to [%.4f, %.4f]",
+                    uniform_lo,
+                    uniform_hi,
+                )
+                setattr(args, "_mi_logbeta_uniform_announced", True)
+
+            if schedule_is_exp and band_lo is not None and band_hi is not None:
+                effective_band_lo = max(band_lo, uniform_lo)
+                effective_band_hi = min(band_hi, uniform_hi)
+                if effective_band_hi <= effective_band_lo:
+                    if not getattr(args, "_mi_logbeta_effective_band_warned", False):
+                        logger.warning(
+                            "Uniform truncation [%.4f, %.4f] conflicts with log-β band [%.4f, %.4f];"
+                            " keeping schedule band for log-β proposals.",
+                            uniform_lo,
+                            uniform_hi,
+                            band_lo,
+                            band_hi,
+                        )
+                        setattr(args, "_mi_logbeta_effective_band_warned", True)
+                    effective_band_lo = band_lo
+                    effective_band_hi = band_hi
+                else:
+                    band_lo = effective_band_lo
+                    band_hi = effective_band_hi
+
+                with torch.no_grad():
+                    t_bounds = torch.tensor(
+                        [band_lo, band_hi],
+                        dtype=schedule.y0.dtype,
+                        device=schedule.y0.device,
+                    )
+                    ell_bounds = schedule.ell_from_t(t_bounds)
+                derived_lmin = float(torch.min(ell_bounds).item())
+                derived_lmax = float(torch.max(ell_bounds).item())
+                if lmin_val is None:
+                    lmin_val = derived_lmin
+                else:
+                    lmin_val = max(lmin_val, derived_lmin)
+                if lmax_val is None:
+                    lmax_val = derived_lmax
+                else:
+                    lmax_val = min(lmax_val, derived_lmax)
+
+            use_logbeta_sampling = (
+                schedule_is_exp
+                and hasattr(schedule, "sample_t_uniform_logbeta")
+                and lmin_val is not None
+                and lmax_val is not None
+            )
+            if use_logbeta_sampling:
+                assert lmin_val is not None and lmax_val is not None
+                if lmax_val <= lmin_val:
+                    if not getattr(args, "_mi_logbeta_interval_warned", False):
+                        logger.warning(
+                            "Ignoring log-β sampling interval with l_min >= l_max (%.4f, %.4f)",
+                            lmin_val,
+                            lmax_val,
+                        )
+                        setattr(args, "_mi_logbeta_interval_warned", True)
+                    use_logbeta_sampling = False
 
             mix_alpha_raw = float(getattr(args, "mi_logbeta_mis_alpha", 0.0))
             mix_alpha = float(min(max(mix_alpha_raw, 0.0), 1.0))
 
+            batch_size = samples.shape[0]
+            uniform_span = max(uniform_hi - uniform_lo, 1e-6)
+            t_uniform = uniform_lo + torch.rand(batch_size, device=device) * uniform_span
+
             if use_logbeta_sampling:
-                batch_size = samples.shape[0]
-                # Draw proposals from both distributions (log-β and uniform) and mix via MIS.
+                assert lmin_val is not None and lmax_val is not None
                 t_logbeta, _ = schedule.sample_t_uniform_logbeta(
                     batch_shape=(batch_size,),
-                    lmin=float(lmin),
-                    lmax=float(lmax),
+                    lmin=float(lmin_val),
+                    lmax=float(lmax_val),
                 )
                 t_logbeta = t_logbeta.to(device=device)
-                t_uniform = torch.rand(batch_size, device=device)
                 selector = torch.rand(batch_size, device=device) < mix_alpha
                 t = torch.where(selector, t_uniform, t_logbeta)
 
                 if not getattr(args, "_mi_logbeta_sampling_announced", False):
                     logger.info(
                         "Using uniform log-β sampling with interval [%.4f, %.4f]",
-                        float(lmin),
-                        float(lmax),
+                        float(lmin_val),
+                        float(lmax_val),
                     )
                     setattr(args, "_mi_logbeta_sampling_announced", True)
                 if 0.0 < mix_alpha < 1.0 and not getattr(args, "_mi_logbeta_mis_announced", False):
@@ -416,17 +562,50 @@ def train_one_epoch(
                     )
                     setattr(args, "_mi_logbeta_mis_announced", True)
 
-                interval = max(float(lmax) - float(lmin), 1e-6)
+                interval = max(float(lmax_val) - float(lmin_val), 1e-6)
                 t_for_schedule = t.to(device=t_logbeta.device, dtype=t_logbeta.dtype)
                 beta_vals, beta_deriv = schedule.beta_and_derivative(t_for_schedule)
                 beta_vals = beta_vals.clamp_min(1e-12)
                 q_logbeta = (beta_deriv / beta_vals).clamp_min(1e-12) / interval
                 q_logbeta = q_logbeta.to(device=device, dtype=torch.float32)
-                q_mix = mix_alpha + (1.0 - mix_alpha) * q_logbeta
+                one_over_span = torch.tensor(
+                    1.0 / uniform_span,
+                    device=device,
+                    dtype=q_logbeta.dtype,
+                )
+                q_uniform = torch.zeros_like(q_logbeta)
+                within_uniform = (t >= uniform_lo) & (t <= uniform_hi)
+                q_uniform = torch.where(within_uniform, one_over_span, q_uniform)
+                q_mix = mix_alpha * q_uniform + (1.0 - mix_alpha) * q_logbeta
                 logbeta_weights = (1.0 / q_mix.clamp_min(1e-12)).to(device=device)
                 mis_uniform_frac = float(selector.float().mean().detach().cpu().item())
             else:
-                t = torch.rand(samples.shape[0], device=device)
+                t = t_uniform
+
+            logbeta_reg_penalty: Optional[torch.Tensor] = None
+            logbeta_reg_terms: Optional[dict[str, torch.Tensor]] = None
+            if schedule_is_exp and isinstance(schedule, ExpMonotoneRQSSchedule):
+                reg_terms = schedule.logbeta_regularization(
+                    t_lo=band_lo,
+                    t_hi=band_hi,
+                    power=logbeta_reg_power,
+                )
+                logbeta_reg_terms = reg_terms
+                penalty_components: Optional[torch.Tensor] = None
+                delta_weight_curr = _logbeta_annealed_weight(logbeta_delta_weight)
+                delta2_weight_curr = _logbeta_annealed_weight(logbeta_delta2_weight)
+                endpoint_weight_curr = _logbeta_annealed_weight(logbeta_endpoint_weight)
+                if delta_weight_curr > 0.0:
+                    penalty = reg_terms["delta"] * delta_weight_curr
+                    penalty_components = penalty if penalty_components is None else penalty_components + penalty
+                if delta2_weight_curr > 0.0:
+                    penalty = reg_terms["delta2"] * delta2_weight_curr
+                    penalty_components = penalty if penalty_components is None else penalty_components + penalty
+                if endpoint_weight_curr > 0.0:
+                    penalty = reg_terms["endpoint"] * endpoint_weight_curr
+                    penalty_components = penalty if penalty_components is None else penalty_components + penalty
+                if penalty_components is not None:
+                    logbeta_reg_penalty = penalty_components
 
             # Provide dummy x_0 for signature compatibility (not used by metric-induced path)
             x_0 = torch.zeros_like(samples)
@@ -446,24 +625,18 @@ def train_one_epoch(
             token_loss = torch.nn.functional.cross_entropy(
                 logits_flat, targets_flat, reduction="none"
             )
-            target_tokens = samples.view(samples.shape[0], -1)
-            token_counts = torch.zeros(
-                target_tokens.shape[0],
-                vocab_size,
-                device=target_tokens.device,
-                dtype=torch.float32,
-            )
-            token_counts.scatter_add_(
-                1,
-                target_tokens,
-                torch.ones_like(target_tokens, dtype=torch.float32),
-            )
-            token_probs = token_counts / token_counts.sum(dim=1, keepdim=True).clamp_min(1e-12)
-            token_probs = token_probs.clamp_min(1e-12)
-            target_entropy = -(token_probs * token_probs.log()).sum(dim=1)
+            with torch.no_grad():
+                x1_flat = samples.view(samples.shape[0], -1)
+                path_probs = path.get_prob_distribution_from_tokens(x1_flat, t)
+                path_probs = path_probs.clamp_min(1e-12)
+                per_site_entropy = -(path_probs * path_probs.log()).sum(dim=-1)
+                target_entropy = per_site_entropy.mean(dim=1)
             per_sample_loss = token_loss.view(samples.shape[0], -1).mean(dim=1)
             uw_loss = per_sample_loss.mean().item()
             loss = _importance_weighted_mean(per_sample_loss, logbeta_weights)
+
+            if logbeta_reg_penalty is not None:
+                loss = loss + logbeta_reg_penalty
 
             if use_path_trust_region:
                 x1_flat = samples.view(samples.shape[0], -1)
@@ -508,8 +681,9 @@ def train_one_epoch(
                     wandb_logger = None
 
             if wandb_logger is not None:
+                weighted_entropy = _importance_weighted_mean(target_entropy, logbeta_weights)
                 wandb_log_data = {
-                    "diag/target_entropy_mean": float(target_entropy.mean().detach().cpu().item()),
+                    "diag/target_entropy_mean": float(weighted_entropy.detach().cpu().item()),
                 }
                 if logbeta_weights is not None:
                     w = logbeta_weights.detach()
@@ -517,6 +691,24 @@ def train_one_epoch(
                     wandb_log_data["diag/ess_frac"] = float((ess_num / (w.numel() + 1e-12)).item())
                 if mis_uniform_frac is not None:
                     wandb_log_data["diag/mis_uniform_frac"] = mis_uniform_frac
+                if logbeta_reg_penalty is not None:
+                    wandb_log_data["loss/logbeta_reg_penalty"] = float(
+                        logbeta_reg_penalty.detach().cpu().item()
+                    )
+                    if logbeta_reg_terms is not None:
+                        wandb_log_data.update(
+                            {
+                                "loss/logbeta_reg_delta": float(
+                                    logbeta_reg_terms["delta"].detach().cpu().item()
+                                ),
+                                "loss/logbeta_reg_delta2": float(
+                                    logbeta_reg_terms["delta2"].detach().cpu().item()
+                                ),
+                                "loss/logbeta_reg_endpoint": float(
+                                    logbeta_reg_terms["endpoint"].detach().cpu().item()
+                                ),
+                            }
+                        )
 
                 if data_iter_step % (PRINT_FREQUENCY * 10) == 0:
                     max_points = int(getattr(args, "wandb_entropy_max_points", 4096) or 4096)
@@ -758,6 +950,8 @@ def train_one_epoch(
             and path.learnable_metric is not None
         ):
             metric_ema.update(path.learnable_metric)
+        if apply_update and not grad_step_skipped:
+            logbeta_reg_update_step += 1
         if apply_update:
             if use_path_trust_region:
                 if grad_step_skipped:
@@ -896,12 +1090,37 @@ def train_one_epoch(
                                 and current_metric_interp is not None
                                 else {}
                             ),
+                            **(
+                                {
+                                    "train/logbeta_reg_penalty": float(
+                                        logbeta_reg_penalty.detach().cpu()
+                                    ),
+                                    **(
+                                        {
+                                            "train/logbeta_reg_delta": float(
+                                                logbeta_reg_terms["delta"].detach().cpu()
+                                            ),
+                                            "train/logbeta_reg_delta2": float(
+                                                logbeta_reg_terms["delta2"].detach().cpu()
+                                            ),
+                                            "train/logbeta_reg_endpoint": float(
+                                                logbeta_reg_terms["endpoint"].detach().cpu()
+                                            ),
+                                        }
+                                        if logbeta_reg_terms is not None
+                                        else {}
+                                    ),
+                                }
+                                if logbeta_reg_penalty is not None
+                                else {}
+                            ),
                         },
                         step=global_step,
                     )
                 except Exception:
                     pass
 
+    setattr(args, "_mi_logbeta_reg_step", logbeta_reg_update_step)
     lr_schedule.step()
     stats = {"loss": float(epoch_loss.compute().detach().cpu())}
     if use_path_trust_region and kl_updates_total > 0 and kl_metric and kl_penalty_metric:
@@ -929,3 +1148,4 @@ def train_one_epoch(
             if hasattr(args, attr):
                 delattr(args, attr)
     return stats
+

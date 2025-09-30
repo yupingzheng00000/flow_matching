@@ -376,6 +376,71 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_logbeta_reg_delta_weight",
+        default=0.0,
+        type=float,
+        help=(
+            "Weight for the first-order smoothness penalty on log β knots (∑(Δℓ/Δs)^2)."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_reg_delta2_weight",
+        default=0.0,
+        type=float,
+        help=(
+            "Weight for the second-order smoothness penalty on log β knots (∑(Δ^2ℓ/Δs^2)^2)."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_reg_power",
+        default=0.0,
+        type=float,
+        help=(
+            "Power-law exponent for reweighting log β knot penalties; positive values emphasize central knots."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_endpoint_weight",
+        default=0.0,
+        type=float,
+        help=(
+            "Weight for penalizing the spline endpoint slopes to prevent exploding dℓ/dt near t ∈ {0,1}."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_reg_anneal_steps",
+        default=0,
+        type=int,
+        help=(
+            "Number of optimizer steps to linearly anneal the log β smoothness penalties towards zero."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_trunc_t",
+        default=None,
+        type=float,
+        help=(
+            "Optional truncation applied to the sampling domain; restrict t to [mi_logbeta_trunc_t, 1-mi_logbeta_trunc_t] "
+            "when drawing log-β proposals (must be greater than mi_t_eps)."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_band_t_lo",
+        default=None,
+        type=float,
+        help=(
+            "Lower cutoff in t-space for computing the active log-β sampling range."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_band_t_hi",
+        default=None,
+        type=float,
+        help=(
+            "Upper cutoff in t-space for computing the active log-β sampling range."
+        ),
+    )
+    parser.add_argument(
         "--mi_logbeta_mis_alpha",
         default=0.3,
         type=float,

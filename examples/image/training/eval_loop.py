@@ -193,20 +193,36 @@ def _build_metric_infer_time_grid(
         if isinstance(schedule, ExpMonotoneRQSSchedule):
             ell_min = getattr(args, "mi_logbeta_min", None)
             ell_max = getattr(args, "mi_logbeta_max", None)
+            band_lo_cfg = getattr(args, "mi_logbeta_band_t_lo", None)
+            band_hi_cfg = getattr(args, "mi_logbeta_band_t_hi", None)
+            cfg_t_eps = float(schedule.config.t_eps)
+            default_lo = cfg_t_eps
+            default_hi = 1.0 - cfg_t_eps
+            band_lo = max(
+                default_lo,
+                float(band_lo_cfg) if band_lo_cfg is not None else default_lo,
+            )
+            band_hi = min(
+                default_hi,
+                float(band_hi_cfg) if band_hi_cfg is not None else default_hi,
+            )
+            if band_hi <= band_lo:
+                band_hi = min(default_hi, band_lo + 1e-6)
             with torch.no_grad():
-                if ell_min is None or ell_max is None:
-                    t_bounds = torch.tensor(
-                        [schedule.config.t_eps, 1.0 - schedule.config.t_eps],
-                        device=schedule.y0.device,
-                        dtype=schedule.y0.dtype,
-                    )
-                    ell_bounds = schedule.ell_from_t(t_bounds)
-                    if ell_min is None:
-                        ell_min = float(ell_bounds[0].item())
-                    if ell_max is None:
-                        ell_max = float(ell_bounds[1].item())
-            ell_min = float(ell_min)
-            ell_max = float(ell_max)
+                t_bounds = torch.tensor(
+                    [band_lo, band_hi],
+                    device=schedule.y0.device,
+                    dtype=schedule.y0.dtype,
+                )
+                ell_bounds = schedule.ell_from_t(t_bounds)
+                derived_min = float(torch.min(ell_bounds).item())
+                derived_max = float(torch.max(ell_bounds).item())
+            ell_min = (
+                derived_min if ell_min is None else max(float(ell_min), derived_min)
+            )
+            ell_max = (
+                derived_max if ell_max is None else min(float(ell_max), derived_max)
+            )
             if not math.isfinite(ell_min) or not math.isfinite(ell_max):
                 raise ValueError("mi_logbeta_min/max must be finite when using uniform_logbeta grid")
             if ell_max <= ell_min:

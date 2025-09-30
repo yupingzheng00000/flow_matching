@@ -462,6 +462,22 @@ class TestExpMonotoneRQSchedule(unittest.TestCase):
         self.assertTrue(torch.all(t <= 1.0 - config.t_eps))
         self.assertTrue(torch.all(weight > 0))
 
+    def test_logbeta_regularization_returns_finite_scalars(self):
+        config = ExpMonotoneRQSConfig(num_bins=6, tail_bound=3.0, init_c=1.2, init_a=2.1)
+        schedule = ExpMonotoneRQSSchedule(config=config)
+
+        base_terms = schedule.logbeta_regularization()
+        narrow_terms = schedule.logbeta_regularization(t_lo=0.2, t_hi=0.8)
+        weighted_terms = schedule.logbeta_regularization(power=1.5)
+
+        for terms in (base_terms, narrow_terms, weighted_terms):
+            for key in ("delta", "delta2", "endpoint"):
+                value = terms[key]
+                self.assertIsInstance(value, torch.Tensor)
+                self.assertEqual(value.shape, torch.Size([]))
+                self.assertTrue(torch.isfinite(value))
+        
+
 
 class TestExpRQSInverse(unittest.TestCase):
     def test_inverse_round_trip(self):
