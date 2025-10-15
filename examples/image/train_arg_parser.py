@@ -141,6 +141,34 @@ def get_args_parser():
     )
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--resume", default="", help="resume from checkpoint")
+    parser.add_argument(
+        "--mi_init_metric_from_checkpoint",
+        default="",
+        type=str,
+        help=(
+            "Path to checkpoint (.pt/.pth) to initialize the learnable metric from. "
+            "Only loads the metric codes, not the model or optimizer. "
+            "Use with --mi_freeze_metric to freeze the loaded metric."
+        ),
+    )
+    parser.add_argument(
+        "--mi_freeze_metric",
+        action="store_true",
+        help=(
+            "Freeze the learnable metric (set requires_grad=False). "
+            "Typically used with --mi_init_metric_from_checkpoint to load a pre-trained metric "
+            "and only train the UNet. This tests if UNet can adapt to a fixed metric geometry."
+        ),
+    )
+    parser.add_argument(
+        "--mi_eval_use_raw_metric",
+        action="store_true",
+        help=(
+            "Use raw student metric (instead of EMA teacher) during evaluation. "
+            "By default, evaluation uses EMA metric if available (smoother, more stable). "
+            "Set this flag to use the raw student metric for evaluation (actual trained version)."
+        ),
+    )
 
     parser.add_argument(
         "--start_epoch",
@@ -148,6 +176,33 @@ def get_args_parser():
         type=int,
         metavar="N",
         help="start epoch (used when resumed from checkpoint)",
+    )
+    # Display-only epoch mapping (does NOT affect training control flow)
+    parser.add_argument(
+        "--epoch_display_offset",
+        default=None,
+        type=int,
+        help=(
+            "Additive offset for display epoch: display_epoch = epoch + offset. "
+            "This only affects logs/metrics/optional symlinks, not sampler, eval triggers, or resume."
+        ),
+    )
+    parser.add_argument(
+        "--force_display_start_epoch",
+        default=None,
+        type=int,
+        help=(
+            "Override to force the first displayed epoch after resume to this value. "
+            "Effective offset will be computed as (force_display_start_epoch - start_epoch)."
+        ),
+    )
+    parser.add_argument(
+        "--save_display_epoch_symlinks",
+        action="store_true",
+        help=(
+            "When saving checkpoints, also create a symlink named with the display epoch number "
+            "(e.g., checkpoint-4499.pth -> checkpoint-5499.pth)."
+        ),
     )
     parser.add_argument(
         "--eval_only", action="store_true", help="No training, only run evaluation"
@@ -265,6 +320,109 @@ def get_args_parser():
         choices=["lp", "cosine"],
         type=str,
         help="Metric to use for the metric-induced path.",
+    )
+    parser.add_argument(
+        "--mi_learnable_lut",
+        action="store_true",
+        help="Enable a learnable per-channel scalar LUT inside the metric-induced path.",
+    )
+    parser.add_argument(
+        "--mi_lut_num_channels",
+        default=3,
+        type=int,
+        help="Number of channels (e.g., 3 for RGB) when using a learnable LUT.",
+    )
+    parser.add_argument(
+        "--mi_lut_emb_dim",
+        default=1,
+        type=int,
+        help="Embedding dimension for learnable LUT (1=scalar, >1=vector embeddings).",
+    )
+    parser.add_argument(
+        "--mi_lut_share_channels",
+        action="store_true",
+        help="Share a single LUT across all channels (instead of one per channel).",
+    )
+    parser.add_argument(
+        "--mi_lut_renorm_init_norm",
+        action="store_true",
+        help=(
+            "Renormalize LUT weights to the initialization Frobenius norm every forward pass. "
+            "Preserves gradients and keeps the effective geometry aligned with the linear init."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_bounded_residual_scale",
+        action="store_true",
+        help=(
+            "Use bounded residual scale parameterization: s = s_0 * (1 + ε * tanh(c)). "
+            "c is learnable per channel, L2 penalty keeps it near 0. "
+            "Trust region approach prevents extreme scale changes."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_scale_baseline",
+        default=1.0,
+        type=float,
+        help="Baseline scale s_0 in bounded residual parameterization.",
+    )
+    parser.add_argument(
+        "--mi_lut_scale_epsilon",
+        default=0.25,
+        type=float,
+        help="Maximum deviation ε in bounded residual parameterization (s ∈ [s_0*(1-ε), s_0*(1+ε)]).",
+    )
+    parser.add_argument(
+        "--mi_lut_scale_penalty_weight",
+        default=0.01,
+        type=float,
+        help="L2 penalty weight on scale parameter c to keep it near 0.",
+    )
+    parser.add_argument(
+        "--mi_use_normalized_distance",
+        action="store_true",
+        help=(
+            "Use normalized distance: \tilde d = ||E[v]-E[x_1]||_2 / \sqrt{m} "
+            "where m is the embedding dimension."
+        ),
+    )
+    parser.add_argument(
+        "--mi_freeze_lut",
+        action="store_true",
+        help="Freeze the learnable LUT parameters (requires_grad=False).",
+    )
+    parser.add_argument(
+        "--mi_lut_lr_scale",
+        default=0.1,
+        type=float,
+        help="Learning rate scale applied to learnable LUT parameters.",
+    )
+    parser.add_argument(
+        "--mi_lut_weight_decay",
+        default=1e-4,
+        type=float,
+        help="Weight decay applied to learnable LUT parameters.",
+    )
+    parser.add_argument(
+        "--mi_lut_init_method",
+        default="linear",
+        choices=["linear", "small_noise_qr"],
+        type=str,
+        help=(
+            "Initialization method for learnable LUT weights. "
+            "'linear': Standard linear spacing with small noise (default). "
+            "'small_noise_qr': QR decomposition with controlled noise for high-dim embeddings."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_init_noise_scale",
+        default=0.01,
+        type=float,
+        help=(
+            "Noise scale for small_noise_qr initialization. "
+            "Controls perturbation strength in higher dimensions (σ parameter). "
+            "Recommended: 0.01-0.05 for balanced warm start vs orthogonality."
+        ),
     )
     parser.add_argument(
         "--mi_lp",
@@ -450,6 +608,83 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_logbeta_eval_alpha",
+        default=None,
+        type=float,
+        help=(
+            "Mixture coefficient α for evaluation grid when using uniform_logbeta. "
+            "If None, uses the training value from --mi_logbeta_mis_alpha. "
+            "Set to 0 for pure log-β sampling, 0.5 for balanced 50-50 mix, "
+            "1.0 for pure uniform-t sampling."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_sampling_strategy",
+        default="uniform",
+        choices=["uniform", "log_normal_broad", "log_normal_focused"],
+        type=str,
+        help=(
+            "Sampling strategy in log-β space for uniform_logbeta grid. "
+            "'uniform': uniform distribution in log-β. "
+            "'log_normal_broad': Gaussian centered on full interval (μ=0, σ=2.5 for [-5,5]). "
+            "'log_normal_focused': Gaussian concentrated on informative region (auto-computed)."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_lognormal_mu",
+        default=None,
+        type=float,
+        help=(
+            "Mean (μ) of log-normal distribution in log-β space. "
+            "If None: auto-computed based on strategy. "
+            "  - 'broad': μ = (ℓ_max + ℓ_min) / 2 (center of full interval). "
+            "  - 'focused': μ = center of informative region in log-β. "
+            "Manual override: set explicit value (e.g., 0.0 for β=1)."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_lognormal_sigma",
+        default=None,
+        type=float,
+        help=(
+            "Standard deviation (σ) of log-normal distribution in log-β space. "
+            "If None: auto-computed based on strategy. "
+            "  - 'broad': σ = (ℓ_max - ℓ_min) / 4 (4σ covers full interval). "
+            "  - 'focused': σ = (informative_width) / 2 (1σ covers informative). "
+            "Manual override: set explicit value (e.g., 2.5 for broad coverage)."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_informative_H_min_ratio",
+        default=0.2,
+        type=float,
+        help=(
+            "Lower bound of informative region as ratio of H_max. "
+            "Informative region: H ∈ [ratio_min × H_max, ratio_max × H_max]. "
+            "Used for auto-computing focused log-normal parameters."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_informative_H_max_ratio",
+        default=0.8,
+        type=float,
+        help=(
+            "Upper bound of informative region as ratio of H_max. "
+            "Informative region: H ∈ [ratio_min × H_max, ratio_max × H_max]. "
+            "Used for auto-computing focused log-normal parameters."
+        ),
+    )
+    parser.add_argument(
+        "--mi_logbeta_use_is",
+        action="store_true",
+        help=(
+            "Enable importance sampling (IS) for log-β proposals. "
+            "When disabled (default), samples are drawn from log-β distribution "
+            "without reweighting (logbeta_weights = None). "
+            "When enabled, applies IS weights: w(β) = 1/q(β)."
+        ),
+    )
+    parser.add_argument(
         "--mi_infer_grid",
         default="uniform_t",
         choices=["uniform_t", "uniform_logbeta"],
@@ -525,6 +760,21 @@ def get_args_parser():
         help="Upper clamp for the adaptive schedule KL weight.",
     )
     parser.add_argument(
+        "--mi_geodesic_energy_weight",
+        default=0.0,
+        type=float,
+        help=(
+            "Weight (λ) for geodesic energy regularization in metric-induced path training. "
+            "Penalizes ||v_t||²_M where v_t is the velocity in the learned metric embedding space. "
+            "This encourages smoother, lower-energy trajectories that follow geodesics under the "
+            "learned Mahalanobis metric, reducing entropy of intermediate distributions p(x_t|x_1,t). "
+            "Recommended values: 0.01-0.1 (start conservative, e.g., 0.05). "
+            "Expected effects: 10-20%% entropy reduction (target: 4.3 → 3.5-4.0), improved FID. "
+            "Set to 0.0 to disable. The penalty is scaled by the current metric interpolation λ, "
+            "so it only applies when the learned metric is active (λ > 0)."
+        ),
+    )
+    parser.add_argument(
         "--diag_enable",
         action="store_true",
         help="Run stability diagnostics (weights, activations, attention) during evaluation.",
@@ -566,6 +816,15 @@ def get_args_parser():
         help="Relative learning rate scale applied to the β schedule parameter group.",
     )
     parser.add_argument(
+        "--mi_freeze_beta_schedule",
+        action="store_true",
+        help=(
+            "Freeze the β schedule parameters during training (no gradient updates). "
+            "When enabled, schedule EMA and KL controller are disabled. "
+            "Use this to train only the UNet with a fixed schedule."
+        ),
+    )
+    parser.add_argument(
         "--mi_learnable_metric",
         action="store_true",
         help="Enable a learnable Mahalanobis metric for the metric-induced path.",
@@ -587,6 +846,12 @@ def get_args_parser():
         default=0.1,
         type=float,
         help="Relative learning rate scale applied to the learnable metric parameter group.",
+    )
+    parser.add_argument(
+        "--mi_metric_weight_decay",
+        default=0.0,
+        type=float,
+        help="Weight decay (L2 regularization) applied to learnable metric parameters.",
     )
     parser.add_argument(
         "--mi_metric_use_ema",
@@ -655,10 +920,73 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_metric_detailed_analysis",
+        action="store_true",
+        help=(
+            "Run comprehensive metric analysis during evaluation including "
+            "t-SNE/UMAP visualizations, distance distributions, and nearest neighbors. "
+            "This provides deep insights into what the metric learned."
+        ),
+    )
+    parser.add_argument(
+        "--mi_metric_use_umap",
+        action="store_true",
+        default=False,
+        help=(
+            "Use UMAP for dimensionality reduction in detailed metric analysis. "
+            "UMAP is faster and better preserves global structure than t-SNE. "
+            "Enabled by default when --mi_metric_detailed_analysis is set."
+        ),
+    )
+    parser.add_argument(
+        "--mi_metric_use_tsne",
+        action="store_true",
+        default=False,
+        help=(
+            "Use t-SNE for dimensionality reduction in detailed metric analysis. "
+            "t-SNE emphasizes local structure and clusters. "
+            "Enabled by default when --mi_metric_detailed_analysis is set."
+        ),
+    )
+    parser.add_argument(
         "--mi_metric_interp_start",
         default=0.0,
         type=float,
         help="Initial interpolation weight between the fixed Lp distance and the learned metric.",
+    )
+    parser.add_argument(
+        "--mi_metric_lr_decay_start",
+        default=3500,
+        type=int,
+        help=(
+            "Epoch to start decaying the metric learning rate. "
+            "This allows the metric to stabilize while UNet continues adapting. "
+            "Default: 3500 (75%% of 4500 epoch training)."
+        ),
+    )
+    parser.add_argument(
+        "--mi_metric_lr_decay_mode",
+        default="cosine",
+        type=str,
+        choices=["cosine", "exp", "step", "none"],
+        help=(
+            "Learning rate decay schedule for the metric parameters. "
+            "cosine: smooth cosine annealing (recommended), "
+            "exp: exponential decay, "
+            "step: step-wise decay at fixed epochs, "
+            "none: no decay. "
+            "Default: cosine."
+        ),
+    )
+    parser.add_argument(
+        "--mi_metric_lr_decay_end_ratio",
+        default=0.1,
+        type=float,
+        help=(
+            "Final learning rate ratio for metric parameters at the end of training. "
+            "With cosine/exp decay, the metric LR will decay from base_lr to base_lr*end_ratio. "
+            "Default: 0.1 (decay to 10%%)."
+        ),
     )
     parser.add_argument(
         "--mi_metric_interp_end",

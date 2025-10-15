@@ -7,27 +7,23 @@
 
 """
 Path bootstrap
-Ensures the top-level 'flow_matching' package is importable when running
-this script from within 'examples/image' (e.g., via torchrun).
-"""
-import os as _os
-import sys as _sys
-from pathlib import Path as _Path
-
 _this_dir = _Path(__file__).resolve().parent
 # Go up three levels: .../flow_matching/examples/image -> .../flow_matching
 _pkg_root = _this_dir.parents[1]
 if str(_pkg_root) not in _sys.path:
     _sys.path.insert(0, str(_pkg_root))
 
+"""
+
 import datetime
 import json
 import logging
+import gc
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -133,6 +129,62 @@ def main(args):
     metric_ema: Optional[LearnableMetricEMA] = None
     kl_controller: Optional[AdaptiveKLController] = None
     metric_path: Optional[MetricInducedGibbsProbPath] = None
+    
+    # Load metric from checkpoint if specified (before creating path)
+    loaded_metric_codes: Optional[torch.Tensor] = None
+    loaded_metric_source: str = "unknown"
+    
+    if getattr(args, "mi_init_metric_from_checkpoint", ""):
+        checkpoint_path = args.mi_init_metric_from_checkpoint
+        logger.info(f"[Freeze Metric] Loading metric from checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        
+        # PRIORITY 1: Try EMA teacher version first (this is what eval uses!)
+        # This ensures consistency with reported FID scores
+        if "path" in checkpoint and "learnable_metric_ema" in checkpoint["path"]:
+            ema_state = checkpoint["path"]["learnable_metric_ema"]
+            if "teacher" in ema_state and "codes" in ema_state["teacher"]:
+                loaded_metric_codes = ema_state["teacher"]["codes"]
+                loaded_metric_source = "EMA teacher"
+                logger.info(f"  ✓ Loaded EMA teacher metric codes: {loaded_metric_codes.shape}")
+                logger.info("  → This is the version used during evaluation (consistent with reported FID)")
+        
+        # PRIORITY 2: Fall back to raw student metric if no EMA
+        if loaded_metric_codes is None and "path" in checkpoint and "learnable_metric" in checkpoint["path"]:
+            metric_state = checkpoint["path"]["learnable_metric"]
+            loaded_metric_source = "raw student"
+            logger.info("  ⚠ Warning: This may differ from eval metric (EMA teacher)")
+            if "codes" in metric_state:
+                loaded_metric_codes = metric_state["codes"]
+                logger.info(f"  ✓ Loaded raw student metric codes: {loaded_metric_codes.shape}")
+        
+        # PRIORITY 3: Try model state dict
+        if loaded_metric_codes is None and "model" in checkpoint:
+            model_state = checkpoint["model"]
+            metric_keys = [k for k in model_state.keys() if "metric" in k.lower() and "codes" in k]
+            if metric_keys:
+                loaded_metric_codes = model_state[metric_keys[0]]
+                loaded_metric_source = f"model.{metric_keys[0]}"
+                logger.info(f"  ✓ Loaded metric codes from {metric_keys[0]}: {loaded_metric_codes.shape}")
+        
+        # If still not found, raise error
+        if loaded_metric_codes is None:
+            available_keys = list(checkpoint.keys())
+            if "path" in checkpoint:
+                path_keys = list(checkpoint["path"].keys())
+                raise KeyError(
+                    f"Could not find metric codes in checkpoint.\n"
+                    f"Available top-level keys: {available_keys}\n"
+                    f"Available path keys: {path_keys}"
+                )
+            else:
+                raise KeyError(f"Checkpoint structure not recognized. Available keys: {available_keys}")
+        
+        if args.mi_freeze_metric:
+            logger.info("[Freeze Metric] Metric will be FROZEN (requires_grad=False)")
+            logger.info(f"[Freeze Metric] Loaded from: {loaded_metric_source}")
+            logger.info("[Freeze Metric] Only UNet parameters will be trained")
+    
     if getattr(args, "ko_metric_induced", False):
         embed_range = "pm1" if args.mi_embed_range == "pm1" else "unit"
         if getattr(args, "mi_learnable_beta", False):
@@ -194,12 +246,27 @@ def main(args):
         args.mi_gumbel_tau_start = float(tau_start)
         args.mi_gumbel_tau_end = float(tau_end)
 
+        if getattr(args, "mi_learnable_metric", False) and getattr(args, "mi_learnable_lut", False):
+            raise ValueError("Cannot enable both --mi_learnable_metric and --mi_learnable_lut at the same time.")
+
         metric_kwargs = {}
         if getattr(args, "mi_learnable_metric", False):
             metric_kwargs.update(
                 learnable_metric_dim=int(getattr(args, "mi_metric_dim", 0)),
                 learnable_metric_diag_eps=float(getattr(args, "mi_metric_diag_eps", 1e-4)),
                 metric_interp_lambda=float(getattr(args, "mi_metric_interp_start", 0.0)),
+            )
+        if getattr(args, "mi_learnable_lut", False):
+            metric_kwargs.update(
+                learnable_lut=True,
+                lut_num_channels=int(getattr(args, "mi_lut_num_channels", 3)),
+                lut_emb_dim=int(getattr(args, "mi_lut_emb_dim", 1)),
+                lut_share_across_channels=bool(getattr(args, "mi_lut_share_channels", False)),
+                lut_renorm_to_init_norm=bool(getattr(args, "mi_lut_renorm_init_norm", False)),
+                lut_bounded_residual_scale=bool(getattr(args, "mi_lut_bounded_residual_scale", False)),
+                lut_scale_baseline=float(getattr(args, "mi_lut_scale_baseline", 1.0)),
+                lut_scale_epsilon=float(getattr(args, "mi_lut_scale_epsilon", 0.25)),
+                use_normalized_distance=bool(getattr(args, "mi_use_normalized_distance", False)),
             )
         args.mi_metric_interp_start = float(getattr(args, "mi_metric_interp_start", 0.0))
         args.mi_metric_interp_end = float(getattr(args, "mi_metric_interp_end", 1.0))
@@ -221,11 +288,37 @@ def main(args):
             gumbel_hard=True,
             **metric_kwargs,
         )
+        
+        # Apply loaded metric codes if available
+        if loaded_metric_codes is not None:
+            if metric_path.learnable_metric is not None:
+                logger.info("[Freeze Metric] Applying loaded metric codes to path...")
+                # Load the codes
+                with torch.no_grad():
+                    metric_path.learnable_metric.codes.copy_(loaded_metric_codes.to(device))
+                logger.info(f"  ✓ Metric codes loaded: {metric_path.learnable_metric.codes.shape}")
+                
+                # Freeze if requested
+                if args.mi_freeze_metric:
+                    metric_path.learnable_metric.codes.requires_grad = False
+                    logger.info("  ✓ Metric codes FROZEN (requires_grad=False)")
+                    logger.info("  → Only UNet will be trained, metric geometry is fixed")
+                    
+                    # Force lambda to 1.0 (use learned metric fully)
+                    metric_path.set_metric_interpolation_lambda(1.0)
+                    logger.info("  → Metric interpolation lambda forced to 1.0")
+            else:
+                logger.warning("[Freeze Metric] Loaded metric codes but path has no learnable_metric!")
+        
         if getattr(args, "mi_learnable_metric", False):
             metric_path.set_metric_interpolation_lambda(args.mi_metric_interp_start)
         kl_target = float(getattr(args, "mi_beta_kl_target", 0.0))
         kl_init_weight = float(getattr(args, "mi_beta_kl_init_weight", 0.0))
 
+        # Create EMA even when schedule is frozen (EMA provides smooth training target)
+        # Freeze only prevents gradient updates to raw parameters
+        freeze_schedule = getattr(args, "mi_freeze_beta_schedule", False)
+        
         if (
             getattr(args, "mi_learnable_beta", False)
             and getattr(args, "mi_beta_use_ema", False)
@@ -237,6 +330,10 @@ def main(args):
             )
             beta_schedule_ema.to(device=device)
             beta_schedule_ema.synchronize_from(metric_path.beta_schedule)
+            if freeze_schedule:
+                logger.info("Created β schedule EMA (schedule params frozen, EMA provides smooth training target)")
+            else:
+                logger.info("Created β schedule EMA (will track student schedule)")
 
         if (
             getattr(args, "mi_learnable_metric", False)
@@ -250,10 +347,13 @@ def main(args):
             metric_ema.to(device=device)
             metric_ema.synchronize_from(metric_path.learnable_metric)
 
+        # KL controller monitors EMA vs raw schedule divergence
+        # But in freeze mode, raw has no gradient → KL penalty has no effect → disable it
         if (
             kl_target > 0.0
             and kl_init_weight > 0.0
             and (beta_schedule_ema is not None or metric_ema is not None)
+            and not freeze_schedule  # Disable KL in freeze mode
         ):
             kl_controller = AdaptiveKLController(
                 target=kl_target,
@@ -264,6 +364,24 @@ def main(args):
                 max_weight=float(getattr(args, "mi_beta_kl_max_weight", 1e4)),
             )
             kl_controller.to(device=device)
+            logger.info("Enabled schedule KL trust region")
+        elif freeze_schedule and kl_target > 0.0:
+            # CHANGED: Enable KL controller even when schedule is frozen
+            # Reason: We now have learnable metric that can benefit from KL penalty
+            # The penalty will affect the metric parameters (not schedule)
+            kl_controller = AdaptiveKLController(
+                target=kl_target,
+                init_weight=kl_init_weight,
+                adapt_rate=float(getattr(args, "mi_beta_kl_adapt_rate", 2.0)),
+                tolerance=float(getattr(args, "mi_beta_kl_tolerance", 1.5)),
+                min_weight=float(getattr(args, "mi_beta_kl_min_weight", 1e-4)),
+                max_weight=float(getattr(args, "mi_beta_kl_max_weight", 1e4)),
+            )
+            kl_controller.to(device=device)
+            logger.info(
+                "Freeze mode: KL controller ENABLED (will regularize learnable metric, "
+                "even though schedule is frozen)"
+            )
 
     # define the model
     logger.info("Initializing Model")
@@ -300,28 +418,77 @@ def main(args):
     optimizer_param_groups = [{"params": list(model_without_ddp.parameters())}]
     extra_modules = {}
     if metric_path is not None:
+        freeze_schedule = getattr(args, "mi_freeze_beta_schedule", False)
+        
+        # Only add schedule parameters to optimizer if not frozen
         schedule_params = list(metric_path.schedule_parameters())
-        if schedule_params:
+        if schedule_params and not freeze_schedule:
             schedule_lr_scale = float(getattr(args, "mi_beta_lr_scale", 1.0))
             optimizer_param_groups.append(
                 {
                     "params": schedule_params,
                     "lr": args.lr * schedule_lr_scale,
+                    "name": "beta_schedule",
                 }
             )
+            logger.info(f"Added {len(schedule_params)} schedule parameters to optimizer (lr_scale={schedule_lr_scale})")
+        elif schedule_params and freeze_schedule:
+            # Freeze schedule parameters
+            for param in schedule_params:
+                param.requires_grad = False
+            logger.info(f"FROZEN {len(schedule_params)} schedule parameters (excluded from optimizer)")
+        
         metric_params = list(metric_path.metric_parameters())
         if metric_params:
-            metric_lr_scale = float(getattr(args, "mi_metric_lr_scale", 0.1))
-            optimizer_param_groups.append(
-                {
-                    "params": metric_params,
-                    "lr": args.lr * metric_lr_scale,
-                }
-            )
+            freeze_metric = getattr(args, "mi_freeze_metric", False)
+            if not freeze_metric:
+                metric_lr_scale = float(getattr(args, "mi_metric_lr_scale", 0.1))
+                metric_weight_decay = float(getattr(args, "mi_metric_weight_decay", 1e-4))
+                optimizer_param_groups.append(
+                    {
+                        "params": metric_params,
+                        "lr": args.lr * metric_lr_scale,
+                        "weight_decay": metric_weight_decay,
+                        "name": "learnable_metric",
+                    }
+                )
+                logger.info(
+                    f"Added {len(metric_params)} metric parameters to optimizer (lr_scale={metric_lr_scale}, weight_decay={metric_weight_decay})"
+                )
+            else:
+                for param in metric_params:
+                    param.requires_grad = False
+                logger.info(f"EXCLUDED {len(metric_params)} metric parameters from optimizer (frozen)")
+                logger.info("  → Only model (UNet) parameters will be optimized")
+
+        lut_params = list(metric_path.lut_parameters())
+        if lut_params:
+            freeze_lut = getattr(args, "mi_freeze_lut", False)
+            if not freeze_lut:
+                lut_lr_scale = float(getattr(args, "mi_lut_lr_scale", 0.1))
+                lut_weight_decay = float(getattr(args, "mi_lut_weight_decay", 1e-4))
+                optimizer_param_groups.append(
+                    {
+                        "params": lut_params,
+                        "lr": args.lr * lut_lr_scale,
+                        "weight_decay": lut_weight_decay,
+                        "name": "learnable_lut",
+                    }
+                )
+                logger.info(
+                    f"Added {len(lut_params)} LUT parameters to optimizer (lr_scale={lut_lr_scale}, weight_decay={lut_weight_decay})"
+                )
+            else:
+                for param in lut_params:
+                    param.requires_grad = False
+                logger.info(f"EXCLUDED {len(lut_params)} LUT parameters from optimizer (frozen)")
+                logger.info("  → Only model (UNet) parameters will be optimized")
         if isinstance(metric_path.beta_schedule, nn.Module):
             extra_modules["metric_beta_schedule"] = metric_path.beta_schedule
         if metric_path.learnable_metric is not None:
             extra_modules["metric_learnable_metric"] = metric_path.learnable_metric
+        if metric_path.learnable_lut is not None:
+            extra_modules["metric_learnable_lut"] = metric_path.learnable_lut
         if beta_schedule_ema is not None:
             extra_modules["metric_beta_schedule_ema"] = beta_schedule_ema
         if metric_ema is not None:
@@ -390,11 +557,37 @@ def main(args):
         except Exception as e:
             logger.warning(f"wandb not enabled ({e})")
 
-    logger.info(f"Start from {args.start_epoch} to {args.epochs} epochs")
+    # Compute display-only epoch mapping
+    display_offset: Optional[int] = None
+    if getattr(args, "force_display_start_epoch", None) is not None:
+        try:
+            display_offset = int(args.force_display_start_epoch) - int(args.start_epoch)
+        except Exception:
+            display_offset = None
+    elif getattr(args, "epoch_display_offset", None) is not None:
+        try:
+            display_offset = int(args.epoch_display_offset)
+        except Exception:
+            display_offset = None
+
+    if display_offset is not None:
+        logger.info(
+            f"Epoch display mapping enabled: display_epoch = epoch + ({display_offset}). "
+            f"Raw training range: [{args.start_epoch}, {args.epochs})"
+        )
+    else:
+        logger.info(f"Start from {args.start_epoch} to {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
+        display_epoch = epoch + (display_offset or 0)
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
+        
+        # Adjust metric learning rate (before training if enabled)
+        if not args.eval_only:
+            from training.train_loop import adjust_metric_learning_rate
+            adjust_metric_learning_rate(optimizer, epoch, args)
+        
         if not args.eval_only:
             train_stats = train_one_epoch(
                 model=model,
@@ -413,10 +606,12 @@ def main(args):
             log_stats = {
                 **{f"train_{k}": v for k, v in train_stats.items()},
                 "epoch": epoch,
+                "display_epoch": display_epoch,
             }
         else:
             log_stats = {
                 "epoch": epoch,
+                "display_epoch": display_epoch,
             }
 
         if args.output_dir and (
@@ -435,6 +630,27 @@ def main(args):
                     epoch=epoch,
                     extra_modules=extra_modules,
                 )
+                # Optionally create display-epoch symlink for convenience in plotting
+                try:
+                    if getattr(args, "save_display_epoch_symlinks", False) and display_offset is not None:
+                        ckpt_dir = Path(args.output_dir)
+                        src = ckpt_dir / f"checkpoint-{epoch}.pth"
+                        dst = ckpt_dir / f"checkpoint-{display_epoch}.pth"
+                        if src.exists():
+                            # Avoid overwriting real files; only make symlink if dst absent
+                            if not dst.exists():
+                                try:
+                                    # On systems without symlink perms, fall back to hardlink or copy
+                                    dst.symlink_to(src.name)
+                                except Exception:
+                                    try:
+                                        os.link(src, dst)  # type: ignore[attr-defined]
+                                    except Exception:
+                                        import shutil
+                                        shutil.copy2(src, dst)
+                            logger.info(f"Display-epoch alias created: {dst.name} -> {src.name}")
+                except Exception as _e:
+                    logger.warning(f"Could not create display-epoch alias: {_e}")
             if args.distributed:
                 data_loader_train.sampler.set_epoch(0)
             if distributed_mode.is_main_process():
@@ -443,23 +659,42 @@ def main(args):
                 )
             else:
                 fid_samples = args.fid_samples // num_tasks
-            eval_stats = eval_model(
-                model,
-                data_loader_train,
-                device,
-                epoch=epoch,
-                fid_samples=fid_samples,
-                args=args,
-                metric_path=metric_path,
-                metric_ema=metric_ema,
-            )
-            log_stats.update({f"eval_{k}": v for k, v in eval_stats.items()})
+            try:
+                eval_stats = eval_model(
+                    model,
+                    data_loader_train,
+                    device,
+                    epoch=epoch,
+                    fid_samples=fid_samples,
+                    args=args,
+                    metric_path=metric_path,
+                    metric_ema=metric_ema,
+                    schedule_ema=beta_schedule_ema,  # Pass EMA for eval
+                )
+            finally:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            eval_prefixed = {f"eval_{k}": v for k, v in eval_stats.items()}
+            if display_offset is not None:
+                eval_prefixed["eval_display_epoch"] = display_epoch
+            log_stats.update(eval_prefixed)
 
         # Log to wandb (only on main process)
         if wandb_run is not None and distributed_mode.is_main_process():
             try:
                 import swanlab as wandb  # type: ignore
-                wandb.log(log_stats, step=epoch)
+
+                wandb_payload: Dict[str, Union[int, float]] = {}
+                for key, value in log_stats.items():
+                    if isinstance(value, (int, float)):
+                        wandb_payload[key] = float(value)
+                    elif isinstance(value, np.generic):  # type: ignore[arg-type]
+                        wandb_payload[key] = float(value.item())
+
+                if wandb_payload:
+                    wandb_step = display_epoch if display_offset is not None else epoch
+                    wandb.log(wandb_payload, step=wandb_step)
             except Exception as e:
                 logger.warning(f"wandb.log failed: {e}")
 
@@ -489,6 +724,24 @@ if __name__ == "__main__":
     # Backward-compat: map consolidated flag to legacy alias expected elsewhere
     if not hasattr(args, "ko_metric_induced"):
         setattr(args, "ko_metric_induced", getattr(args, "metric_induced", False))
+    
+    # CRITICAL: Reset annealing step counters when resuming from baseline
+    # This ensures Gumbel tau and metric interpolation start fresh
+    # even when resuming from a checkpoint at epoch > 0
+    if args.resume:
+        setattr(args, "_gumbel_update_step", 0)
+        setattr(args, "_metric_interp_update_step", 0)
+        setattr(args, "_mi_logbeta_reg_step", 0)
+        setattr(args, "_annealing_counters_reset", True)  # Flag to prevent override
+        print(
+            "=" * 80 + "\n"
+            "RESET ANNEALING COUNTERS TO 0\n"
+            "  - Gumbel tau will anneal from start\n"
+            "  - Metric interpolation will anneal from start\n"
+            "  - Resuming from checkpoint but with fresh annealing schedules\n"
+            + "=" * 80
+        )
+    
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

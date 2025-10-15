@@ -42,6 +42,7 @@ from flow_matching.path import MixtureDiscreteProbPath, MetricInducedGibbsProbPa
 from flow_matching.path.beta_schedules import ExpMonotoneRQSSchedule
 from flow_matching.path.metric_ema import LearnableMetricEMA
 from flow_matching.path.scheduler import PolynomialConvexScheduler
+from flow_matching.path.metric_analysis import analyze_metric, quick_metric_check
 from flow_matching.solver import MixtureDiscreteEulerSolver, KODiscreteGibbsEulerSolver
 from flow_matching.solver.ode_solver import ODESolver
 from flow_matching.utils import ModelWrapper
@@ -180,6 +181,15 @@ def _build_metric_infer_time_grid(
     device: torch.device,
 ) -> tuple[torch.Tensor, str]:
     grid_type = str(getattr(args, "mi_infer_grid", "uniform_t"))
+    
+    # Get evaluation alpha: if not specified, fall back to training alpha
+    eval_alpha_cfg = getattr(args, "mi_logbeta_eval_alpha", None)
+    if eval_alpha_cfg is None:
+        eval_alpha = float(getattr(args, "mi_logbeta_mis_alpha", 0.0))
+    else:
+        eval_alpha = float(eval_alpha_cfg)
+    eval_alpha = min(max(eval_alpha, 0.0), 1.0)  # Clamp to [0, 1]
+    
     steps_cfg = getattr(args, "mi_infer_steps", None)
     if steps_cfg is None:
         steps = int(getattr(args, "discrete_fm_steps", 1024))
@@ -227,17 +237,162 @@ def _build_metric_infer_time_grid(
                 raise ValueError("mi_logbeta_min/max must be finite when using uniform_logbeta grid")
             if ell_max <= ell_min:
                 raise ValueError("mi_logbeta_max must exceed mi_logbeta_min for uniform_logbeta grid")
-            ell_grid = torch.linspace(
-                ell_min,
-                ell_max,
-                steps=num_points,
-                device=schedule.y0.device,
-                dtype=schedule.y0.dtype,
-            )
-            t_vals, _ = schedule.t_from_ell(ell_grid)
-            t_vals = t_vals.clamp(schedule.config.t_eps, 1.0 - schedule.config.t_eps)
-            t_vals = torch.sort(t_vals)[0]
-            return t_vals.to(device=device, dtype=torch.float32), grid_type
+            
+            # Get sampling strategy
+            sampling_strategy = str(getattr(args, "mi_logbeta_sampling_strategy", "uniform"))
+            
+            # Compute mu and sigma based on strategy
+            def compute_lognormal_params():
+                """Compute mu and sigma for log-normal sampling"""
+                mu_cfg = getattr(args, "mi_logbeta_lognormal_mu", None)
+                sigma_cfg = getattr(args, "mi_logbeta_lognormal_sigma", None)
+                
+                if sampling_strategy == "log_normal_broad":
+                    # Broad: center on full interval
+                    mu_default = (ell_min + ell_max) / 2
+                    sigma_default = (ell_max - ell_min) / 4
+                    mu = mu_default if mu_cfg is None else float(mu_cfg)
+                    sigma = sigma_default if sigma_cfg is None else float(sigma_cfg)
+                    return mu, sigma
+                    
+                elif sampling_strategy == "log_normal_focused":
+                    # Focused: center on informative region
+                    # First, compute informative region in beta space
+                    vocab_size = getattr(path, "vocab_size", 256)  # From metric geometry
+                    H_max = math.log(vocab_size)
+                    H_min_ratio = float(getattr(args, "mi_logbeta_informative_H_min_ratio", 0.01))
+                    H_max_ratio = float(getattr(args, "mi_logbeta_informative_H_max_ratio", 0.99))
+                    H_min_threshold = H_min_ratio * H_max
+                    H_max_threshold = H_max_ratio * H_max
+                    
+                    # Use sigmoid model to find corresponding beta values
+                    # H(beta) = H_max / (1 + exp(-beta/beta_transition + shift))
+                    # Solve for beta: beta = beta_transition * (shift - log(H_max/H - 1))
+                    beta_transition = 1.0
+                    shift = 3.0
+                    
+                    beta_info_min = beta_transition * (shift - math.log(H_max / H_min_threshold - 1))
+                    beta_info_max = beta_transition * (shift - math.log(H_max / H_max_threshold - 1))
+                    
+                    # Clamp beta to positive range (avoid log of negative/zero)
+                    beta_info_min = max(beta_info_min, 0.01)  # Minimum β = 0.01
+                    beta_info_max = max(beta_info_max, 0.02)  # Ensure β_max > β_min
+                    
+                    # Ensure β_max > β_min
+                    if beta_info_max <= beta_info_min:
+                        beta_info_max = beta_info_min * 2.0
+                    
+                    # Convert to log-beta
+                    ell_info_min = math.log(beta_info_min)
+                    ell_info_max = math.log(beta_info_max)
+                    
+                    # Mu: center of informative region
+                    mu_default = (ell_info_min + ell_info_max) / 2
+                    # Sigma: 1-sigma covers informative region
+                    sigma_default = (ell_info_max - ell_info_min) / 2
+                    
+                    mu = mu_default if mu_cfg is None else float(mu_cfg)
+                    sigma = sigma_default if sigma_cfg is None else float(sigma_cfg)
+                    
+                    logger.info(
+                        f"Focused log-normal auto-computed: "
+                        f"H_informative=[{H_min_threshold:.2f}, {H_max_threshold:.2f}] nats, "
+                        f"beta_informative=[{beta_info_min:.2f}, {beta_info_max:.2f}], "
+                        f"log_beta_informative=[{ell_info_min:.3f}, {ell_info_max:.3f}], "
+                        f"mu={mu:.4f}, sigma={sigma:.4f}"
+                    )
+                    return mu, sigma
+                    
+                else:
+                    # Default values if needed
+                    mu = 0.0 if mu_cfg is None else float(mu_cfg)
+                    sigma = 2.5 if sigma_cfg is None else float(sigma_cfg)
+                    return mu, sigma
+            
+            # Implement mixed sampling if eval_alpha > 0
+            if eval_alpha > 0:
+                # Number of samples from each component
+                n_uniform = int(eval_alpha * num_points)
+                n_logbeta = num_points - n_uniform
+                
+                # Generate uniform-t component
+                t_uniform = torch.linspace(
+                    0.0,
+                    1.0,
+                    steps=n_uniform,
+                    device=schedule.y0.device,
+                    dtype=schedule.y0.dtype,
+                )
+                
+                # Generate log-β component (depends on sampling strategy)
+                if sampling_strategy in ["log_normal_broad", "log_normal_focused"]:
+                    mu, sigma = compute_lognormal_params()
+                    
+                    # Sample from N(mu, sigma^2) and clip to [ell_min, ell_max]
+                    ell_samples = torch.randn(
+                        n_logbeta,
+                        device=schedule.y0.device,
+                        dtype=schedule.y0.dtype,
+                    ) * sigma + mu
+                    ell_grid_logbeta = torch.clamp(ell_samples, ell_min, ell_max)
+                else:
+                    # Uniform sampling in log-β space
+                    ell_grid_logbeta = torch.linspace(
+                        ell_min,
+                        ell_max,
+                        steps=n_logbeta,
+                        device=schedule.y0.device,
+                        dtype=schedule.y0.dtype,
+                    )
+                
+                t_logbeta, _ = schedule.t_from_ell(ell_grid_logbeta)
+                t_logbeta = t_logbeta.clamp(schedule.config.t_eps, 1.0 - schedule.config.t_eps)
+                
+                # Combine and sort
+                t_vals = torch.cat([t_uniform, t_logbeta])
+                t_vals = torch.sort(t_vals)[0]
+                
+                # Create descriptive label
+                if sampling_strategy == "log_normal_broad":
+                    strategy_suffix = "_broad"
+                elif sampling_strategy == "log_normal_focused":
+                    strategy_suffix = "_focused"
+                else:
+                    strategy_suffix = ""
+                grid_label = f"mixed_alpha{eval_alpha:.2f}{strategy_suffix}"
+                return t_vals.to(device=device, dtype=torch.float32), grid_label
+            else:
+                # Pure log-β sampling (alpha=0)
+                if sampling_strategy in ["log_normal_broad", "log_normal_focused"]:
+                    mu, sigma = compute_lognormal_params()
+                    
+                    # Sample from N(mu, sigma^2) and clip to [ell_min, ell_max]
+                    ell_samples = torch.randn(
+                        num_points,
+                        device=schedule.y0.device,
+                        dtype=schedule.y0.dtype,
+                    ) * sigma + mu
+                    ell_grid = torch.clamp(ell_samples, ell_min, ell_max)
+                    
+                    if sampling_strategy == "log_normal_focused":
+                        grid_label = "focused_logbeta"
+                    else:
+                        grid_label = "broad_logbeta"
+                else:
+                    # Uniform sampling in log-β space
+                    ell_grid = torch.linspace(
+                        ell_min,
+                        ell_max,
+                        steps=num_points,
+                        device=schedule.y0.device,
+                        dtype=schedule.y0.dtype,
+                    )
+                    grid_label = grid_type
+                
+                t_vals, _ = schedule.t_from_ell(ell_grid)
+                t_vals = t_vals.clamp(schedule.config.t_eps, 1.0 - schedule.config.t_eps)
+                t_vals = torch.sort(t_vals)[0]
+                return t_vals.to(device=device, dtype=torch.float32), grid_label
         else:
             logger.warning(
                 "mi_infer_grid=uniform_logbeta requested but β schedule is not ExpMonotoneRQSSchedule; falling back to uniform_t."
@@ -584,6 +739,127 @@ def _evaluate_metric_geometry(
 
     return stats
 
+
+def _run_detailed_metric_analysis(
+    path: MetricInducedGibbsProbPath,
+    *,
+    args: Namespace,
+    epoch: int,
+    metric_ema: Optional[LearnableMetricEMA],
+    output_root: Optional[Path],
+) -> Dict[str, float]:
+    """
+    Run comprehensive metric analysis including t-SNE/UMAP visualizations.
+    This provides deep insights into what the metric learned.
+    """
+    if not getattr(args, "mi_metric_detailed_analysis", False):
+        return {}
+    
+    if not distributed_mode.is_main_process():
+        return {}
+    
+    if output_root is None:
+        logger.warning("Skipping detailed metric analysis because --output_dir is not set.")
+        return {}
+    
+    learnable_metric = getattr(path, "learnable_metric", None)
+    if learnable_metric is None:
+        logger.warning("Skipping detailed metric analysis because no learnable metric found.")
+        return {}
+    
+    # Create output directory for this epoch's analysis
+    analysis_dir = output_root / "metric_analysis" / f"epoch_{epoch:04d}"
+    
+    try:
+        # Use UMAP if available, fall back to t-SNE
+        # Default: enable both if not explicitly disabled
+        use_umap = getattr(args, "mi_metric_use_umap", False)
+        use_tsne = getattr(args, "mi_metric_use_tsne", False)
+        
+        # If neither flag is set, enable both by default
+        if not use_umap and not use_tsne:
+            use_umap = True
+            use_tsne = True
+        
+        logger.info("Running detailed metric analysis (epoch %d)...", epoch)
+        
+        # Run analysis on student metric
+        device = str(learnable_metric.codes.device)
+        student_results = analyze_metric(
+            learnable_metric,
+            output_dir=str(analysis_dir / "student"),
+            device=device,
+            use_umap=use_umap,
+            use_tsne=use_tsne,
+            verbose=False,  # Don't clutter logs
+            save_plots=True,
+        )
+        
+        # Also analyze EMA teacher metric if available
+        teacher_module = getattr(metric_ema, "teacher", None) if metric_ema else None
+        if isinstance(teacher_module, torch.nn.Module):
+            logger.info("Running detailed metric analysis for EMA teacher...")
+            teacher_results = analyze_metric(
+                teacher_module,
+                output_dir=str(analysis_dir / "teacher"),
+                device=device,
+                use_umap=use_umap,
+                use_tsne=use_tsne,
+                verbose=False,
+                save_plots=True,
+            )
+            # Prefix teacher stats
+            teacher_results = {f"teacher_{k}": v for k, v in teacher_results.items()}
+            student_results.update(teacher_results)
+        
+        # Log key metrics to wandb
+        if getattr(args, "wandb", False):
+            try:
+                try:
+                    import swanlab as wandb  # type: ignore
+                except Exception:  # pragma: no cover
+                    import wandb  # type: ignore
+                
+                # Log key statistics (only numeric values, exclude complex types)
+                wandb_metrics = {}
+                for k, v in student_results.items():
+                    # Skip paths, nearest_neighbors dicts, and other complex types
+                    if k.endswith("_path") or k.endswith("neighbors") or isinstance(v, (dict, list)):
+                        continue
+                    if isinstance(v, (int, float)):
+                        wandb_metrics[f"metric_analysis/{k}"] = v
+                
+                # Log visualizations as images
+                viz_keys = [k for k in student_results.keys() if k.endswith("_path")]
+                for key in viz_keys:
+                    path_str = student_results[key]
+                    if isinstance(path_str, str) and Path(path_str).exists():
+                        img_key = key.replace("_path", "").replace("_", "/")
+                        try:
+                            wandb_metrics[f"metric_analysis/{img_key}"] = wandb.Image(path_str)  # type: ignore
+                        except Exception:
+                            # Swanlab might not support wandb.Image, skip silently
+                            pass
+                
+                if wandb_metrics:
+                    wandb.log(wandb_metrics, step=epoch)  # type: ignore
+                    
+            except Exception as wandb_exc:  # pragma: no cover
+                logger.debug("Failed to log metric analysis to wandb: %s", wandb_exc)
+        
+        logger.info(
+            "Detailed metric analysis complete: distance_std=%.4f, CV=%.4f",
+            student_results.get("distance_std", 0.0),
+            student_results.get("coefficient_of_variation", 0.0),
+        )
+        
+        return student_results
+        
+    except Exception as analysis_exc:  # pragma: no cover
+        logger.warning("Detailed metric analysis failed: %s", analysis_exc)
+        return {}
+
+
 class CFGScaledModel(ModelWrapper):
     def __init__(self, model: Module, return_logits: bool = False):
         super().__init__(model)
@@ -640,6 +916,8 @@ def eval_model(
     args: Namespace,
     metric_path: Optional[MetricInducedGibbsProbPath] = None,
     metric_ema: Optional[LearnableMetricEMA] = None,
+    schedule_ema: Optional["BetaScheduleEMA"] = None,  # NEW: Use EMA schedule for eval
+    fid_metric: Optional[FrechetInceptionDistance] = None,
 ):
     gc.collect()
     cfg_scaled_model = CFGScaledModel(model=model)
@@ -695,9 +973,10 @@ def eval_model(
         cont_solver = ODESolver(velocity_model=cfg_scaled_model)
         cont_ode_opts = args.ode_options
 
-    fid_metric = FrechetInceptionDistance(normalize=True).to(
-        device=device, non_blocking=True
-    )
+    owns_fid_metric = fid_metric is None
+    if fid_metric is None:
+        fid_metric = FrechetInceptionDistance(normalize=True)
+    fid_metric = fid_metric.to(device=device, non_blocking=True)
 
     num_synthetic = 0
     num_real = 0
@@ -714,10 +993,66 @@ def eval_model(
 
     # Lazily constructed KO solver and path (once K is known)
     ko_solver = None
+    # Use EMA schedule for eval if available (train/eval consistency)
     ko_path = metric_path
+    ko_path_raw = None  # For comparison
+    use_ema_for_eval = schedule_ema is not None and metric_path is not None
+    compare_schedules = use_ema_for_eval and getattr(args, "mi_compare_schedule_eval", False)
+    
+    if use_ema_for_eval:
+        # Create a temporary path with EMA schedule AND EMA metric for evaluation
+        # This ensures UNet is evaluated on the same schedule/metric it was trained on
+        import copy
+        ko_path = copy.copy(metric_path)  # Shallow copy
+        # Use schedule_ema.teacher (the EMA-tracked parameters) which has full schedule interface
+        # NOT schedule_ema itself (which only wraps beta_and_derivative)
+        ko_path.beta_schedule = schedule_ema.teacher  # Replace with EMA's teacher
+        
+        # CRITICAL: Also replace metric with EMA metric (if available)
+        # This ensures train/eval consistency for the entire path
+        # User can override with --mi_eval_use_raw_metric to test raw student metric
+        use_raw_metric = getattr(args, "mi_eval_use_raw_metric", False)
+        
+        if metric_ema is not None and hasattr(metric_ema, 'teacher') and metric_ema.teacher is not None:
+            if not use_raw_metric:
+                # Default: Use EMA teacher (smooth, stable)
+                ko_path.learnable_metric = metric_ema.teacher
+                logger.info("Eval using EMA schedule + EMA metric (train/eval consistency)")
+                # Precompute learned metric distance table for eval (huge speedup!)
+                ko_path.precompute_learned_metric_table(
+                    device=device, dtype=torch.float32, metric_module=metric_ema.teacher
+                )
+            else:
+                # User requested: Use raw student metric
+                logger.info("Eval using EMA schedule + RAW student metric (--mi_eval_use_raw_metric enabled)")
+                # Precompute with raw student metric
+                if ko_path.learnable_metric is not None:
+                    ko_path.precompute_learned_metric_table(
+                        device=device, dtype=torch.float32
+                    )
+        else:
+            logger.info("Eval using EMA schedule (train/eval consistency)")
+            # Also precompute if we have a learnable metric (even without EMA)
+            if ko_path.learnable_metric is not None:
+                ko_path.precompute_learned_metric_table(
+                    device=device, dtype=torch.float32
+                )
+        
+        if compare_schedules:
+            # Keep raw path for comparison
+            ko_path_raw = metric_path
+            logger.info("Will also evaluate with raw schedule for comparison")
+    elif metric_path is not None:
+        logger.info("Eval using raw schedule (no EMA available)")
+    
     schedule_snapshot_logged = False
     geometry_stats: Dict[str, float] = {}
     geometry_logged = False
+    
+    # Track whether we need to clear cache at the end
+    need_clear_cache = False
+    if ko_path is not None and ko_path.learnable_metric is not None:
+        need_clear_cache = True
 
     diagnostics_enabled = bool(getattr(args, "diag_enable", False))
     if diagnostics_enabled and distributed_mode.is_main_process():
@@ -759,6 +1094,17 @@ def eval_model(
                 metric_ema=metric_ema,
                 output_root=output_root,
             )
+            
+            # Run detailed metric analysis (t-SNE/UMAP visualizations)
+            detailed_stats = _run_detailed_metric_analysis(
+                path_obj,
+                args=args,
+                epoch=epoch,
+                metric_ema=metric_ema,
+                output_root=output_root,
+            )
+            geometry_stats.update(detailed_stats)
+            
         except Exception as geom_exc:  # pragma: no cover - diagnostic failures
             logger.warning("Metric geometry evaluation failed: %s", geom_exc)
         geometry_logged = True
@@ -1212,4 +1558,18 @@ def eval_model(
     fid_value = float(fid_metric.compute().detach().cpu())
     stats = {"fid": fid_value}
     stats.update(geometry_stats)
+    if owns_fid_metric:
+        try:
+            fid_metric.reset()
+        except Exception:
+            pass
+        del fid_metric
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Clear learned metric cache if we used it
+    if need_clear_cache and ko_path is not None:
+        ko_path.clear_learned_metric_cache()
+    
     return stats

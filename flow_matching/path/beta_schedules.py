@@ -270,17 +270,29 @@ class _ExpRQS1D(nn.Module):
             t2 = slope + (d1 + d0 - 2.0 * slope) * xi * (1.0 - xi)
             outputs_mid = y0 + h * (t1 / (t2 + eps_val))
 
-            numerator = (
-                d1 * xi * xi
-                + 2.0 * slope * xi * (1.0 - xi)
-                + d0 * (1.0 - xi) * (1.0 - xi)
-            )
-            derivatives_mid = (h / (w + eps_val)) * (slope * slope) * numerator / (
-                (t2 + eps_val) ** 2
+            # Analytical derivative of the monotone RQS (matches finite differences)
+            delta_val = slope
+            coeff = d0 + d1 - 2.0 * delta_val
+            B_val = delta_val + coeff * xi * (1.0 - xi)
+            A_val = delta_val * xi * xi + d0 * xi * (1.0 - xi)
+            dA_dxi = 2.0 * delta_val * xi + d0 * (1.0 - 2.0 * xi)
+            dB_dxi = coeff * (1.0 - 2.0 * xi)
+            derivatives_mid = delta_val * (dA_dxi * B_val - A_val * dB_dxi) / (
+                (B_val + eps_val) ** 2
             )
 
             outputs[center_mask] = outputs_mid
             derivatives[center_mask] = derivatives_mid
+
+        if left_mask.any():
+            slope = delta[0]
+            outputs[left_mask] = -B + (flat_inputs[left_mask] + B) * slope
+            derivatives[left_mask] = slope
+
+        if right_mask.any():
+            slope = delta[-1]
+            outputs[right_mask] = B + (flat_inputs[right_mask] - B) * slope
+            derivatives[right_mask] = slope
 
         return outputs.view_as(inputs), derivatives.view_as(inputs)
 
@@ -457,9 +469,29 @@ class ExpMonotoneRQSSchedule(BetaSchedule):
         t_hi: float | None = None,
         power: float = 0.0,
     ) -> dict[str, Tensor]:
+        """Compute smoothness penalties using ANALYTICAL derivatives from RQS.
+        
+        Key features:
+        1. Uses exact dℓ/ds = a * dr/ds from RQS.forward() (not finite differences)
+        2. NORMALIZED penalties using Coefficient of Variation (CV = std/mean)
+        3. Second derivative: finite difference of exact first derivatives
+        
+        Normalization strategy (CV-based):
+        - delta: CV² of first derivatives → penalizes relative variability
+        - delta2: CV² of second derivatives → penalizes relative curvature changes
+        - endpoint: normalized by interior scale → detects boundary anomalies
+        
+        Why CV is scale-invariant:
+        - CV = std/mean is dimensionless (scale-free)
+        - β(t) ×10 → std ×10, mean ×10 → CV unchanged
+        - Penalties ∈ [0, ∞) with typical values ~ 0.01-1.0
+        - Automatically adapts to any β magnitude
+        """
         dtype = self.y0.dtype
         device = self.y0.device
         zero = torch.zeros((), dtype=dtype, device=device)
+        eps = 1e-8  # Numerical stability
+        cv_min_abs_mean = 1e-3  # Huber-like saturation: clamp |mean| to prevent CV² explosion
 
         xk, yk, _ = self.rqs._knot_tensors(dtype=dtype, device=device)
         if xk.numel() < 2:
@@ -475,34 +507,60 @@ class ExpMonotoneRQSSchedule(BetaSchedule):
         t_lo_tensor = torch.tensor(lo_val, dtype=dtype, device=device)
         t_hi_tensor = torch.tensor(hi_val, dtype=dtype, device=device)
 
+        # Map knot positions to t-space for masking
         t_knots = torch.sigmoid(xk)
         t_knots = t_knots.clamp(cfg.t_eps, 1.0 - cfg.t_eps)
-        ell_knots = self.y0 + self.a * yk
+        
+        # ========== ANALYTICAL DERIVATIVE COMPUTATION ==========
+        # Evaluate RQS at knot positions to get exact dr/ds
+        r_knots, dr_ds_knots = self.rqs(xk)  # Analytical derivatives!
+        a = self.a
+        ell_knots = self.y0 + a * r_knots
+        dell_ds_knots = a * dr_ds_knots  # Exact dℓ/ds = a * dr/ds
+        # ========================================================
 
-        delta_s = xk[1:] - xk[:-1]
-        delta_s = delta_s.clamp_min(1e-6)
-        delta_ell = ell_knots[1:] - ell_knots[:-1]
-        first_slopes = delta_ell / delta_s
+        # ========== FIRST-ORDER PENALTY (NORMALIZED) ==========
+        # Use midpoints between knots for interval masking
         centers = 0.5 * (t_knots[1:] + t_knots[:-1])
         interval_mask = (centers >= t_lo_tensor) & (centers <= t_hi_tensor)
         weights = torch.ones_like(centers)
         if power != 0.0:
             weights = torch.pow((centers * (1.0 - centers)).clamp_min(1e-6), power)
 
+        # Average first derivatives at interval endpoints
+        first_slopes = 0.5 * (dell_ds_knots[1:] + dell_ds_knots[:-1])
+        
         if interval_mask.any():
             weighted = weights[interval_mask]
             slopes = first_slopes[interval_mask]
-            denom = weighted.sum().clamp_min(1.0)
-            first_penalty = (weighted * slopes.square()).sum() / denom
+            
+            # NORMALIZED: Coefficient of Variation (CV) penalty
+            # CV = std/mean measures relative variability (scale-invariant)
+            # Penalizing CV² encourages smoothness regardless of magnitude
+            # Huber-like saturation: clamp |mean| to prevent explosion when mean ≈ 0
+            if slopes.numel() > 1:
+                slopes_mean_raw = slopes.mean().detach()
+                slopes_mean = torch.clamp(torch.abs(slopes_mean_raw), min=cv_min_abs_mean)  # Saturate denominator
+                slopes_std = torch.std(slopes, unbiased=False).detach() + eps
+                cv = slopes_std / slopes_mean  # Coefficient of variation with bounded denominator
+                first_penalty = cv.square()  # Penalize relative variability
+            else:
+                # Single sample: no variability to penalize
+                first_penalty = zero
         else:
             first_penalty = zero
 
-        if first_slopes.numel() >= 2:
-            h_prev = delta_s[:-1]
-            h_next = delta_s[1:]
-            diff_slopes = first_slopes[1:] - first_slopes[:-1]
-            denom = (h_prev + h_next).clamp_min(1e-6)
-            second_est = 2.0 * diff_slopes / denom
+        # ========== SECOND-ORDER PENALTY (NORMALIZED) ==========
+        # Finite difference of EXACT first derivatives
+        if dell_ds_knots.numel() >= 2:
+            delta_s = xk[1:] - xk[:-1]
+            delta_s = delta_s.clamp_min(1e-6)
+            
+            # Finite difference on analytical first derivatives
+            delta_dell_ds = dell_ds_knots[1:] - dell_ds_knots[:-1]
+            second_est = delta_dell_ds / delta_s  # Approximate d²ℓ/ds²
+            
+            # Mask to interior knots
             interior_t = t_knots[1:-1]
             interior_mask = (interior_t >= t_lo_tensor) & (interior_t <= t_hi_tensor)
             interior_weights = torch.ones_like(interior_t)
@@ -510,20 +568,55 @@ class ExpMonotoneRQSSchedule(BetaSchedule):
                 interior_weights = torch.pow(
                     (interior_t * (1.0 - interior_t)).clamp_min(1e-6), power
                 )
-            if interior_mask.any():
+            
+            # Trim second_est to match interior knots (exclude boundaries)
+            if second_est.numel() > interior_t.numel():
+                start_idx = 0
+                end_idx = interior_t.numel()
+                second_est_interior = second_est[start_idx:end_idx]
+            else:
+                second_est_interior = second_est
+                
+            if interior_mask.any() and second_est_interior.numel() == interior_mask.numel():
                 w2 = interior_weights[interior_mask]
-                s2 = second_est[interior_mask]
-                denom2 = w2.sum().clamp_min(1.0)
-                second_penalty = (w2 * s2.square()).sum() / denom2
+                s2 = second_est_interior[interior_mask]
+                
+                # NORMALIZED: Coefficient of Variation (CV) penalty
+                # CV = std/mean measures relative variability (scale-invariant)
+                # Huber-like saturation: clamp |mean| to prevent explosion when mean ≈ 0
+                if s2.numel() > 1:
+                    s2_mean_raw = s2.mean().detach()
+                    s2_mean = torch.clamp(torch.abs(s2_mean_raw), min=cv_min_abs_mean)  # Saturate denominator
+                    s2_std = torch.std(s2, unbiased=False).detach() + eps
+                    cv2 = s2_std / s2_mean  # Coefficient of variation with bounded denominator
+                    second_penalty = cv2.square()  # Penalize relative variability
+                else:
+                    # Single sample: no variability to penalize
+                    second_penalty = zero
             else:
                 second_penalty = zero
         else:
             second_penalty = zero
 
-        if first_slopes.numel() >= 1:
-            endpoint_penalty = 0.5 * (
-                first_slopes[0].square() + first_slopes[-1].square()
-            )
+        # ========== ENDPOINT PENALTY (NORMALIZED) ==========
+        # Penalize steep slopes at boundaries, normalized by interior scale
+        if dell_ds_knots.numel() >= 3:
+            # Use interior slopes (exclude endpoints) for scale reference
+            interior_slopes = dell_ds_knots[1:-1]
+            interior_scale = torch.abs(interior_slopes.mean()).detach() + eps
+            
+            # Normalized endpoint slopes (relative to interior)
+            endpoint_left = dell_ds_knots[0] / interior_scale
+            endpoint_right = dell_ds_knots[-1] / interior_scale
+            
+            # Penalize if endpoints deviate from interior scale
+            endpoint_penalty = 0.5 * (endpoint_left.square() + endpoint_right.square())
+        elif dell_ds_knots.numel() >= 1:
+            # Too few knots: use absolute value normalization
+            all_scale = torch.abs(dell_ds_knots.mean()).detach() + eps
+            endpoint_left = dell_ds_knots[0] / all_scale
+            endpoint_right = dell_ds_knots[-1] / all_scale
+            endpoint_penalty = 0.5 * (endpoint_left.square() + endpoint_right.square())
         else:
             endpoint_penalty = zero
 

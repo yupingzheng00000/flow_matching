@@ -12,6 +12,7 @@ from typing import Iterable, Optional
 
 import torch
 import torch.nn as nn
+import numpy as np
 from flow_matching.path import (
     CondOTProbPath,
     MixtureDiscreteProbPath,
@@ -100,6 +101,69 @@ def skewed_timestep_sample(num_samples: int, device: torch.device) -> torch.Tens
     time = 1 / (1 + sigma)
     time = torch.clip(time, min=0.0001, max=1.0)
     return time
+
+
+def compute_geodesic_energy_embedding(
+    logits: torch.Tensor,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    metric_module: nn.Module,
+) -> torch.Tensor:
+    """
+    Compute geodesic energy regularization based on velocity in embedding space.
+    
+    Energy = ||v_t||²_M where v_t = (embed(x_1_pred) - embed(x_t)) / (1 - t)
+    
+    This penalizes high-velocity trajectories in the learned metric space,
+    encouraging paths that follow geodesics and reducing entropy of intermediate
+    distributions p(x_t | x_1, t).
+    
+    Args:
+        logits: Model output logits [B, H, W, V] where V is vocab size (256)
+        x_t: Current state [B, H, W] (discrete tokens) or [B, H, W, V] (soft)
+        t: Time values [B] in [0, 1]
+        metric_module: Learnable metric with .codes attribute [V, d]
+    
+    Returns:
+        Scalar energy value (mean over batch and spatial dimensions)
+    
+    References:
+        - Energy-guided geometric flow matching: 10-20% entropy reduction
+        - Geodesic Gaussian regularization: smoother paths, lower variance
+        - Entropic Gromov-Wasserstein: 5-15% entropy drops with λ tuning
+    """
+    # Get metric embedding codes [vocab_size, embedding_dim]
+    codes = metric_module.codes  # [256, d]
+    
+    # Predicted distribution over x_1
+    x_1_pred = torch.nn.functional.softmax(logits, dim=-1)  # [B, H, W, 256]
+    
+    # Convert x_t to soft distribution if needed
+    if x_t.dtype == torch.long or x_t.dim() == 3:
+        # Hard tokens [B, H, W] → one-hot [B, H, W, 256]
+        vocab_size = codes.shape[0]
+        x_t_soft = torch.nn.functional.one_hot(
+            x_t.long(), num_classes=vocab_size
+        ).float()
+    else:
+        # Already soft [B, H, W, 256]
+        x_t_soft = x_t
+    
+    # Compute embeddings: weighted average of codes
+    # x @ codes: [B, H, W, 256] @ [256, d] → [B, H, W, d]
+    x_t_embed = x_t_soft @ codes  # [B, H, W, d]
+    x_1_embed = x_1_pred @ codes  # [B, H, W, d]
+    
+    # Velocity in embedding space: change per unit time remaining
+    # v_t = (x_1 - x_t) / (1 - t)  where t ∈ [0, 1]
+    delta_t = 1.0 - t.view(-1, 1, 1, 1) + 1e-8  # [B, 1, 1, 1]
+    v_t = (x_1_embed - x_t_embed) / delta_t  # [B, H, W, d]
+    
+    # Energy: L2 norm squared (already in metric space, no need for M weighting)
+    # ||v_t||² = sum_d v_t[d]²
+    energy = (v_t ** 2).sum(dim=-1).mean()  # scalar
+    
+    return energy
 
 
 class AdaptiveKLController(nn.Module):
@@ -196,20 +260,108 @@ def _anneal_scalar(
     step: int, total_steps: int, start: float, end: float, schedule: str
 ) -> float:
     """Return an annealed scalar following the provided schedule."""
-
     if total_steps <= 0:
         return end
-
-    progress = min(max(step / float(total_steps), 0.0), 1.0)
-    if schedule == "quadratic":
-        weight = (1.0 - progress) ** 2
-    elif schedule == "linear":
-        weight = 1.0 - progress
+    
+    if step <= 0:
+        return start
+    if step >= total_steps:
+        return end
+    
+    progress = step / total_steps
+    
+    if schedule == "linear":
+        return start + (end - start) * progress
     elif schedule == "cosine":
-        weight = 0.5 * (math.cos(math.pi * progress) + 1.0)
+        cos_factor = 0.5 * (1 + math.cos(math.pi * progress))
+        return end + (start - end) * cos_factor
+    elif schedule == "exp":
+        return start * math.exp(progress * math.log(end / start))
     else:
-        raise ValueError(f"Unsupported Gumbel annealing schedule: {schedule}")
-    return end + (start - end) * weight
+        raise ValueError(f"Unknown schedule: {schedule}")
+
+
+def adjust_metric_learning_rate(
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    args: argparse.Namespace,
+) -> None:
+    """Adjust learning rate for metric parameters based on decay schedule.
+    
+    This allows the metric to stabilize in later training while UNet continues
+    adapting to the learned geometry. Inspired by staged learning strategies.
+    
+    Args:
+        optimizer: The optimizer containing metric parameter groups
+        epoch: Current training epoch
+        args: Training arguments containing decay configuration
+    """
+    if not getattr(args, "mi_learnable_metric", False):
+        return
+    
+    decay_start = int(getattr(args, "mi_metric_lr_decay_start", 3500))
+    if epoch < decay_start:
+        return
+    
+    decay_mode = getattr(args, "mi_metric_lr_decay_mode", "cosine")
+    if decay_mode == "none":
+        return
+    
+    # Base learning rate for metric (before decay)
+    base_lr = args.lr * float(getattr(args, "mi_metric_lr_scale", 0.1))
+    end_ratio = float(getattr(args, "mi_metric_lr_decay_end_ratio", 0.1))
+    
+    # Compute decay factor based on mode
+    if decay_mode == "cosine":
+        # Cosine annealing from 1.0 to end_ratio
+        progress = (epoch - decay_start) / (args.epochs - decay_start)
+        progress = min(progress, 1.0)
+        
+        decay_factor = end_ratio + (1.0 - end_ratio) * 0.5 * (
+            1 + math.cos(math.pi * progress)
+        )
+        
+    elif decay_mode == "exp":
+        # Exponential decay
+        decay_steps = (epoch - decay_start) / 100.0
+        # Decay to end_ratio over ~10 steps (1000 epochs)
+        decay_factor = max(end_ratio, end_ratio ** (decay_steps / 10.0))
+        
+    elif decay_mode == "step":
+        # Step-wise decay at fixed milestones
+        if epoch >= 4000:
+            decay_factor = 0.25
+        elif epoch >= 3500:
+            decay_factor = 0.5
+        else:
+            decay_factor = 1.0
+    else:
+        decay_factor = 1.0
+    
+    # Apply to metric parameter groups only
+    adjusted_any = False
+    for param_group in optimizer.param_groups:
+        # Identify metric parameters by group name
+        group_name = param_group.get("name", "")
+        # Also check if this group has fewer parameters (metric typically has 1-2 params)
+        # and weight_decay is set (metric uses weight_decay, UNet typically doesn't)
+        is_metric_group = (
+            "learnable_metric" in group_name 
+            or "metric" in group_name
+            or (param_group.get("weight_decay", 0) > 0 and len(param_group["params"]) <= 10)
+        )
+        if is_metric_group:
+            new_lr = base_lr * decay_factor
+            param_group["lr"] = new_lr
+            adjusted_any = True
+    
+    # Log only once per epoch (rank 0 only)
+    if adjusted_any and distributed_mode.is_main_process():
+        logger.info(
+            f"Epoch {epoch}: Metric LR adjusted to {base_lr * decay_factor:.2e} "
+            f"(mode={decay_mode}, factor={decay_factor:.4f})"
+        )
+
 
 
 def train_one_epoch(
@@ -252,12 +404,34 @@ def train_one_epoch(
     else:
         path = CondOTProbPath()
 
+    # Snapshot LUT state at epoch start for delta computations at epoch end.
+    # Stored on args so state persists across function calls. Non-fatal if any error.
+    if hasattr(path, "learnable_lut") and path.learnable_lut is not None:
+        try:
+            with torch.no_grad():
+                start_w = path.learnable_lut().detach().cpu().clone()
+            setattr(args, "_epoch_lut_start", start_w)
+            if hasattr(path.learnable_lut, "scale_c") and path.learnable_lut.scale_c is not None:
+                setattr(args, "_epoch_lut_scale_c_start", path.learnable_lut.scale_c.detach().cpu().clone())
+        except Exception:
+            pass
+
     beta_schedule_module: Optional[nn.Module] = None
     if isinstance(path, MetricInducedGibbsProbPath) and isinstance(
         path.beta_schedule, nn.Module
     ):
         beta_schedule_module = path.beta_schedule
 
+    # Freeze schedule: params frozen but EMA continues (soft landing mechanism)
+    freeze_schedule = getattr(args, "mi_freeze_beta_schedule", False)
+    if freeze_schedule and schedule_ema is not None and epoch == args.start_epoch:
+        # Only log once at the first epoch, and only on rank 0
+        if distributed_mode.is_main_process():
+            logger.info(
+                "Freeze mode: schedule params frozen (no gradient), EMA continues (smooth training target). "
+                "EMA will gradually converge to frozen values."
+            )
+    
     teacher_schedule_available = (
         schedule_ema is not None and beta_schedule_module is not None
     )
@@ -268,6 +442,7 @@ def train_one_epoch(
     )
     use_path_ema = teacher_schedule_available or teacher_metric_available
     use_path_trust_region = use_path_ema and kl_controller is not None
+    
     if kl_controller is not None and not use_path_ema:
         logger.warning(
             "KL controller was provided without an EMA teacher; disabling the controller."
@@ -320,7 +495,10 @@ def train_one_epoch(
     if _dl_len is not None:
         updates_per_epoch = (_dl_len + accum_iter - 1) // accum_iter
     gumbel_update_step = int(getattr(args, "_gumbel_update_step", 0))
-    if gumbel_schedule_active and updates_per_epoch is not None:
+    # CRITICAL: If explicitly set to 0 (e.g., when resuming but wanting fresh annealing),
+    # don't override it with epoch_offset. Only use epoch_offset if counter is uninitialized.
+    was_explicitly_reset = hasattr(args, "_annealing_counters_reset") and getattr(args, "_annealing_counters_reset", False)
+    if gumbel_schedule_active and updates_per_epoch is not None and not was_explicitly_reset:
         epoch_offset = epoch * updates_per_epoch
         if gumbel_update_step < epoch_offset:
             gumbel_update_step = epoch_offset
@@ -338,7 +516,8 @@ def train_one_epoch(
         path.get_metric_interpolation_lambda() if metric_interp_active else None
     )
     metric_interp_update_step = int(getattr(args, "_metric_interp_update_step", 0))
-    if metric_interp_active and updates_per_epoch is not None:
+    # CRITICAL: Same logic as gumbel_update_step - respect explicit reset to 0
+    if metric_interp_active and updates_per_epoch is not None and not was_explicitly_reset:
         epoch_offset_interp = epoch * updates_per_epoch
         if metric_interp_update_step < epoch_offset_interp:
             metric_interp_update_step = epoch_offset_interp
@@ -531,6 +710,7 @@ def train_one_epoch(
 
             mix_alpha_raw = float(getattr(args, "mi_logbeta_mis_alpha", 0.0))
             mix_alpha = float(min(max(mix_alpha_raw, 0.0), 1.0))
+            use_is = bool(getattr(args, "mi_logbeta_use_is", False))
 
             batch_size = samples.shape[0]
             uniform_span = max(uniform_hi - uniform_lo, 1e-6)
@@ -561,24 +741,35 @@ def train_one_epoch(
                         1.0 - mix_alpha,
                     )
                     setattr(args, "_mi_logbeta_mis_announced", True)
+                if not use_is and not getattr(args, "_mi_logbeta_no_is_announced", False):
+                    logger.info(
+                        "Importance sampling DISABLED: using direct log-β sampling without reweighting"
+                    )
+                    setattr(args, "_mi_logbeta_no_is_announced", True)
 
-                interval = max(float(lmax_val) - float(lmin_val), 1e-6)
-                t_for_schedule = t.to(device=t_logbeta.device, dtype=t_logbeta.dtype)
-                beta_vals, beta_deriv = schedule.beta_and_derivative(t_for_schedule)
-                beta_vals = beta_vals.clamp_min(1e-12)
-                q_logbeta = (beta_deriv / beta_vals).clamp_min(1e-12) / interval
-                q_logbeta = q_logbeta.to(device=device, dtype=torch.float32)
-                one_over_span = torch.tensor(
-                    1.0 / uniform_span,
-                    device=device,
-                    dtype=q_logbeta.dtype,
-                )
-                q_uniform = torch.zeros_like(q_logbeta)
-                within_uniform = (t >= uniform_lo) & (t <= uniform_hi)
-                q_uniform = torch.where(within_uniform, one_over_span, q_uniform)
-                q_mix = mix_alpha * q_uniform + (1.0 - mix_alpha) * q_logbeta
-                logbeta_weights = (1.0 / q_mix.clamp_min(1e-12)).to(device=device)
-                mis_uniform_frac = float(selector.float().mean().detach().cpu().item())
+                # Only compute IS weights when explicitly enabled
+                if use_is:
+                    interval = max(float(lmax_val) - float(lmin_val), 1e-6)
+                    t_for_schedule = t.to(device=t_logbeta.device, dtype=t_logbeta.dtype)
+                    beta_vals, beta_deriv = schedule.beta_and_derivative(t_for_schedule)
+                    beta_vals = beta_vals.clamp_min(1e-12)
+                    q_logbeta = (beta_deriv / beta_vals).clamp_min(1e-12) / interval
+                    q_logbeta = q_logbeta.to(device=device, dtype=torch.float32)
+                    one_over_span = torch.tensor(
+                        1.0 / uniform_span,
+                        device=device,
+                        dtype=q_logbeta.dtype,
+                    )
+                    q_uniform = torch.zeros_like(q_logbeta)
+                    within_uniform = (t >= uniform_lo) & (t <= uniform_hi)
+                    q_uniform = torch.where(within_uniform, one_over_span, q_uniform)
+                    q_mix = mix_alpha * q_uniform + (1.0 - mix_alpha) * q_logbeta
+                    logbeta_weights = (1.0 / q_mix.clamp_min(1e-12)).to(device=device)
+                    mis_uniform_frac = float(selector.float().mean().detach().cpu().item())
+                else:
+                    # IS disabled: no reweighting
+                    logbeta_weights = None
+                    mis_uniform_frac = float(selector.float().mean().detach().cpu().item()) if mix_alpha > 0.0 else None
             else:
                 t = t_uniform
 
@@ -638,6 +829,20 @@ def train_one_epoch(
             if logbeta_reg_penalty is not None:
                 loss = loss + logbeta_reg_penalty
 
+            # Bounded residual scale penalty (L2 on scale parameter c)
+            scale_penalty: Optional[torch.Tensor] = None
+            scale_penalty_weight = getattr(args, "mi_lut_scale_penalty_weight", 0.01)
+            if (
+                scale_penalty_weight > 0.0
+                and hasattr(path, "learnable_lut")
+                and path.learnable_lut is not None
+                and hasattr(path.learnable_lut, "scale_c")
+                and path.learnable_lut.scale_c is not None
+            ):
+                # L2 penalty on scale parameter c to keep it near 0
+                scale_penalty = scale_penalty_weight * (path.learnable_lut.scale_c ** 2).sum()
+                loss = loss + scale_penalty
+
             if use_path_trust_region:
                 x1_flat = samples.view(samples.shape[0], -1)
                 with torch.no_grad():
@@ -672,6 +877,43 @@ def train_one_epoch(
                 kl_sum_for_step += float(schedule_kl_value.detach())
                 kl_micro_steps += 1
 
+            # Geodesic energy regularization (optional)
+            geodesic_energy_val: Optional[torch.Tensor] = None
+            geodesic_penalty: Optional[torch.Tensor] = None
+            
+            geodesic_weight = getattr(args, "mi_geodesic_energy_weight", 0.0)
+            if geodesic_weight > 0.0:
+                if isinstance(path, MetricInducedGibbsProbPath):
+                    if path.learnable_metric is not None:
+                        # Only apply when learned metric is active
+                        current_lambda = path.get_metric_interpolation_lambda()
+                        if current_lambda > 0.0:
+                            # Compute geodesic energy
+                            geo_energy = compute_geodesic_energy_embedding(
+                                logits=logits,
+                                x_t=path_sample.x_t,  # Use discrete tokens
+                                t=t,
+                                metric_module=path.learnable_metric,
+                            )
+                            
+                            # Weight by metric interpolation (stronger as lambda increases)
+                            # and by user-specified regularization strength
+                            geo_penalty = geodesic_weight * current_lambda * geo_energy
+                            
+                            # Add to total loss
+                            loss = loss + geo_penalty
+                            
+                            # Store for logging (detach to avoid gradients)
+                            geodesic_energy_val = geo_energy.detach()
+                            
+                            # Announce once per training
+                            if not getattr(args, "_geodesic_energy_announced", False):
+                                logger.info(
+                                    f"[Geodesic Energy] Enabled with λ={geodesic_weight:.4f}, "
+                                    f"current metric interpolation={current_lambda:.3f}"
+                                )
+                                setattr(args, "_geodesic_energy_announced", True)
+
             wandb_logger = None
             if getattr(args, "wandb", False) and distributed_mode.is_main_process():
                 try:
@@ -689,6 +931,13 @@ def train_one_epoch(
                     w = logbeta_weights.detach()
                     ess_num = (w.sum() ** 2) / (w.square().sum() + 1e-12)
                     wandb_log_data["diag/ess_frac"] = float((ess_num / (w.numel() + 1e-12)).item())
+                    wandb_log_data["diag/weight_mean"] = float(w.mean().item())
+                    wandb_log_data["diag/weight_std"] = float(w.std().item())
+                    wandb_log_data["diag/weight_max"] = float(w.max().item())
+                    wandb_log_data["diag/weight_min"] = float(w.min().item())
+                else:
+                    # IS disabled: ESS = 1.0 (all samples have equal weight)
+                    wandb_log_data["diag/ess_frac"] = 1.0
                 if mis_uniform_frac is not None:
                     wandb_log_data["diag/mis_uniform_frac"] = mis_uniform_frac
                 if logbeta_reg_penalty is not None:
@@ -709,158 +958,49 @@ def train_one_epoch(
                                 ),
                             }
                         )
+                
+                # Log geodesic energy regularization
+                if geodesic_energy_val is not None:
+                    wandb_log_data["train/geodesic_energy"] = float(
+                        geodesic_energy_val.cpu().item()
+                    )
+                if geodesic_penalty is not None:
+                    wandb_log_data["train/geodesic_penalty"] = float(
+                        geodesic_penalty.detach().cpu().item()
+                    )
 
-                if data_iter_step % (PRINT_FREQUENCY * 10) == 0:
-                    max_points = int(getattr(args, "wandb_entropy_max_points", 4096) or 4096)
-                    entropy_table = getattr(args, "_entropy_vs_t_table", None)
-                    entropy_rows = getattr(args, "_entropy_vs_t_rows", None)
-                    if not isinstance(entropy_rows, deque):
-                        existing_rows = list(entropy_rows) if entropy_rows is not None else []
-                        entropy_rows = deque(existing_rows[-max_points:], maxlen=max_points)
-                        setattr(args, "_entropy_vs_t_rows", entropy_rows)
-                    elif entropy_rows.maxlen != max_points:
-                        entropy_rows = deque(list(entropy_rows)[-max_points:], maxlen=max_points)
-                        setattr(args, "_entropy_vs_t_rows", entropy_rows)
-                    if entropy_table is None:
-                        entropy_table = wandb_logger.echarts.Table()
-                        setattr(args, "_entropy_vs_t_table", entropy_table)
+                # Log bounded residual scale parameters and penalty
+                if (
+                    hasattr(path, "learnable_lut")
+                    and path.learnable_lut is not None
+                    and hasattr(path.learnable_lut, "scale_c")
+                    and path.learnable_lut.scale_c is not None
+                ):
+                    scale_c = path.learnable_lut.scale_c.detach().cpu()
+                    # Log each channel's scale_c value
+                    for ch_idx in range(scale_c.numel()):
+                        wandb_log_data[f"lut/scale_c_ch{ch_idx}"] = float(scale_c[ch_idx].item())
+                    # Log scale_c statistics
+                    wandb_log_data["lut/scale_c_mean"] = float(scale_c.mean().item())
+                    wandb_log_data["lut/scale_c_std"] = float(scale_c.std().item())
+                    wandb_log_data["lut/scale_c_min"] = float(scale_c.min().item())
+                    wandb_log_data["lut/scale_c_max"] = float(scale_c.max().item())
+                
+                # Log scale penalty if it exists
+                if scale_penalty is not None:
+                    wandb_log_data["loss/scale_penalty"] = float(
+                        scale_penalty.detach().cpu().item()
+                    )
 
+                # Log entropy vs t chart (reduced frequency to save space)
+                if data_iter_step % (PRINT_FREQUENCY * 20) == 0:  # Reduced from 10x to 20x
                     t_cpu = t.detach().float().cpu()
                     entropy_cpu = target_entropy.detach().float().cpu()
-                    counter = int(getattr(args, "_entropy_vs_t_counter", 0))
-                    new_rows = []
-                    for t_val, entropy_val in zip(t_cpu.tolist(), entropy_cpu.tolist()):
-                        # Track arrival order in column 2 so visualMap can encode recency with color.
-                        new_rows.append([
-                            float(t_val),
-                            float(entropy_val),
-                            float(counter),
-                        ])
-                        counter += 1
-                    setattr(args, "_entropy_vs_t_counter", counter)
-                    entropy_rows.extend(new_rows)
-
-                    rows_list = list(entropy_rows)
-                    entropy_table.add(["t", "entropy", "index"], rows_list)
-
-                    scatter_chart = wandb_logger.echarts.Scatter()
-                    scatter_chart.add_xaxis([])
-                    options_mod = getattr(wandb_logger.echarts, "options", None)
-                    label_opts = (
-                        options_mod.LabelOpts(is_show=False)
-                        if options_mod is not None
-                        else None
-                    )
-                    scatter_chart.add_yaxis(
-                        "entropy",
-                        rows_list,
-                        symbol_size=3.5,
-                        label_opts=label_opts,
-                        encode={"x": 0, "y": 1},
-                    )
-                    palette = [
-                        "#003f5c",
-                        "#2f4b7c",
-                        "#665191",
-                        "#a05195",
-                        "#d45087",
-                        "#f95d6a",
-                    ]
-                    if rows_list:
-                        min_t = min(row[0] for row in rows_list)
-                        max_t = max(row[0] for row in rows_list)
-                        if math.isfinite(min_t) and math.isfinite(max_t):
-                            if abs(max_t - min_t) < 1e-9:
-                                pad = max(abs(min_t), 1.0) * 1e-3
-                                min_axis = min_t - pad
-                                max_axis = max_t + pad
-                            else:
-                                min_axis = min_t
-                                max_axis = max_t
-                        else:
-                            min_axis = 0.0
-                            max_axis = 1.0
-                        color_min = min(row[2] for row in rows_list)
-                        color_max = max(row[2] for row in rows_list)
-                        if abs(color_max - color_min) < 1e-9:
-                            color_pad = max(abs(color_min), 1.0)
-                            color_min -= color_pad * 0.5
-                            color_max += color_pad * 0.5
-                    else:
-                        min_axis = 0.0
-                        max_axis = 1.0
-                        color_min = 0.0
-                        color_max = float(len(rows_list))
-
-                    diff = max(color_max - color_min, 1e-6)
-                    segment_count = len(palette)
-                    pieces = []
-                    for idx, color_hex in enumerate(palette):
-                        start_ratio = idx / segment_count
-                        end_ratio = (idx + 1) / segment_count
-                        piece_min = color_min + diff * start_ratio
-                        piece_max = (
-                            color_min + diff * end_ratio
-                            if idx < segment_count - 1
-                            else color_max
-                        )
-                        pieces.append(
-                            {
-                                "min": piece_min,
-                                "max": piece_max,
-                                "color": color_hex,
-                            }
-                        )
-
-                    echarts_opts = options_mod
-                    if echarts_opts is not None:
-                        tooltip_fmt = getattr(
-                            echarts_opts.TooltipOpts,
-                            "formatter",
-                            None,
-                        )
-                        tooltip_kwargs = {}
-                        if tooltip_fmt is None:
-                            tooltip_kwargs["formatter"] = "t: {c0}<br/>entropy: {c1}<br/>idx: {c2}"
-                        else:
-                            tooltip_kwargs = {"formatter": "t: {c0}<br/>entropy: {c1}<br/>idx: {c2}"}
-                        scatter_chart.set_global_opts(
-                            title_opts=echarts_opts.TitleOpts(
-                                title="Target Entropy vs t",
-                                pos_left="center",
-                            ),
-                            xaxis_opts=echarts_opts.AxisOpts(
-                                name="t",
-                                type_="value",
-                                min_=min_axis,
-                                max_=max_axis,
-                            ),
-                            yaxis_opts=echarts_opts.AxisOpts(
-                                name="entropy",
-                                type_="value",
-                            ),
-                            tooltip_opts=echarts_opts.TooltipOpts(**tooltip_kwargs),
-                            datazoom_opts=[
-                                echarts_opts.DataZoomOpts(type_="slider"),
-                                echarts_opts.DataZoomOpts(type_="inside"),
-                            ],
-                            visualmap_opts=echarts_opts.VisualMapOpts(
-                                dimension=2,
-                                is_piecewise=True,
-                                pieces=pieces,
-                                min_=color_min,
-                                max_=color_max,
-                                orient="horizontal",
-                                pos_top="5%",
-                                pos_left="center",
-                            ),
-                        )
-                        scatter_chart.set_series_opts(
-                            itemstyle_opts=echarts_opts.ItemStyleOpts(opacity=0.35),
-                        )
-
-                    wandb_log_data["diag/entropy_vs_t_table"] = entropy_table
-                    wandb_log_data["diag/entropy_vs_t"] = scatter_chart
+                    
+                    # Log simple statistics (always)
+                    wandb_log_data["diag/entropy_mean"] = float(entropy_cpu.mean().item())
+                    wandb_log_data["diag/entropy_std"] = float(entropy_cpu.std().item())
+                    wandb_log_data["diag/t_mean"] = float(t_cpu.mean().item())
                 wandb_logger.log(wandb_log_data)
         elif args.discrete_flow_matching:
             samples = (samples * 255.0).to(torch.long)
@@ -919,12 +1059,60 @@ def train_one_epoch(
         )
         grad_step_skipped = False
         if apply_update:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if grad_norm is None:
                 grad_step_skipped = True
             elif isinstance(grad_norm, torch.Tensor):
                 grad_step_skipped = not torch.isfinite(grad_norm.detach()).all().item()
             else:
                 grad_step_skipped = not math.isfinite(float(grad_norm))
+            
+            # Compute gradient norms before clipping for logging
+            metric_grad_norm_value = None
+            if hasattr(path, "learnable_metric") and path.learnable_metric is not None:
+                # Compute metric gradient norm BEFORE clipping
+                metric_params = list(path.learnable_metric.parameters())
+                if metric_params:
+                    metric_grad_norm_value = torch.nn.utils.clip_grad_norm_(
+                        metric_params, max_norm=float('inf')
+                    )
+                    # Now actually clip to max_norm=1.0
+                    torch.nn.utils.clip_grad_norm_(metric_params, max_norm=1.0)
+            
+            # LUT gradient diagnostics
+            lut_grad_norm_value = None
+            lut_param_delta = None
+            if hasattr(path, "learnable_lut") and path.learnable_lut is not None:
+                lut_params = list(path.learnable_lut.parameters())
+                if lut_params and lut_params[0].grad is not None:
+                    # Compute gradient norm
+                    lut_grad_norm_value = torch.nn.utils.clip_grad_norm_(
+                        lut_params, max_norm=float('inf')
+                    )
+                    # Store pre-update LUT for delta computation
+                    if not hasattr(args, '_prev_lut_weight'):
+                        args._prev_lut_weight = lut_params[0].data.detach().clone()
+                    else:
+                        # Compute parameter change
+                        lut_param_delta = (lut_params[0].data - args._prev_lut_weight).norm().item()
+                        args._prev_lut_weight = lut_params[0].data.detach().clone()
+            
+            # Post-update projection REMOVED for reparameterization mode
+            # In reparameterization mode (default), Frobenius constraint is enforced by construction
+            # via codes property: codes = scale * (codes_raw / ||codes_raw||_F)
+            # This avoids fighting the optimizer and eliminates gradient explosion
+            #
+            # Legacy post-update projection (only for old checkpoints with use_reparameterization=False):
+            # if apply_update and not grad_step_skipped:
+            #     if hasattr(path, "learnable_metric") and path.learnable_metric is not None:
+            #         if not getattr(path.learnable_metric, 'use_reparameterization', True):
+            #             with torch.no_grad():
+            #                 lower = path.learnable_metric.cholesky_factor()
+            #                 Z = path.learnable_metric.codes @ lower.T
+            #                 fro_norm = torch.linalg.norm(Z, ord='fro')
+            #                 if fro_norm > 1e-8:
+            #                     path.learnable_metric.codes.mul_(1.0 / fro_norm)
+            
             optimizer.zero_grad(set_to_none=True)
         if apply_update and isinstance(model, EMA):
             model.update_ema()
@@ -941,7 +1129,11 @@ def train_one_epoch(
             and teacher_schedule_available
             and beta_schedule_module is not None
         ):
-            schedule_ema.update(beta_schedule_module)
+            # Only update schedule EMA if schedule is not frozen
+            freeze_schedule = getattr(args, "mi_freeze_beta_schedule", False)
+            if not freeze_schedule:
+                schedule_ema.update(beta_schedule_module)
+            # If frozen, skip EMA update (student == teacher, no need to track)
         if (
             apply_update
             and not grad_step_skipped
@@ -1032,6 +1224,13 @@ def train_one_epoch(
                 log_msg += f", tau = {float(current_gumbel_tau):.4g}"
             if metric_interp_active and current_metric_interp is not None:
                 log_msg += f", lambda = {float(current_metric_interp):.4g}"
+            
+            # Add LUT diagnostics to log message
+            if lut_grad_norm_value is not None:
+                log_msg += f", lut_grad = {float(lut_grad_norm_value):.4g}"
+            if lut_param_delta is not None:
+                log_msg += f", lut_delta = {float(lut_param_delta):.6f}"
+            
             logger.info(log_msg)
 
             # Optional Weights & Biases step-level logging (main process only)
@@ -1042,6 +1241,57 @@ def train_one_epoch(
                         global_step = epoch * _dl_len + data_iter_step
                     else:
                         global_step = None
+                    
+                    # Compute metric diagnostics for logging
+                    metric_diagnostics = {}
+                    if hasattr(path, "learnable_metric") and path.learnable_metric is not None:
+                        with torch.no_grad():
+                            Z = path.learnable_metric.transformed_codes(
+                                device=device, dtype=torch.float32
+                            )
+                            fro_norm = torch.linalg.norm(Z, ord='fro')
+                            dist_table = path.learnable_metric.pairwise_distance_table(
+                                device=device, dtype=torch.float32
+                            )
+                            metric_diagnostics = {
+                                "metric/frobenius_norm": float(fro_norm.cpu()),
+                                "metric/distance_mean": float(dist_table.mean().cpu()),
+                                "metric/distance_std": float(dist_table.std().cpu()),
+                                "metric/distance_max": float(dist_table.max().cpu()),
+                                "metric/distance_min": float(dist_table.min().cpu()),
+                            }
+                            # Log learned scale (in reparameterization mode)
+                            if hasattr(path.learnable_metric, 'log_scale'):
+                                metric_diagnostics["metric/learned_scale"] = float(
+                                    torch.exp(path.learnable_metric.log_scale).cpu()
+                                )
+                            if metric_grad_norm_value is not None:
+                                metric_diagnostics["metric/grad_norm"] = float(
+                                    metric_grad_norm_value.cpu() if isinstance(metric_grad_norm_value, torch.Tensor) 
+                                    else metric_grad_norm_value
+                                )
+                    
+                    # Add LUT diagnostics
+                    lut_diagnostics = {}
+                    if hasattr(path, "learnable_lut") and path.learnable_lut is not None:
+                        with torch.no_grad():
+                            # Use forward() to get renormalized weights if enabled
+                            lut_weight = path.learnable_lut()
+                            lut_diagnostics["lut/weight_mean"] = float(lut_weight.mean().cpu())
+                            lut_diagnostics["lut/weight_std"] = float(lut_weight.std().cpu())
+                            lut_diagnostics["lut/weight_min"] = float(lut_weight.min().cpu())
+                            lut_diagnostics["lut/weight_max"] = float(lut_weight.max().cpu())
+                            # Per-channel std
+                            for ch_idx in range(lut_weight.shape[0]):
+                                lut_diagnostics[f"lut/ch{ch_idx}_std"] = float(lut_weight[ch_idx].std().cpu())
+                        if lut_grad_norm_value is not None:
+                            lut_diagnostics["lut/grad_norm"] = float(
+                                lut_grad_norm_value.cpu() if isinstance(lut_grad_norm_value, torch.Tensor) 
+                                else lut_grad_norm_value
+                            )
+                        if lut_param_delta is not None:
+                            lut_diagnostics["lut/param_delta"] = float(lut_param_delta)
+                    
                     wandb.log(  # type: ignore[attr-defined]
                         {
                             "train/step_loss": float(batch_loss.compute().detach().cpu()),
@@ -1049,6 +1299,13 @@ def train_one_epoch(
                             "train/uw_loss": float(uw_loss) if 'uw_loss' in locals() else float(loss_value),
                             "train/lr": float(lr),
                             "epoch": int(epoch),
+                            **metric_diagnostics,
+                            **lut_diagnostics,
+                            **({
+                                "train/model_grad_norm": float(
+                                    grad_norm.cpu() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                                )
+                            } if grad_norm is not None and not grad_step_skipped else {}),
                             **(
                                 {
                                     "train/schedule_kl": float(
@@ -1147,5 +1404,278 @@ def train_one_epoch(
         for attr in ("_schedule_kl_window", "_schedule_kl_window_sum"):
             if hasattr(args, attr):
                 delattr(args, attr)
+    
+    # LUT diagnostics at end of epoch (every 25 epochs)
+    # Per-epoch numeric LUT diagnostics (always compute on main process).
+    if hasattr(path, "learnable_lut") and path.learnable_lut is not None:
+        try:
+            if distributed_mode.is_main_process():
+                with torch.no_grad():
+                    lut_w = path.learnable_lut()  # forward() may renormalize
+                    lut_w_cpu = lut_w.detach().cpu()
+                    # Basic statistics
+                    stats.update(
+                        {
+                            "lut/weight_mean": float(lut_w_cpu.mean().item()),
+                            "lut/weight_std": float(lut_w_cpu.std().item()),
+                            "lut/weight_min": float(lut_w_cpu.min().item()),
+                            "lut/weight_max": float(lut_w_cpu.max().item()),
+                        }
+                    )
+
+                    # Per-channel norms and (if available) renorm targets
+                    try:
+                        per_chan_norm = torch.linalg.vector_norm(lut_w_cpu, dim=(1, 2))
+                        for i, val in enumerate(per_chan_norm.tolist()):
+                            stats[f"lut/ch{i}_norm"] = float(val)
+                        # base norm buffer exists on module (no-noise baseline)
+                        base_buf = getattr(path.learnable_lut, "_base_fro_norm_per_channel", None)
+                        if base_buf is not None:
+                            base_cpu = base_buf.detach().cpu()
+                            renorm_factors = (base_cpu / (per_chan_norm + getattr(path.learnable_lut, "renorm_eps", 1e-12)))
+                            for i, val in enumerate(renorm_factors.tolist()):
+                                stats[f"lut/ch{i}_renorm_factor"] = float(val)
+                    except Exception:
+                        pass
+
+                    # Bounded residual scale diagnostics
+                    if hasattr(path.learnable_lut, "scale_c") and path.learnable_lut.scale_c is not None:
+                        sc = path.learnable_lut.scale_c.detach().cpu()
+                        s0 = float(getattr(path.learnable_lut, "scale_baseline", 1.0))
+                        eps = float(getattr(path.learnable_lut, "scale_epsilon", 0.25))
+                        s_vals = s0 * (1.0 + eps * torch.tanh(sc))
+                        stats.update(
+                            {
+                                "lut/scale_c_mean": float(sc.mean().item()),
+                                "lut/scale_c_std": float(sc.std().item()),
+                                "lut/scale_s_mean": float(s_vals.mean().item()),
+                                "lut/scale_s_min": float(s_vals.min().item()),
+                                "lut/scale_s_max": float(s_vals.max().item()),
+                            }
+                        )
+
+                    # Orthogonality check for multi-dim embeddings (cheap: only max off-diag)
+                    try:
+                        if lut_w_cpu.ndim == 3 and lut_w_cpu.shape[2] > 1:
+                            C, V, D = lut_w_cpu.shape
+                            for ch in range(C):
+                                W = lut_w_cpu[ch].numpy()  # [V, D]
+                                G = W.T @ W
+                                off_diag = np.abs(G - np.diag(np.diag(G)))
+                                stats[f"lut/ch{ch}_orth_offdiag_max"] = float(off_diag.max())
+                    except Exception:
+                        # numpy may not be imported; skip if any error
+                        pass
+
+                    # Parameter delta since epoch start (if snapshot exists)
+                    prev = getattr(args, "_epoch_lut_start", None)
+                    if prev is not None:
+                        try:
+                            delta = (lut_w_cpu - prev).norm().item()
+                            stats["lut/epoch_param_delta"] = float(delta)
+                        except Exception:
+                            pass
+
+                # Also call the richer visualization every 25 epochs (unchanged)
+                if epoch % 25 == 0:
+                    _log_lut_diagnostics(path, epoch, logger, args)
+        except Exception:
+            logger.exception("Error while collecting per-epoch LUT diagnostics")
+    
     return stats
 
+
+def _log_lut_diagnostics(path: MetricInducedGibbsProbPath, epoch: int, logger: logging.Logger, args: argparse.Namespace) -> None:
+    """Visualize LUT diagnostics with matplotlib plots.
+    
+    Creates a comprehensive visualization showing:
+    1. LUT curves for all channels
+    2. Channel correlations and metrics
+    3. Health indicators
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        logger.warning("matplotlib not available, skipping LUT visualization")
+        return
+    
+    with torch.no_grad():
+        # Use forward() to get renormalized weights (if enabled)
+        lut_weights_raw = path.learnable_lut().cpu()  # [C, V, D]
+        shape = lut_weights_raw.shape
+        
+        # Handle both [C, V] (legacy 1D) and [C, V, D] (new multi-dim) formats
+        if len(shape) == 2:
+            # Legacy 1D format: [C, V]
+            C, V = shape
+            D = 1
+            lut_weights = lut_weights_raw.numpy()
+            is_multidim = False
+        elif len(shape) == 3:
+            # New multi-dim format: [C, V, D]
+            C, V, D = shape
+            if D == 1:
+                # Squeeze out singleton dimension for backward compatibility
+                lut_weights = lut_weights_raw.squeeze(-1).numpy()  # [C, V]
+                is_multidim = False
+            else:
+                # Compute L2 norm per token as scalar proxy for visualization
+                lut_weights = torch.norm(lut_weights_raw, p=2, dim=-1).numpy()  # [C, V]
+                is_multidim = True
+        else:
+            logger.error(f"Unexpected LUT weight shape: {shape}")
+            return
+        
+        channel_names = ['R', 'G', 'B'] if C == 3 else [f'Ch{i}' for i in range(C)]
+        colors = ['red', 'green', 'blue'] if C == 3 else [f'C{i}' for i in range(C)]
+        
+        # Create figure with subplots
+        fig = plt.figure(figsize=(16, 10))
+        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+        
+        # 1. Main LUT curves
+        ax1 = fig.add_subplot(gs[0:2, 0:2])
+        x = np.arange(V)
+        for c, (name, color) in enumerate(zip(channel_names, colors)):
+            ax1.plot(x, lut_weights[c], label=name, color=color, alpha=0.8, linewidth=1.5)
+        ax1.set_xlabel('Token Value', fontsize=12)
+        ylabel = 'L2 Norm of Embedding' if is_multidim else 'Embedding Value'
+        ax1.set_ylabel(ylabel, fontsize=12)
+        title_suffix = f' (D={D})' if is_multidim else ''
+        ax1.set_title(f'LUT Curves{title_suffix} - Epoch {epoch}', fontsize=14, fontweight='bold')
+        ax1.legend(loc='best')
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. Channel L2 Norms
+        ax2 = fig.add_subplot(gs[0, 2])
+        norms = [np.linalg.norm(lut_weights[c]) for c in range(C)]
+        ax2.bar(channel_names, norms, color=colors, alpha=0.7)
+        ax2.set_ylabel('L2 Norm', fontsize=11)
+        ax2.set_title('Channel Norms', fontsize=12, fontweight='bold')
+        ax2.grid(True, alpha=0.3, axis='y')
+        for i, v in enumerate(norms):
+            ax2.text(i, v + 0.05, f'{v:.2f}', ha='center', va='bottom', fontsize=9)
+        
+        # 3. Spearman ρ (rank correlation)
+        ax3 = fig.add_subplot(gs[1, 2])
+        init_order = np.arange(V, dtype=np.float32)
+        rhos = []
+        for c in range(C):
+            emb = lut_weights[c]
+            rank_emb = np.argsort(np.argsort(emb)).astype(np.float32)
+            # Pearson correlation of ranks = Spearman
+            rho = np.corrcoef(rank_emb, init_order)[0, 1]
+            rhos.append(rho)
+        ax3.bar(channel_names, rhos, color=colors, alpha=0.7)
+        ax3.set_ylabel('Spearman ρ', fontsize=11)
+        ax3.set_title('Rank Preservation', fontsize=12, fontweight='bold')
+        ax3.axhline(y=1.0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        ax3.set_ylim([min(rhos) - 0.01, 1.01])
+        ax3.grid(True, alpha=0.3, axis='y')
+        for i, v in enumerate(rhos):
+            ax3.text(i, v - 0.005, f'{v:.4f}', ha='center', va='top', fontsize=9)
+        
+        # 4. Inversions (monotonicity)
+        ax4 = fig.add_subplot(gs[2, 0])
+        inversions = []
+        for c in range(C):
+            diffs = lut_weights[c][1:] - lut_weights[c][:-1]
+            inv_count = np.sum(diffs < 0)
+            inversions.append(inv_count)
+        ax4.bar(channel_names, inversions, color=colors, alpha=0.7)
+        ax4.set_ylabel('Inversion Count', fontsize=11)
+        ax4.set_title('Monotonicity Check', fontsize=12, fontweight='bold')
+        ax4.grid(True, alpha=0.3, axis='y')
+        for i, v in enumerate(inversions):
+            ax4.text(i, v + 0.5, f'{int(v)}', ha='center', va='bottom', fontsize=9)
+        
+        # 5. Channel correlations (heatmap)
+        ax5 = fig.add_subplot(gs[2, 1])
+        if C > 1:
+            corr_matrix = np.corrcoef(lut_weights)
+            im = ax5.imshow(corr_matrix, cmap='RdYlGn_r', vmin=0.95, vmax=1.0, aspect='auto')
+            ax5.set_xticks(range(C))
+            ax5.set_yticks(range(C))
+            ax5.set_xticklabels(channel_names)
+            ax5.set_yticklabels(channel_names)
+            ax5.set_title('Channel Correlation', fontsize=12, fontweight='bold')
+            # Add correlation values
+            for i in range(C):
+                for j in range(C):
+                    text = ax5.text(j, i, f'{corr_matrix[i, j]:.4f}',
+                                   ha='center', va='center', color='black', fontsize=9)
+            plt.colorbar(im, ax=ax5, fraction=0.046, pad=0.04)
+        else:
+            ax5.text(0.5, 0.5, 'Single Channel', ha='center', va='center', fontsize=12)
+            ax5.set_xticks([])
+            ax5.set_yticks([])
+        
+        # 6. Health summary
+        ax6 = fig.add_subplot(gs[2, 2])
+        ax6.axis('off')
+        health_text = f"Epoch {epoch}\n\n"
+        health_text += "Health Status:\n"
+        all_good = True
+        for c, name in enumerate(channel_names):
+            emb = lut_weights[c]
+            diffs = emb[1:] - emb[:-1]
+            inv_count = np.sum(diffs < 0)
+            inv_ratio = inv_count / (V - 1)
+            std_val = np.std(emb)
+            
+            issues = []
+            if inv_ratio > 0.06:
+                issues.append(f"inv>{int(inv_ratio*100)}%")
+                all_good = False
+            if std_val > 2.0:
+                issues.append(f"std>{std_val:.1f}")
+                all_good = False
+            if std_val < 0.2:
+                issues.append(f"std<{std_val:.2f}")
+                all_good = False
+            if emb[0] > emb[-1]:
+                issues.append("flipped")
+                all_good = False
+            
+            if issues:
+                health_text += f"  {name}: ⚠ {', '.join(issues)}\n"
+            else:
+                health_text += f"  {name}: ✓\n"
+        
+        if all_good:
+            health_text += "\n[OK] All checks passed"
+        
+        ax6.text(0.1, 0.9, health_text, transform=ax6.transAxes,
+                fontsize=10, verticalalignment='top', family='monospace',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+        
+        # Save and log
+        plt.suptitle(f'LUT Diagnostics - Epoch {epoch}', fontsize=16, fontweight='bold', y=0.98)
+        
+        # Save to file
+        save_dir = getattr(args, 'output_dir', './output_dir')
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'lut_diagnostics_epoch_{epoch:04d}.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        logger.info(f"LUT diagnostics visualization saved to {save_path}")
+        
+        # Log to wandb if available
+        if getattr(args, 'wandb', False):
+            try:
+                import wandb
+                # Only log if wandb is actually initialized
+                if wandb.run is not None:
+                    wandb.log({"lut/diagnostics": wandb.Image(save_path)}, step=epoch)
+                    logger.info(f"✓ LUT diagnostics uploaded to wandb (run: {wandb.run.name})")
+                else:
+                    logger.info("wandb not initialized, image saved locally only")
+            except ImportError:
+                logger.info("wandb not installed, image saved locally only")
+            except Exception as e:
+                logger.info(f"wandb upload skipped ({type(e).__name__}), image saved locally")
+        
+        plt.close(fig)
