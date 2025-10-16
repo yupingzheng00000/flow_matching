@@ -4,11 +4,15 @@
 #
 # Utility to inspect the local geometry of a learnable LUT snapshot.
 #
-# Usage:
+# Usage (snapshot):
 #   python lut_geometry_inspect.py --lut path/to/lut_epoch_xxxx.pt \
 #       [--normalized] [--print-projection] [--export-projection path.npy]
+# Usage (checkpoint):
+#   python lut_geometry_inspect.py --checkpoint path/to/checkpoint-5499.pth \
+#       --lut-key metric_learnable_lut [--normalized] [...]
 #
 # The LUT snapshot can be produced via training.lut_diagnostics_integration.save_lut_snapshot.
+# When pointing to a training checkpoint, the LUT is fetched from checkpoint["extra_modules"][lut_key].
 # The script reports:
 #   - cos_mean / cos_median / flip_rate: directional continuity of adjacent token differences.
 #   - stretch_median / stretch_mean: ratio of adjacent distances vs baseline linear LUT.
@@ -51,6 +55,37 @@ def load_lut_snapshot(path: Path) -> Tuple[torch.Tensor, Dict[str, int]]:
         "num_channels": int(data.get("num_channels", weight.shape[0])),
         "vocab_size": int(data.get("vocab_size", weight.shape[1])),
         "embed_range": data.get("embed_range", "pm1"),
+    }
+    return weight, meta
+
+
+def load_lut_from_checkpoint(
+    path: Path,
+    lut_key: str,
+) -> Tuple[torch.Tensor, Dict[str, int]]:
+    checkpoint = torch.load(path, map_location="cpu")
+    extra = checkpoint.get("extra_modules")
+    if not isinstance(extra, dict):
+        raise KeyError(f"{path} has no 'extra_modules' dict; cannot locate '{lut_key}'")
+    if lut_key not in extra:
+        available = ", ".join(sorted(extra.keys()))
+        raise KeyError(f"'{lut_key}' not found in checkpoint extra_modules. Available keys: {available}")
+    state_dict = extra[lut_key]
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"extra_modules['{lut_key}'] is not a state_dict (got {type(state_dict).__name__})")
+    if "weight" not in state_dict:
+        raise KeyError(f"State dict for '{lut_key}' is missing 'weight'")
+    weight = state_dict["weight"]
+    embed_range = None
+    checkpoint_args = checkpoint.get("args")
+    if hasattr(checkpoint_args, "mi_embed_range"):
+        embed_range = getattr(checkpoint_args, "mi_embed_range")
+    if embed_range is None:
+        embed_range = "pm1"
+    meta = {
+        "num_channels": weight.shape[0],
+        "vocab_size": weight.shape[1],
+        "embed_range": embed_range,
     }
     return weight, meta
 
@@ -133,14 +168,22 @@ def signed_projection_curve(weight: torch.Tensor, mode: str = "mean") -> torch.T
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect learnable LUT geometry.")
-    parser.add_argument("--lut", type=Path, required=True, help="Path to LUT snapshot (.pt).")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--lut", type=Path, help="Path to LUT snapshot (.pt) saved via save_lut_snapshot.")
+    group.add_argument("--checkpoint", type=Path, help="Path to training checkpoint containing extra_modules.")
     parser.add_argument("--baseline", type=Path, default=None, help="Optional baseline LUT snapshot (.pt).")
+    parser.add_argument("--lut-key", type=str, default="metric_learnable_lut", help="Key inside checkpoint['extra_modules'] for the learnable LUT.")
     parser.add_argument("--normalized", action="store_true", help="Use normalized distances (divide by sqrt(D)).")
     parser.add_argument("--projection-mode", choices=["none", "mean", "uniform"], default="none", help="Compute signed projection curve.")
     parser.add_argument("--export-projection", type=Path, default=None, help="Where to save projection curve (npz with per-channel arrays).")
     args = parser.parse_args()
 
-    lut_weight, meta = load_lut_snapshot(args.lut)
+    if args.lut is not None:
+        lut_weight, meta = load_lut_snapshot(args.lut)
+        lut_source = args.lut
+    else:
+        lut_weight, meta = load_lut_from_checkpoint(args.checkpoint, lut_key=args.lut_key)
+        lut_source = args.checkpoint
     lut_weight = _ensure_3d(lut_weight)
 
     if args.baseline is not None:
@@ -155,8 +198,9 @@ def main() -> None:
         normalized_distance=args.normalized,
     )
 
-    print(f"LUT snapshot: {args.lut}")
+    print(f"LUT source: {lut_source}")
     print(f"Shape: C={meta['num_channels']}, V={meta['vocab_size']}, D={lut_weight.shape[-1]}")
+    print(f"Embed range baseline: {meta.get('embed_range', 'pm1')}")
     print("=== Directional continuity ===")
     for key in ["cos_mean", "cos_median", "flip_rate", "cos_lt_half_rate"]:
         print(f"{key}: {metrics[key].tolist()}")
