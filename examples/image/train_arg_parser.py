@@ -169,6 +169,15 @@ def get_args_parser():
             "Set this flag to use the raw student metric for evaluation (actual trained version)."
         ),
     )
+    parser.add_argument(
+        "--mi_eval_cache_lut",
+        action="store_true",
+        help=(
+            "Precompute and cache learnable LUT distance tables during evaluation. "
+            "This speeds up sampling when learnable LUT embeddings have dim > 1; "
+            "training continues to recompute distances each step."
+        ),
+    )
 
     parser.add_argument(
         "--start_epoch",
@@ -317,7 +326,7 @@ def get_args_parser():
     parser.add_argument(
         "--mi_metric",
         default="lp",
-        choices=["lp", "cosine"],
+        choices=["lp", "euclidean", "cosine"],
         type=str,
         help="Metric to use for the metric-induced path.",
     )
@@ -387,6 +396,15 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_lut_cosine_scale",
+        default=1.0,
+        type=float,
+        help=(
+            "Scale factor s applied to cosine LUT distance (dist = s * (1 - cos)). "
+            "Only used when --mi_metric=cosine."
+        ),
+    )
+    parser.add_argument(
         "--mi_freeze_lut",
         action="store_true",
         help="Freeze the learnable LUT parameters (requires_grad=False).",
@@ -402,6 +420,31 @@ def get_args_parser():
         default=1e-4,
         type=float,
         help="Weight decay applied to learnable LUT parameters.",
+    )
+    parser.add_argument(
+        "--mi_lut_kl_weight",
+        default=0.0,
+        type=float,
+        help=(
+            "KL trust-region weight to keep learned LUT-induced p_t close to the baseline geometry. "
+            "Computes KL(p_base || p_learned) at the sampled t and adds it to the loss."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_kl_t_lo",
+        default=None,
+        type=float,
+        help=(
+            "Optional lower t-bound for LUT KL penalty (only apply when t in [lo, hi])."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_kl_t_hi",
+        default=None,
+        type=float,
+        help=(
+            "Optional upper t-bound for LUT KL penalty (only apply when t in [lo, hi])."
+        ),
     )
     parser.add_argument(
         "--mi_lut_init_method",

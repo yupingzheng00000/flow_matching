@@ -72,6 +72,11 @@ class LearnableScalarLUT(nn.Module):
         # Set initialization parameters before calling _init_weight
         self.init_method = str(init_method)
         self.init_noise_scale = float(init_noise_scale)
+        if self.init_method == "small_noise_qr" and self.emb_dim > self.vocab_size:
+            raise ValueError(
+                "small_noise_qr initialization requires emb_dim <= vocab_size "
+                f"(got emb_dim={self.emb_dim}, vocab_size={self.vocab_size})"
+            )
 
         weight = self._init_weight()
         if device is not None:
@@ -638,6 +643,7 @@ class MetricInducedGibbsProbPath(ProbPath):
         lut_init_method: str = "linear",
         lut_init_noise_scale: float = 0.01,
         use_normalized_distance: bool = False,
+        lut_cosine_scale: float = 1.0,
     ):
         super().__init__()
         self.metric_name = metric
@@ -673,13 +679,20 @@ class MetricInducedGibbsProbPath(ProbPath):
         self._lut_init_method = str(lut_init_method)
         self._lut_init_noise_scale = float(lut_init_noise_scale)
         self._use_normalized_distance = bool(use_normalized_distance)
+        # Optional cosine metric scale (applied to 1-cos distance)
+        self._lut_cosine_scale: float = float(lut_cosine_scale)
 
         if learnable_lut:
             if learnable_metric_dim > 0:
                 raise ValueError("Cannot enable both learnable_metric and learnable_lut")
-            if metric not in {"lp", "euclidean"}:
+            if metric not in {"lp", "euclidean", "cosine"}:
                 raise ValueError(
-                    "learnable_lut currently supports only 'lp' or 'euclidean' metrics (absolute difference)"
+                    "learnable_lut supports metrics: 'lp', 'euclidean', or 'cosine'"
+                )
+            if metric == "cosine":
+                logger.info(
+                    "Initializing learnable LUT with cosine distance (scale=%.3f)",
+                    self._lut_cosine_scale,
                 )
             num_channels = 1 if self._lut_share_across_channels else self._lut_num_channels
             lut_module = LearnableScalarLUT(
@@ -728,6 +741,8 @@ class MetricInducedGibbsProbPath(ProbPath):
         self._cached_lp_order: Optional[float] = None
         # Cache for learned metric during eval (parameters frozen)
         self._cached_learned_dist_table: Optional[Tensor] = None  # [K,K]
+        # Cache for learnable LUT distance tables during eval
+        self._cached_lut_dist_table: Optional[Tensor] = None  # [C,K,K]
 
         self.metric_interp_lambda = 0.0
         self.set_metric_interpolation_lambda(metric_interp_lambda)
@@ -939,10 +954,17 @@ class MetricInducedGibbsProbPath(ProbPath):
         if weight.device != device or weight.dtype != dtype:
             weight = weight.to(device=device, dtype=dtype)
         channels, vocab_size, emb_dim = weight.shape
-        
+
+        # Cosine metric: compute 1 - cosine similarity on unit-normalized embeddings
+        if self.metric_name == "cosine":
+            wn = F.normalize(weight, p=2, dim=-1, eps=1e-12)  # [C,V,D]
+            sim = torch.matmul(wn, wn.transpose(-1, -2))      # [C,V,V]
+            dist = (1.0 - sim) * float(self._lut_cosine_scale)
+            return dist
+
         # Compute pairwise differences: [C, V, V, D]
         diff = weight[:, :, None, :] - weight[:, None, :, :]  # [C, V, 1, D] - [C, 1, V, D]
-        
+
         if self._use_normalized_distance:
             # Normalized distance: ||diff||_2 / sqrt(m)
             # For scalar embeddings (emb_dim=1): m=1, so just ||diff||_2
@@ -1004,6 +1026,36 @@ class MetricInducedGibbsProbPath(ProbPath):
         dist = rows.gather(1, flat1.view(-1, 1))
         return dist.view(x_tokens.shape + (1,))
 
+    def precompute_lut_distance_table(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Precompute and cache the learnable LUT distance table for evaluation.
+
+        This should be called at the start of evaluation when LUT parameters are
+        frozen so that repeated sampling steps can reuse the cached distances.
+        """
+        if self.learnable_lut is None:
+            logger.warning("precompute_lut_distance_table is a no-op (learnable_lut is None)")
+            return
+        with torch.no_grad():
+            table = self._build_lut_distance_table(device=device, dtype=dtype).detach()
+        self._cached_lut_dist_table = table
+        logger.info(
+            "Precomputed learnable LUT distance table [%s] on %s with dtype %s",
+            tuple(table.shape),
+            device,
+            dtype,
+        )
+
+    def clear_lut_cache(self) -> None:
+        """Clear the cached LUT distance table (if any)."""
+        if self._cached_lut_dist_table is not None:
+            logger.info("Clearing cached learnable LUT distance table")
+            self._cached_lut_dist_table = None
+
     def precompute_learned_metric_table(
         self,
         *,
@@ -1011,20 +1063,20 @@ class MetricInducedGibbsProbPath(ProbPath):
         dtype: torch.dtype,
         metric_module: Optional[MahalanobisTokenMetric] = None,
     ) -> None:
-        if self.learnable_lut is not None:
-            logger.warning("precompute_learned_metric_table is a no-op when learnable_lut is enabled")
-            return
         """Precompute and cache learned metric distance table for evaluation.
-        
-        This should be called once at the start of evaluation to avoid recomputing
-        the distance table at every timestep when the metric parameters are frozen.
-        
+
         Args:
-            device: Device to store the cached table on
-            dtype: Data type for the cached table
-            metric_module: Optional metric module to use (e.g., EMA teacher).
-                If None, uses self.learnable_metric.
+            device: Device to store the cached table on.
+            dtype: Data type for the cached table.
+            metric_module: Optional override for the metric (e.g., EMA teacher).
+                When omitted, uses ``self.learnable_metric``.
         """
+        if self.learnable_lut is not None:
+            logger.warning(
+                "precompute_learned_metric_table is intended for learnable metrics; "
+                "call precompute_lut_distance_table when using a learnable LUT instead."
+            )
+            return
         learned_table = self._learned_distance_table(
             device=device,
             dtype=dtype,
@@ -1071,7 +1123,12 @@ class MetricInducedGibbsProbPath(ProbPath):
         use_cache: bool = False,
     ) -> Tensor:
         if self.learnable_lut is not None:
-            table = self._build_lut_distance_table(device=device, dtype=dtype)
+            if use_cache and self._cached_lut_dist_table is not None:
+                table = self._cached_lut_dist_table
+                if table.device != device or table.dtype != dtype:
+                    table = table.to(device=device, dtype=dtype)
+            else:
+                table = self._build_lut_distance_table(device=device, dtype=dtype)
             return table
 
         base = self._get_base_distance_table(device=device, dtype=dtype)
@@ -1119,7 +1176,9 @@ class MetricInducedGibbsProbPath(ProbPath):
         
         # LUT path: [C, K, K] distance table requires channel-aware indexing
         if self.learnable_lut is not None:
-            dist_table = self._build_lut_distance_table(device=device, dtype=dtype)
+            dist_table = self._build_distance_table(
+                device=device, dtype=dtype, use_cache=True
+            )
             return self._lut_rows(dist_table, token_indices)
         
         # Standard path: [K, K] distance table

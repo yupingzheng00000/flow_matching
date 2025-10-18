@@ -267,6 +267,7 @@ def main(args):
                 lut_scale_baseline=float(getattr(args, "mi_lut_scale_baseline", 1.0)),
                 lut_scale_epsilon=float(getattr(args, "mi_lut_scale_epsilon", 0.25)),
                 use_normalized_distance=bool(getattr(args, "mi_use_normalized_distance", False)),
+                lut_cosine_scale=float(getattr(args, "mi_lut_cosine_scale", 1.0)),
             )
         args.mi_metric_interp_start = float(getattr(args, "mi_metric_interp_start", 0.0))
         args.mi_metric_interp_end = float(getattr(args, "mi_metric_interp_end", 1.0))

@@ -1049,10 +1049,19 @@ def eval_model(
     geometry_stats: Dict[str, float] = {}
     geometry_logged = False
     
-    # Track whether we need to clear cache at the end
-    need_clear_cache = False
+    # Track whether we need to clear cached resources at the end
+    need_clear_metric_cache = False
+    need_clear_lut_cache = False
     if ko_path is not None and ko_path.learnable_metric is not None:
-        need_clear_cache = True
+        need_clear_metric_cache = True
+    if (
+        getattr(args, "mi_eval_cache_lut", False)
+        and ko_path is not None
+        and ko_path.learnable_lut is not None
+    ):
+        cache_dtype = ko_path.embedding.weight.dtype
+        ko_path.precompute_lut_distance_table(device=device, dtype=cache_dtype)
+        need_clear_lut_cache = True
 
     diagnostics_enabled = bool(getattr(args, "diag_enable", False))
     if diagnostics_enabled and distributed_mode.is_main_process():
@@ -1569,7 +1578,10 @@ def eval_model(
         torch.cuda.empty_cache()
     
     # Clear learned metric cache if we used it
-    if need_clear_cache and ko_path is not None:
-        ko_path.clear_learned_metric_cache()
+    if ko_path is not None:
+        if need_clear_metric_cache:
+            ko_path.clear_learned_metric_cache()
+        if need_clear_lut_cache:
+            ko_path.clear_lut_cache()
     
     return stats

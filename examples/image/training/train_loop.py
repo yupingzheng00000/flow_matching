@@ -389,6 +389,8 @@ def train_one_epoch(
 
     batch_loss = MeanMetric().to(device, non_blocking=True)
     epoch_loss = MeanMetric().to(device, non_blocking=True)
+    entropy_metric = MeanMetric().to(device, non_blocking=True)
+    entropy_samples: list[torch.Tensor] = []
 
     accum_iter = args.accum_iter
     # Select path according to args. For KO CIFAR-10 metric-induced path, set
@@ -556,6 +558,9 @@ def train_one_epoch(
 
         schedule_kl_value = None
         schedule_kl_penalty = None
+        step_entropy_mean: Optional[float] = None
+        step_entropy_median: Optional[float] = None
+        step_entropy_p90: Optional[float] = None
 
         if getattr(args, "ko_metric_induced", False):
             # KO: 256-way classification; no mask token
@@ -822,12 +827,63 @@ def train_one_epoch(
                 path_probs = path_probs.clamp_min(1e-12)
                 per_site_entropy = -(path_probs * path_probs.log()).sum(dim=-1)
                 target_entropy = per_site_entropy.mean(dim=1)
+                entropy_metric.update(target_entropy.mean())
+                entropy_detached = target_entropy.detach()
+                if entropy_detached.numel() > 0:
+                    entropy_cpu = entropy_detached.to(device="cpu")
+                    entropy_samples.append(entropy_cpu)
+                    step_entropy_mean = float(entropy_cpu.mean().item())
+                    step_entropy_median = float(torch.quantile(entropy_cpu, 0.5).item())
+                    step_entropy_p90 = float(torch.quantile(entropy_cpu, 0.9).item())
             per_sample_loss = token_loss.view(samples.shape[0], -1).mean(dim=1)
             uw_loss = per_sample_loss.mean().item()
             loss = _importance_weighted_mean(per_sample_loss, logbeta_weights)
 
             if logbeta_reg_penalty is not None:
                 loss = loss + logbeta_reg_penalty
+
+            # KL trust region to baseline geometry for LUT (teacher = baseline distances)
+            lut_kl_weight = float(getattr(args, "mi_lut_kl_weight", 0.0) or 0.0)
+            if (
+                lut_kl_weight > 0.0
+                and isinstance(path, MetricInducedGibbsProbPath)
+                and getattr(path, "learnable_lut", None) is not None
+            ):
+                # Optionally restrict to a t-band
+                t_lo = getattr(args, "mi_lut_kl_t_lo", None)
+                t_hi = getattr(args, "mi_lut_kl_t_hi", None)
+                apply_mask = None
+                if t_lo is not None and t_hi is not None:
+                    t_lo_f = float(t_lo)
+                    t_hi_f = float(t_hi)
+                    apply_mask = (t >= t_lo_f) & (t <= t_hi_f)
+
+                # Build baseline table once per step and gather rows for x1
+                base_table = path._get_base_distance_table(
+                    device=path.embedding.weight.device,
+                    dtype=path.embedding.weight.dtype,
+                )
+                # Gather baseline distances rows for tokens
+                B = x1_flat.shape[0]
+                S = x1_flat.shape[1]
+                K = path.vocab_size
+                base_rows = base_table.index_select(0, x1_flat.view(-1)).view(B, S, K)
+                # Compute teacher probs from baseline with the same beta(t)
+                beta_t, _ = path.beta(t)
+                beta_t = beta_t.view(B, 1, 1).to(device=base_rows.device, dtype=base_rows.dtype)
+                logits_base = -beta_t * base_rows
+                logits_base = logits_base - logits_base.max(dim=-1, keepdim=True).values
+                teacher_probs = torch.softmax(logits_base, dim=-1).to(device=path_probs.device, dtype=path_probs.dtype)
+
+                # Student probs are current path_probs (already clamped)
+                student_probs = path_probs.clamp_min(1e-12)
+                teacher_probs = teacher_probs.clamp_min(1e-12).detach()  # no grad through teacher
+                kl_tensor = (teacher_probs * (torch.log(teacher_probs) - torch.log(student_probs))).sum(dim=-1)
+                if apply_mask is not None:
+                    # Zero out KL where mask is false
+                    kl_tensor = torch.where(apply_mask.view(-1, 1), kl_tensor, torch.zeros_like(kl_tensor))
+                lut_kl_value = _importance_weighted_mean(kl_tensor, logbeta_weights)
+                loss = loss + lut_kl_weight * lut_kl_value
 
             # Bounded residual scale penalty (L2 on scale parameter c)
             scale_penalty: Optional[torch.Tensor] = None
@@ -1050,6 +1106,10 @@ def train_one_epoch(
         # Loss scaler applies the optimizer when update_grad is set to true.
         # Otherwise just updates the internal gradient scales
         apply_update = (data_iter_step + 1) % accum_iter == 0
+        metric_grad_norm_value = None
+        lut_grad_norm_value = None
+        lut_param_delta = None
+
         grad_norm = loss_scaler(
             loss,
             optimizer,
@@ -1068,7 +1128,6 @@ def train_one_epoch(
                 grad_step_skipped = not math.isfinite(float(grad_norm))
             
             # Compute gradient norms before clipping for logging
-            metric_grad_norm_value = None
             if hasattr(path, "learnable_metric") and path.learnable_metric is not None:
                 # Compute metric gradient norm BEFORE clipping
                 metric_params = list(path.learnable_metric.parameters())
@@ -1080,8 +1139,6 @@ def train_one_epoch(
                     torch.nn.utils.clip_grad_norm_(metric_params, max_norm=1.0)
             
             # LUT gradient diagnostics
-            lut_grad_norm_value = None
-            lut_param_delta = None
             if hasattr(path, "learnable_lut") and path.learnable_lut is not None:
                 lut_params = list(path.learnable_lut.parameters())
                 if lut_params and lut_params[0].grad is not None:
@@ -1210,6 +1267,9 @@ def train_one_epoch(
         if data_iter_step % PRINT_FREQUENCY == 0:
             # Console log
             dl_len_str = str(_dl_len) if _dl_len is not None else "?"
+            tau_progress = None
+            if gumbel_schedule_active and gumbel_tau_steps > 0:
+                tau_progress = min(gumbel_update_step, gumbel_tau_steps) / float(gumbel_tau_steps)
             log_msg = (
                 f"Epoch {epoch} [{data_iter_step}/{dl_len_str}]: loss = {batch_loss.compute()}, lr = {lr}"
             )
@@ -1222,8 +1282,14 @@ def train_one_epoch(
                     log_msg += f", kl_avg = {float(kl_avg_for_logging):.4g}"
             if gumbel_schedule_active and current_gumbel_tau is not None:
                 log_msg += f", tau = {float(current_gumbel_tau):.4g}"
+                if tau_progress is not None:
+                    log_msg += f" (prog={tau_progress:.2%})"
             if metric_interp_active and current_metric_interp is not None:
                 log_msg += f", lambda = {float(current_metric_interp):.4g}"
+            if step_entropy_mean is not None:
+                log_msg += f", H={step_entropy_mean:.3f}"
+                if step_entropy_median is not None:
+                    log_msg += f" (p50={step_entropy_median:.3f})"
             
             # Add LUT diagnostics to log message
             if lut_grad_norm_value is not None:
@@ -1281,13 +1347,32 @@ def train_one_epoch(
                             lut_diagnostics["lut/weight_std"] = float(lut_weight.std().cpu())
                             lut_diagnostics["lut/weight_min"] = float(lut_weight.min().cpu())
                             lut_diagnostics["lut/weight_max"] = float(lut_weight.max().cpu())
+                            lut_diagnostics["lut/weight_abs_max"] = float(lut_weight.abs().max().cpu())
                             # Per-channel std
                             for ch_idx in range(lut_weight.shape[0]):
                                 lut_diagnostics[f"lut/ch{ch_idx}_std"] = float(lut_weight[ch_idx].std().cpu())
+                            # Per-channel Frobenius norms
+                            lut_flat = lut_weight.view(lut_weight.shape[0], -1)
+                            channel_fro = torch.linalg.vector_norm(lut_flat, ord=2, dim=1)
+                            lut_diagnostics["lut/fro_norm_mean"] = float(channel_fro.mean().cpu())
+                            for ch_idx, fro_val in enumerate(channel_fro):
+                                lut_diagnostics[f"lut/ch{ch_idx}_fro_norm"] = float(fro_val.cpu())
+                            base_norm = getattr(path.learnable_lut, "_base_fro_norm_per_channel", None)
+                            if base_norm is not None:
+                                base_norm = base_norm.to(device=lut_weight.device, dtype=lut_weight.dtype)
+                                ratio = channel_fro / base_norm.clamp_min(1e-12)
+                                lut_diagnostics["lut/fro_ratio_mean"] = float(ratio.mean().cpu())
+                                for ch_idx, ratio_val in enumerate(ratio):
+                                    lut_diagnostics[f"lut/ch{ch_idx}_fro_ratio"] = float(ratio_val.cpu())
+                        if hasattr(path.learnable_lut, "scale_c") and path.learnable_lut.scale_c is not None:
+                            scale_c_cpu = path.learnable_lut.scale_c.detach().cpu()
+                            lut_diagnostics["lut/scale_c_mean"] = float(scale_c_cpu.mean().item())
+                            lut_diagnostics["lut/scale_c_std"] = float(scale_c_cpu.std().item())
                         if lut_grad_norm_value is not None:
                             lut_diagnostics["lut/grad_norm"] = float(
-                                lut_grad_norm_value.cpu() if isinstance(lut_grad_norm_value, torch.Tensor) 
-                                else lut_grad_norm_value
+                                lut_grad_norm_value.detach().cpu().item()
+                                if isinstance(lut_grad_norm_value, torch.Tensor)
+                                else float(lut_grad_norm_value)
                             )
                         if lut_param_delta is not None:
                             lut_diagnostics["lut/param_delta"] = float(lut_param_delta)
@@ -1339,6 +1424,22 @@ def train_one_epoch(
                             ),
                             **(
                                 {
+                                    "train/gumbel_tau_progress": float(tau_progress)
+                                }
+                                if tau_progress is not None
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "train/entropy_mean": float(step_entropy_mean),
+                                    "train/entropy_median": float(step_entropy_median),
+                                    "train/entropy_p90": float(step_entropy_p90),
+                                }
+                                if step_entropy_mean is not None
+                                else {}
+                            ),
+                            **(
+                                {
                                     "train/metric_interp_lambda": float(
                                         current_metric_interp
                                     )
@@ -1380,6 +1481,21 @@ def train_one_epoch(
     setattr(args, "_mi_logbeta_reg_step", logbeta_reg_update_step)
     lr_schedule.step()
     stats = {"loss": float(epoch_loss.compute().detach().cpu())}
+    if entropy_samples:
+        try:
+            entropy_epoch_tensor = torch.cat(entropy_samples)
+            stats.update(
+                {
+                    "entropy/mean": float(entropy_epoch_tensor.mean().item()),
+                    "entropy/std": float(entropy_epoch_tensor.std(unbiased=False).item()),
+                    "entropy/p25": float(torch.quantile(entropy_epoch_tensor, 0.25).item()),
+                    "entropy/p50": float(torch.quantile(entropy_epoch_tensor, 0.5).item()),
+                    "entropy/p90": float(torch.quantile(entropy_epoch_tensor, 0.9).item()),
+                    "entropy/batch_mean": float(entropy_metric.compute().detach().cpu()),
+                }
+            )
+        except Exception:
+            pass
     if use_path_trust_region and kl_updates_total > 0 and kl_metric and kl_penalty_metric:
         stats.update(
             {
@@ -1394,6 +1510,10 @@ def train_one_epoch(
         setattr(args, "_gumbel_update_step", gumbel_update_step)
         if current_gumbel_tau is not None:
             stats["gumbel_tau"] = float(current_gumbel_tau)
+        if gumbel_tau_steps > 0:
+            stats["gumbel_tau_progress"] = float(
+                min(gumbel_update_step, gumbel_tau_steps) / float(gumbel_tau_steps)
+            )
     if metric_interp_active:
         setattr(args, "_metric_interp_update_step", metric_interp_update_step)
         if current_metric_interp is not None:

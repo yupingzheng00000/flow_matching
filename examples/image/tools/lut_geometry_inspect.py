@@ -34,15 +34,23 @@ def _ensure_3d(weight: torch.Tensor) -> torch.Tensor:
     return weight
 
 
-def _linear_baseline(num_channels: int, vocab_size: int, embed_range: str, device, dtype) -> torch.Tensor:
-    weight = torch.zeros(num_channels, vocab_size, 1, device=device, dtype=dtype)
+def _linear_baseline(
+    num_channels: int,
+    vocab_size: int,
+    embed_range: str,
+    device,
+    dtype,
+    embed_dim: int = 1,
+) -> torch.Tensor:
+    weight = torch.zeros(num_channels, vocab_size, embed_dim, device=device, dtype=dtype)
     if embed_range == "pm1":
         base = torch.linspace(-1.0, 1.0, steps=vocab_size, device=device, dtype=dtype)
     elif embed_range == "unit":
         base = torch.linspace(0.0, 1.0, steps=vocab_size, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported embed_range '{embed_range}'.")
-    weight[:, :, 0] = base.unsqueeze(0).expand(num_channels, -1)
+    base = base.unsqueeze(0).expand(num_channels, -1)  # [C,V]
+    weight[:] = base.unsqueeze(-1)  # broadcast across embed_dim
     return weight
 
 
@@ -104,6 +112,9 @@ def compute_geometry_metrics(
     """
     lut_weight = _ensure_3d(lut_weight).to(dtype=torch.float64)
     baseline_weight = _ensure_3d(baseline_weight).to(dtype=torch.float64, device=lut_weight.device)
+
+    if baseline_weight.shape[-1] == 1 and lut_weight.shape[-1] > 1:
+        baseline_weight = baseline_weight.expand(-1, -1, lut_weight.shape[-1])
 
     if lut_weight.shape != baseline_weight.shape:
         raise ValueError(f"Shape mismatch: learned {tuple(lut_weight.shape)} vs baseline {tuple(baseline_weight.shape)}")
@@ -190,7 +201,14 @@ def main() -> None:
         base_weight, _ = load_lut_snapshot(args.baseline)
         base_weight = _ensure_3d(base_weight)
     else:
-        base_weight = _linear_baseline(meta["num_channels"], meta["vocab_size"], meta.get("embed_range", "pm1"), lut_weight.device, lut_weight.dtype)
+        base_weight = _linear_baseline(
+            num_channels=meta["num_channels"],
+            vocab_size=meta["vocab_size"],
+            embed_range=meta.get("embed_range", "pm1"),
+            device=lut_weight.device,
+            dtype=lut_weight.dtype,
+            embed_dim=lut_weight.shape[-1],
+        )
 
     metrics = compute_geometry_metrics(
         lut_weight,
