@@ -113,7 +113,7 @@ def _calibrate_cosine_scale(
             step = max(1, vocab // sample_count)
             idx = torch.arange(0, vocab, step, device=device, dtype=torch.long)
             idx = idx[:sample_count]
-            if idx[-1].item() != vocab - 1:
+            if idx.numel() > 0 and idx[-1].item() != vocab - 1:
                 idx[-1] = vocab - 1
 
         if idx.numel() == 0:
@@ -141,87 +141,6 @@ def _calibrate_cosine_scale(
             r_new,
             scale,
         )
-
-def _calibrate_cosine_scale(
-    path: MetricInducedGibbsProbPath,
-    *,
-    num_samples: int = 4096,
-) -> None:
-    """Adjust cosine LUT scale so baseline and cosine distances have matched medians."""
-    if getattr(path, "metric_name", "") != "cosine":
-        return
-    lut = getattr(path, "learnable_lut", None)
-    if lut is None:
-        return
-
-    device = lut.weight.device
-    dtype = lut.weight.dtype
-    vocab = path.vocab_size
-
-    with torch.no_grad():
-        base_table = path._get_base_distance_table(device=device, dtype=dtype)
-        idx = torch.linspace(
-            0, vocab - 1, steps=min(vocab, num_samples), device=device, dtype=torch.long
-        )
-        base_rows = base_table.index_select(0, idx)
-        r_base = torch.median(base_rows).item()
-
-        cos_table = path._build_lut_distance_table(device=device, dtype=dtype)
-        cos_rows = cos_table[:, idx, :]
-        r_new = torch.median(cos_rows).item()
-
-        if r_new <= 1e-12:
-            logger.warning(
-                "Cosine distance median too small (%.3e); skip calibration", r_new
-            )
-            return
-
-        scale = r_base / r_new
-        path._lut_cosine_scale = float(scale)
-        logger.info(
-            "Calibrated cosine LUT scale: base=%.4e new=%.4e s=%.4f",
-            r_base,
-            r_new,
-            scale,
-        )
-
-def _calibrate_cosine_scale(
-    path: MetricInducedGibbsProbPath,
-    *,
-    num_samples: int = 4096,
-) -> None:
-    """Adjust cosine LUT scale so baseline and cosine distances have matched medians."""
-    if getattr(path, "metric_name", "") != "cosine":
-        return
-    lut = getattr(path, "learnable_lut", None)
-    if lut is None:
-        return
-    device = lut.weight.device
-    dtype = lut.weight.dtype
-    vocab = path.vocab_size
-    with torch.no_grad():
-        base_table = path._get_base_distance_table(device=device, dtype=dtype)
-        idx = torch.linspace(0, vocab - 1, steps=min(vocab, num_samples), device=device, dtype=torch.long)
-        base_rows = base_table.index_select(0, idx)
-        r_base = torch.median(base_rows).item()
-
-        cos_table = path._build_lut_distance_table(device=device, dtype=dtype)
-        cos_rows = cos_table[:, idx, :]
-        r_new = torch.median(cos_rows).item()
-
-        if r_new <= 1e-12:
-            logger.warning("Cosine distance median too small (%.3e); skip calibration", r_new)
-            return
-
-        scale = r_base / r_new
-        path._lut_cosine_scale = float(scale)
-        logger.info(
-            "Calibrated cosine LUT scale: base=%.4e new=%.4e s=%.4f",
-            r_base,
-            r_new,
-            scale,
-        )
-
 
 def main(args):
     logging.basicConfig(
