@@ -405,6 +405,14 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_lut_force_warm_start",
+        action="store_true",
+        help=(
+            "Force cosine LUT warm start even when resuming from a checkpoint. "
+            "Useful when finetuning a 1D baseline on higher-dimensional cosine geometry."
+        ),
+    )
+    parser.add_argument(
         "--mi_freeze_lut",
         action="store_true",
         help="Freeze the learnable LUT parameters (requires_grad=False).",

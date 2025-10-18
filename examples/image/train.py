@@ -22,6 +22,7 @@ import gc
 import os
 import sys
 import time
+import math
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -51,6 +52,32 @@ from training.load_and_save import load_model, save_model
 from training.train_loop import AdaptiveKLController, train_one_epoch
 
 logger = logging.getLogger(__name__)
+
+
+def _warm_start_cosine_lut(path: MetricInducedGibbsProbPath) -> None:
+    """Initialize cosine-metric LUT on a great-circle warm start."""
+    lut = getattr(path, "learnable_lut", None)
+    if lut is None:
+        return
+    C, V, D = lut.weight.shape
+    if D < 2:
+        logger.warning(
+            "Cosine LUT warm start requires emb_dim >= 2; current emb_dim=%d. Skipping warm start.",
+            D,
+        )
+        return
+    with torch.no_grad():
+        device = lut.weight.device
+        dtype = lut.weight.dtype
+        m = torch.linspace(-1.0, 1.0, V, device=device, dtype=dtype)  # baseline linear scale
+        theta = (m + 1.0) * (math.pi / 2.0)  # map to [0, π]
+        base = torch.zeros(C, V, D, device=device, dtype=dtype)
+        base[:, :, 0] = torch.cos(theta).unsqueeze(0).expand(C, -1)
+        base[:, :, 1] = torch.sin(theta).unsqueeze(0).expand(C, -1)
+        if D > 2:
+            base[:, :, 2:] = 1e-4 * torch.randn(C, V, D - 2, device=device, dtype=dtype)
+        lut.weight.copy_(base)
+    logger.info("Applied cosine LUT warm start on great-circle initialization")
 
 
 def main(args):
@@ -289,6 +316,13 @@ def main(args):
             gumbel_hard=True,
             **metric_kwargs,
         )
+
+        if (
+            getattr(args, "mi_learnable_lut", False)
+            and getattr(args, "mi_metric", "lp") == "cosine"
+            and (not getattr(args, "resume", "") or getattr(args, "mi_lut_force_warm_start", False))
+        ):
+            _warm_start_cosine_lut(metric_path)
         
         # Apply loaded metric codes if available
         if loaded_metric_codes is not None:
@@ -514,7 +548,9 @@ def main(args):
     logger.info(f"Optimizer: {optimizer}")
     logger.info(f"Learning-Rate Schedule: {lr_schedule}")
 
-    loss_scaler = NativeScaler()
+    if getattr(args, "bf16", False):
+        logger.info("bf16 autocast enabled: disabling GradScaler and using bfloat16 forwards.")
+    loss_scaler = NativeScaler(enabled=not getattr(args, "bf16", False))
 
     load_model(
         args=args,
@@ -524,6 +560,14 @@ def main(args):
         lr_schedule=lr_schedule,
         extra_modules=extra_modules,
     )
+    if (
+        getattr(args, "mi_lut_force_warm_start", False)
+        and getattr(args, "mi_learnable_lut", False)
+        and getattr(args, "mi_metric", "lp") == "cosine"
+        and metric_path is not None
+    ):
+        logger.info("Forcing cosine LUT warm start after loading checkpoint.")
+        _warm_start_cosine_lut(metric_path)
     if (
         beta_schedule_ema is not None
         and metric_path is not None
