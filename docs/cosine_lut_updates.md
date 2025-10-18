@@ -12,6 +12,7 @@
 - Added cosine scale calibration:
   - `_calibrate_cosine_scale` matches the median distance of the cosine table to the baseline table.
   - Enabled via `--mi_lut_cosine_calibrate`, executed post warm-start and after loading checkpoints.
+- Updated LUT diagnostics to project cosine embeddings (angle-based scalarization) before plotting/metrics, replacing the old L2-norm visualization.
 - CLI updates:
   - `--mi_metric` choices expanded to include `"euclidean"` and `"cosine"`.
   - New flags `--mi_lut_cosine_scale`, `--mi_lut_cosine_calibrate`, `--mi_lut_force_warm_start`.
@@ -24,4 +25,3 @@
 - `flow_matching/examples/image/train.py`
 - `flow_matching/examples/image/train_arg_parser.py`
 - `flow_matching/examples/image/training/train_loop.py`
-

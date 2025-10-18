@@ -14,10 +14,12 @@ Provides utilities to:
 """
 
 import logging
+import math
 from pathlib import Path
 from typing import Dict, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 import torch.nn as nn
 
@@ -25,6 +27,30 @@ from flow_matching.path import MetricInducedGibbsProbPath
 from flow_matching.path.lut_diagnostics import LUTDiagnostics
 
 logger = logging.getLogger(__name__)
+
+
+def _scalarize_lut_embeddings(weight: Tensor, *, metric: str) -> Tensor:
+    """Convert LUT embeddings [C,V,D] into scalar representation for diagnostics."""
+    if weight is None:
+        return weight
+    if weight.ndim == 2:
+        return weight
+    if weight.ndim == 3 and weight.shape[-1] == 1:
+        return weight.squeeze(-1)
+
+    if weight.ndim != 3:
+        raise ValueError(f"Unexpected LUT weight shape {tuple(weight.shape)}")
+
+    if metric == "cosine":
+        normed = F.normalize(weight, p=2, dim=-1, eps=1e-12)
+        if normed.shape[-1] >= 2:
+            theta = torch.atan2(normed[:, :, 1], normed[:, :, 0])
+            theta = torch.remainder(theta, 2.0 * math.pi)
+            return theta
+        return normed.squeeze(-1)
+
+    # Default: use L2 norm for scalar summary
+    return torch.linalg.vector_norm(weight, ord=2, dim=-1)
 
 
 def create_probe_batch(
@@ -93,8 +119,11 @@ def log_lut_diagnostics_epoch(
         logger.warning("No learnable LUT found in path; skipping diagnostics")
         return {}
     
+    metric_name = getattr(path, "metric_name", "lp")
+
     # Get current LUT weights
-    lut_weights = path.learnable_lut.weight.detach()  # [C, V]
+    lut_weights_raw = path.learnable_lut.weight.detach()
+    lut_weights = _scalarize_lut_embeddings(lut_weights_raw, metric=metric_name)
     
     # Extract gradient and LR (if optimizer available)
     grad = None
@@ -106,8 +135,14 @@ def log_lut_diagnostics_epoch(
                 lr = param_group["lr"]
                 # Get gradient from parameter
                 if path.learnable_lut.weight.grad is not None:
-                    grad = path.learnable_lut.weight.grad.detach()
+                    grad = _scalarize_lut_embeddings(
+                        path.learnable_lut.weight.grad.detach(), metric=metric_name
+                    )
                 break
+    if grad is None and path.learnable_lut.weight.grad is not None:
+        grad = _scalarize_lut_embeddings(
+            path.learnable_lut.weight.grad.detach(), metric=metric_name
+        )
     
     # Beta function for path quality metrics
     def beta_fn(t: Tensor) -> Tensor:
@@ -124,7 +159,7 @@ def log_lut_diagnostics_epoch(
         embeddings=lut_weights,
         probe_batch=probe_batch,
         beta_fn=beta_fn,
-        embeddings_prev=prev_lut,
+        embeddings_prev=_scalarize_lut_embeddings(prev_lut, metric=metric_name) if prev_lut is not None else None,
         grad=grad,
         lr=lr,
         beta_values=beta_values,
