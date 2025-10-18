@@ -76,7 +76,7 @@ def _warm_start_cosine_lut(path: MetricInducedGibbsProbPath) -> None:
         base[:, :, 1] = torch.sin(theta).unsqueeze(0).expand(C, -1)
         if D > 2:
             base[:, :, 2:] = 1e-4 * torch.randn(C, V, D - 2, device=device, dtype=dtype)
-    lut.weight.copy_(base)
+        lut.weight.copy_(base)
     logger.info("Applied cosine LUT warm start on great-circle initialization")
 
 
@@ -91,6 +91,8 @@ def _calibrate_cosine_scale(
     lut = getattr(path, "learnable_lut", None)
     if lut is None:
         return
+    if num_samples is None or num_samples <= 0:
+        num_samples = 4096
 
     device = lut.weight.device
     dtype = lut.weight.dtype
@@ -98,13 +100,31 @@ def _calibrate_cosine_scale(
 
     with torch.no_grad():
         base_table = path._get_base_distance_table(device=device, dtype=dtype)
-        idx = torch.linspace(
-            0, vocab - 1, steps=min(vocab, num_samples), device=device, dtype=torch.long
-        )
+        base_table = base_table.to(device=device, dtype=dtype)
+
+        sample_count = int(min(vocab, num_samples))
+        if sample_count < 1:
+            logger.warning("Cosine calibration skipped: num_samples < 1")
+            return
+
+        if sample_count >= vocab:
+            idx = torch.arange(vocab, device=device, dtype=torch.long)
+        else:
+            step = max(1, vocab // sample_count)
+            idx = torch.arange(0, vocab, step, device=device, dtype=torch.long)
+            idx = idx[:sample_count]
+            if idx[-1].item() != vocab - 1:
+                idx[-1] = vocab - 1
+
+        if idx.numel() == 0:
+            logger.warning("Cosine calibration skipped: no indices sampled")
+            return
+
         base_rows = base_table.index_select(0, idx)
         r_base = torch.median(base_rows).item()
 
         cos_table = path._build_lut_distance_table(device=device, dtype=dtype)
+        cos_table = cos_table.to(device=device, dtype=dtype)
         cos_rows = cos_table[:, idx, :]
         r_new = torch.median(cos_rows).item()
         if r_new <= 1e-12:

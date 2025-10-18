@@ -9,6 +9,7 @@
 - Introduced warm-start for cosine LUTs:
   - `_warm_start_cosine_lut` maps tokens to a great-circle initialization (half-arc on the unit sphere).
   - Flag `--mi_lut_force_warm_start` allows reinitializing even when resuming from checkpoints (e.g., finetuning 1D baselines).
+  - Warm start now applies the weight copy under `torch.no_grad()` to avoid autograd in-place pitfalls.
 - Added cosine scale calibration:
   - `_calibrate_cosine_scale` matches the median distance of the cosine table to the baseline table.
   - Enabled via `--mi_lut_cosine_calibrate`, executed post warm-start and after loading checkpoints.
