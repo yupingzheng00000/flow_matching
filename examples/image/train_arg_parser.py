@@ -405,6 +405,11 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_lut_cosine_calibrate",
+        action="store_true",
+        help="Calibrate cosine LUT scale against baseline distances after load (optional).",
+    )
+    parser.add_argument(
         "--mi_lut_force_warm_start",
         action="store_true",
         help=(
