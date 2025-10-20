@@ -1,4 +1,4 @@
-"""
+﻿"""
 Comprehensive LUT Analysis: Quantile Hypothesis Testing
 
 Implements two key diagnostic probes:
@@ -40,7 +40,22 @@ from scipy.ndimage import gaussian_filter1d
 from sklearn.isotonic import IsotonicRegression
 from sklearn.decomposition import PCA
 
-sys.path.insert(0, str(Path(__file__).parent / "flow_matching"))
+# Allow importing shared LUT quantile tools from examples/image
+_IMAGE_DIR = Path(__file__).resolve().parents[1]
+if str(_IMAGE_DIR) not in sys.path:
+    sys.path.insert(0, str(_IMAGE_DIR))
+
+from lut_quantile_analysis import (  # noqa: E402
+    BaselineResults,
+    analyze_baselines as shared_analyze_baselines,
+    baseline_uniform as shared_baseline_uniform,
+    baseline_probit as shared_baseline_probit,
+    baseline_isotonic as shared_baseline_isotonic,
+    compute_baseline_metrics as shared_compute_baseline_metrics,
+    plot_baseline_comparison,
+    scalarize_embedding,
+    compute_empirical_cdf as shared_compute_empirical_cdf,
+)
 
 
 # ============================================================================
@@ -93,37 +108,15 @@ def load_lut_from_checkpoint(checkpoint_path: str) -> Tuple[torch.Tensor, dict]:
     return lut_weight, metadata
 
 
-def _scalarize_embedding(e_raw: torch.Tensor, mode: str = "uniform") -> torch.Tensor:
-    """Convert [V,D] embedding into a scalar curve [V].
-
-    Modes:
-      - 'norm': L2 norm ||E||
-      - 'norm_normalized': ||E|| / sqrt(D)
-      - 'mean': per-token dimension mean
-      - 'uniform': dot(E, 1/sqrt(D)) (signed projection)
-      - 'pc1': projection to first principal component (signed)
-    """
-    assert e_raw.ndim == 2, "Expected [V,D]"
-    V, D = e_raw.shape
-    if D == 1:
-        return e_raw.squeeze(-1)
-    mode = str(mode).lower()
-    if mode == "norm":
-        return torch.norm(e_raw, p=2, dim=-1)
-    if mode == "norm_normalized":
-        return torch.norm(e_raw, p=2, dim=-1) / torch.sqrt(torch.tensor(float(D), device=e_raw.device, dtype=e_raw.dtype))
-    if mode == "mean":
-        return e_raw.mean(dim=-1)
-    if mode == "uniform":
-        u = torch.ones(D, device=e_raw.device, dtype=e_raw.dtype) / torch.sqrt(torch.tensor(float(D), device=e_raw.device, dtype=e_raw.dtype))
-        return e_raw @ u
-    if mode == "pc1":
-        with torch.no_grad():
-            X = e_raw.double().cpu().numpy()
-            pca = PCA(n_components=1)
-            comp = pca.fit_transform(X)[:, 0]
-            return torch.from_numpy(comp).to(dtype=e_raw.dtype, device=e_raw.device)
-    raise ValueError(f"Unknown scalarization mode '{mode}'")
+def scalarize_embedding(e_raw: torch.Tensor, mode: str = "uniform") -> torch.Tensor:
+    """Backward-compatible shim around :func:`scalarize_embedding`."""
+    warnings.warn(
+        "scalarize_embedding is deprecated; use scalarize_embedding from "
+        "lut_quantile_analysis instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return scalarize_embedding(e_raw, mode)
 
 
 def estimate_data_histogram(
@@ -318,7 +311,7 @@ def analyze_baselines(
     
     # Extract embeddings for this channel
     E_raw = lut_weight[channel_idx, :, :]  # [V, D]
-    E = _scalarize_embedding(E_raw, mode=scalar_mode)
+    E = scalarize_embedding(E_raw, mode=scalar_mode)
     if D > 1:
         print(f"  Using scalarization='{scalar_mode}' for {D}D embeddings (channel {channel_idx})")
     
@@ -393,7 +386,7 @@ def sample_pushforward(
     
     # Map through LUT
     E_raw = lut_weight[channel_idx, :, :]  # [V, D]
-    E = _scalarize_embedding(E_raw, mode=scalar_mode)
+    E = scalarize_embedding(E_raw, mode=scalar_mode)
     
     y_samples = E[x_samples]  # [N]
     
@@ -476,7 +469,7 @@ def test_normality(samples: torch.Tensor) -> Dict[str, float]:
         "KS_stat": ks_stat,
         "KS_pval": ks_pval,
         "AD_stat": ad_stat,
-        "QQ_R²": qq_r2,
+        "QQ_R2": qq_r2,
     }
 
 
@@ -526,8 +519,8 @@ def analyze_pushforward(
 # Visualization
 # ============================================================================
 
-def plot_baseline_comparison(results_A: Dict, output_path: str, channel_idx: int):
-    """Plot learned E vs baselines T1/T2/T3."""
+def _plot_baseline_comparison_basic(results_A: Dict, output_path: str, channel_idx: int):
+    """Legacy baseline plot (kept for reference)."""
     E = results_A["E"].numpy()
     T1 = results_A["T1"].numpy()
     T2 = results_A["T2"].numpy()
@@ -565,7 +558,7 @@ def plot_baseline_comparison(results_A: Dict, output_path: str, channel_idx: int
     ax = axes[1, 0]
     ax.scatter(T1, E, c=tokens, cmap='viridis', s=10, alpha=0.6)
     ax.plot([T1.min(), T1.max()], [T1.min(), T1.max()], 'k--', linewidth=1)
-    metrics_T1 = results_A["metrics"]["T1_uniform"]
+    metrics_T1 = results_A.metrics["T1_uniform"]
     ax.set_xlabel('T1: Uniform')
     ax.set_ylabel('E (Learned)')
     ax.set_title(f'E vs T1 (R²={metrics_T1["R²"]:.4f})')
@@ -575,7 +568,7 @@ def plot_baseline_comparison(results_A: Dict, output_path: str, channel_idx: int
     ax = axes[1, 1]
     ax.scatter(T2, E, c=tokens, cmap='viridis', s=10, alpha=0.6)
     ax.plot([T2.min(), T2.max()], [T2.min(), T2.max()], 'k--', linewidth=1)
-    metrics_T2 = results_A["metrics"]["T2_probit"]
+    metrics_T2 = results_A.metrics["T2_probit"]
     ax.set_xlabel('T2: Probit')
     ax.set_ylabel('E (Learned)')
     ax.set_title(f'E vs T2 (R²={metrics_T2["R²"]:.4f})')
@@ -616,7 +609,7 @@ def plot_pushforward_analysis(results_C: Dict, output_path: str, channel_idx: in
     # QQ plot (normal)
     ax = axes[0, 2]
     stats.probplot(x, dist="norm", plot=ax)
-    ax.set_title(f'Original QQ (Normal)\nR²={results_C["original_normal"]["QQ_R²"]:.4f}')
+    ax.set_title(f'Original QQ (Normal)\nR²={results_C["original_normal"]["QQ_R2"]:.4f}')
     ax.grid(True, alpha=0.3)
     
     # Bottom row: Pushforward distribution
@@ -645,7 +638,7 @@ def plot_pushforward_analysis(results_C: Dict, output_path: str, channel_idx: in
     # QQ plot (normal)
     ax = axes[1, 2]
     stats.probplot(y, dist="norm", plot=ax)
-    ax.set_title(f'Pushforward QQ (Normal)\nR²={results_C["pushforward_normal"]["QQ_R²"]:.4f}')
+    ax.set_title(f'Pushforward QQ (Normal)\nR²={results_C["pushforward_normal"]["QQ_R2"]:.4f}')
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -654,76 +647,71 @@ def plot_pushforward_analysis(results_C: Dict, output_path: str, channel_idx: in
     print(f"  ✓ Saved pushforward analysis to {output_path}")
 
 
-def print_summary_report(results_A: Dict, results_C: Dict, channel_idx: int):
+def print_summary_report(results_A: BaselineResults, results_C: Dict, channel_idx: int):
     """Print text summary of all metrics."""
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print(f"ANALYSIS SUMMARY - Channel {channel_idx}")
-    print("="*80)
-    
+    print("=" * 80)
+
     # Probe A: Baseline comparison
     print("\n[A] QUANTILE EQUALIZATION HYPOTHESIS")
     print("-" * 80)
-    for baseline_name, metrics in results_A["metrics"].items():
+    for metrics in results_A.metrics.values():
         print(f"\n{metrics['name']}:")
-        print(f"  R² = {metrics['R²']:.6f}")
+        print(f"  R² = {metrics['R2']:.6f}")
         print(f"  RMSE = {metrics['RMSE']:.6f}")
         print(f"  MAE = {metrics['MAE']:.6f}")
-        print(f"  Spearman ρ = {metrics['Spearman_ρ']:.6f}")
-        print(f"  Kendall τ = {metrics['Kendall_τ']:.6f}")
-    
-    # Interpretation
-    best_r2 = max(m["R²"] for m in results_A["metrics"].values())
-    best_baseline = [k for k, m in results_A["metrics"].items() if m["R²"] == best_r2][0]
-    print(f"\n✓ Best fit: {results_A['metrics'][best_baseline]['name']} (R²={best_r2:.6f})")
-    
-    if best_r2 >= 0.98:
+        print(f"  Spearman ρ = {metrics['SpearmanR']:.6f}")
+        print(f"  Kendall τ = {metrics['KendallTau']:.6f}")
+
+    best_key, best_metrics = max(results_A.metrics.items(), key=lambda item: item[1]['R2'])
+    print(f"\n✓ Best fit: {best_metrics['name']} (R²={best_metrics['R2']:.6f})")
+    if best_metrics['R2'] >= 0.98:
         print("  → STRONG evidence for quantile-like behavior (R² ≥ 0.98)")
-    elif best_r2 >= 0.95:
+    elif best_metrics['R2'] >= 0.95:
         print("  → MODERATE evidence for quantile-like behavior (R² ≥ 0.95)")
     else:
         print("  → WEAK evidence for quantile-like behavior (R² < 0.95)")
-    
+
     # Probe C: Pushforward tests
     print("\n" + "-" * 80)
     print("[C] PUSHFORWARD DISTRIBUTION TESTS")
     print("-" * 80)
-    
-    print("\nOriginal Distribution (x_1):")
+
+    print("\nOriginal Distribution (x₁):")
     print(f"  Uniformity: KS={results_C['original_uniform']['KS_stat']:.4f}, p={results_C['original_uniform']['KS_pval']:.4e}")
     print(f"  Normality: Shapiro W={results_C['original_normal']['Shapiro_stat']:.4f}, p={results_C['original_normal']['Shapiro_pval']:.4e}")
-    
-    print("\nPushforward Distribution (y=E(x_1)):")
+
+    print("\nPushforward Distribution (y=E(x₁)):")
     print(f"  Uniformity: KS={results_C['pushforward_uniform']['KS_stat']:.4f}, p={results_C['pushforward_uniform']['KS_pval']:.4e}")
     print(f"  Normality: Shapiro W={results_C['pushforward_normal']['Shapiro_stat']:.4f}, p={results_C['pushforward_normal']['Shapiro_pval']:.4e}")
-    print(f"  QQ (Normal) R²={results_C['pushforward_normal']['QQ_R²']:.4f}")
-    
-    # Improvement metrics
-    ks_improvement = (results_C['original_uniform']['KS_stat'] - results_C['pushforward_uniform']['KS_stat']) / results_C['original_uniform']['KS_stat']
-    print(f"\n✓ KS distance improvement: {ks_improvement*100:.1f}%")
-    
+    print(f"  QQ (Normal) R²={results_C['pushforward_normal']['QQ_R2']:.4f}")
+
+    orig_ks = results_C['original_uniform']['KS_stat']
+    push_ks = results_C['pushforward_uniform']['KS_stat']
+    denom = orig_ks if orig_ks > 1e-12 else 1e-12
+    ks_improvement = (orig_ks - push_ks) / denom
+    print(f"\n✓ KS distance improvement: {ks_improvement * 100:.1f}%")
     if ks_improvement >= 0.5:
         print("  → STRONG pushforward effect (≥50% improvement)")
     elif ks_improvement >= 0.3:
         print("  → MODERATE pushforward effect (≥30% improvement)")
     else:
         print("  → WEAK pushforward effect (<30% improvement)")
-    
-    # Final verdict
-    print("\n" + "="*80)
+
+    print("\n" + "=" * 80)
     print("VERDICT")
-    print("="*80)
-    
-    if best_r2 >= 0.98 and ks_improvement >= 0.5:
+    print("=" * 80)
+    if best_metrics['R2'] >= 0.98 and ks_improvement >= 0.5:
         print("✅ CONFIRMED: LUT behaves like quantile equalization")
         print("   The S-tail is a natural consequence of density reallocation.")
-    elif best_r2 >= 0.95 or ks_improvement >= 0.3:
+    elif best_metrics['R2'] >= 0.95 or ks_improvement >= 0.3:
         print("⚠ LIKELY: LUT shows quantile-like behavior")
         print("   Some deviations exist, but overall trend is consistent.")
     else:
         print("❌ INCONCLUSIVE: LUT does not strongly match quantile hypothesis")
         print("   Consider other mechanisms (metric annealing, target geometry, etc.)")
-    
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")
 
 
 # ============================================================================
@@ -763,7 +751,7 @@ def main():
     
     # Probe A: Baseline comparison
     print(f"\n[2/5] Running Probe A: Quantile Equalization Baselines (channel {args.channel}, scalar_mode={args.scalar_mode})...")
-    results_A = analyze_baselines(lut_weight, data_histogram, channel_idx=args.channel, scalar_mode=args.scalar_mode)
+    results_A = shared_analyze_baselines(lut_weight, data_histogram, channel_idx=args.channel, scalar_mode=args.scalar_mode)
     
     # Probe C: Pushforward tests
     print(f"\n[3/5] Running Probe C: Pushforward Distribution Tests (channel {args.channel}, scalar_mode={args.scalar_mode})...")
@@ -796,7 +784,7 @@ def main():
         
         f.write("[A] Baseline Metrics\n")
         f.write("-"*80 + "\n")
-        for baseline_name, metrics in results_A["metrics"].items():
+        for baseline_name, metrics in results_A.metrics.items():
             f.write(f"\n{metrics['name']}:\n")
             for key, value in metrics.items():
                 if key != "name":

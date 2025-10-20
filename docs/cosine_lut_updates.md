@@ -14,6 +14,9 @@
   - `_calibrate_cosine_scale` now defaults to **neighbor-aligned** matching (adjacent-token distances) to capture the effective temperature seen during training.
   - Supports configurable `t_mid` grids (default `0.3 0.5 0.7`); all candidates are logged, the first value drives the applied scale.
   - Enabled via `--mi_lut_cosine_calibrate`, executed post warm-start and after loading checkpoints. Legacy full-table median mode is still available via `--mi_lut_cosine_calibrate_mode median`.
+- Added entropy-based scale matching:
+  - `--mi_lut_cosine_entropy_match` performs a weighted conditional-entropy match (default t-grid `0.3/0.5/0.7` with weights `0.2/0.6/0.2`) using bisection over `s∈[1,200]` and relative tolerance `--mi_lut_cosine_entropy_tol`.
+  - Only the main rank performs the search; the final scale is broadcast to other ranks and cached LUT tables are cleared automatically.
 - Training diagnostics:
   - The training loop logs `β(t)·s·median(1−cos Δθ)` vs. the baseline neighbor scale (console + W&B/stats), alongside conditional entropy and uniform-weight loss.
   - Step logs include `cos_ratio` (effective/baseline) and `cosine_effective_neighbor` to spot hot/cold starts quickly.

@@ -430,6 +430,46 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_lut_cosine_entropy_match",
+        action="store_true",
+        help=(
+            "Match cosine LUT scale to a weighted baseline conditional-entropy target using bisection. "
+            "Runs after warm start / distance calibration."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_cosine_entropy_t_mid",
+        nargs="+",
+        type=float,
+        default=[0.3, 0.5, 0.7],
+        help=(
+            "Reference t values for entropy matching (default: 0.3 0.5 0.7). "
+            "Weights are supplied via --mi_lut_cosine_entropy_weights."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_cosine_entropy_weights",
+        nargs="+",
+        type=float,
+        default=[0.2, 0.6, 0.2],
+        help=(
+            "Weights (non-negative) for each t_mid during entropy matching. "
+            "If a single value is provided, it is broadcast to all t_mid entries."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_cosine_entropy_tol",
+        type=float,
+        default=0.01,
+        help="Relative tolerance |H_cos - H_base| / H_base for entropy matching (default: 0.01).",
+    )
+    parser.add_argument(
+        "--mi_lut_cosine_entropy_max_iter",
+        type=int,
+        default=12,
+        help="Maximum bisection iterations for entropy matching (default: 12).",
+    )
+    parser.add_argument(
         "--mi_lut_force_warm_start",
         action="store_true",
         help=(

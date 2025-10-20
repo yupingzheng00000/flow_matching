@@ -15,6 +15,7 @@ Provides utilities to:
 
 import logging
 import math
+import sys
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -26,10 +27,22 @@ import torch.nn as nn
 from flow_matching.path import MetricInducedGibbsProbPath
 from flow_matching.path.lut_diagnostics import LUTDiagnostics
 
+_THIS_DIR = Path(__file__).resolve().parent
+_IMAGE_DIR = _THIS_DIR.parent
+if str(_IMAGE_DIR) not in sys.path:
+    sys.path.insert(0, str(_IMAGE_DIR))
+
+from lut_quantile_analysis import (  # noqa: E402
+    BaselineResults,
+    analyze_baselines,
+    plot_baseline_comparison,
+    scalarize_embedding,
+)
+
 logger = logging.getLogger(__name__)
 
 
-def _scalarize_lut_embeddings(weight: Tensor, *, metric: str) -> Tensor:
+def _scalarize_lut_embeddings(weight: Tensor, *, metric: str, scalar_mode: str = "uniform") -> Tensor:
     """Convert LUT embeddings [C,V,D] into scalar representation for diagnostics."""
     if weight is None:
         return weight
@@ -42,15 +55,29 @@ def _scalarize_lut_embeddings(weight: Tensor, *, metric: str) -> Tensor:
         raise ValueError(f"Unexpected LUT weight shape {tuple(weight.shape)}")
 
     if metric == "cosine":
-        normed = F.normalize(weight, p=2, dim=-1, eps=1e-12)
-        if normed.shape[-1] >= 2:
-            theta = torch.atan2(normed[:, :, 1], normed[:, :, 0])
-            theta = torch.remainder(theta, 2.0 * math.pi)
-            return theta
-        return normed.squeeze(-1)
+        channels = []
+        for c in range(weight.shape[0]):
+            channels.append(scalarize_embedding(weight[c], mode=scalar_mode))
+        return torch.stack(channels, dim=0)
 
     # Default: use L2 norm for scalar summary
     return torch.linalg.vector_norm(weight, ord=2, dim=-1)
+
+
+def _estimate_histogram_from_probe(probe_batch: Tensor, vocab_size: int) -> Tensor:
+    """Estimate per-channel token histogram from probe batch."""
+    if probe_batch.dtype not in (torch.int32, torch.int64, torch.int16, torch.uint8):
+        tokens = probe_batch.round().clamp(0, vocab_size - 1).to(torch.long)
+    else:
+        tokens = probe_batch.to(torch.long)
+    B, C, *spatial = tokens.shape
+    tokens = tokens.view(B, C, -1)
+    histograms = []
+    for c in range(C):
+        channel_tokens = tokens[:, c, :].reshape(-1).cpu()
+        counts = torch.bincount(channel_tokens, minlength=vocab_size).float()
+        histograms.append(counts)
+    return torch.stack(histograms, dim=0)
 
 
 def create_probe_batch(
@@ -90,6 +117,46 @@ def create_probe_batch(
     return batch.to(device)
 
 
+
+def _save_detailed_quantile_plots(
+    path: MetricInducedGibbsProbPath,
+    probe_batch: Tensor,
+    epoch: int,
+    output_dir: Path,
+    *,
+    scalar_mode: str = "uniform",
+    channel_names: Optional[list] = None,
+) -> None:
+    """Generate detailed quantile diagnostics plots for each LUT channel."""
+    if path.learnable_lut is None:
+        return
+
+    lut_weight = path.learnable_lut.weight.detach().cpu()
+    vocab_size = path.learnable_lut.vocab_size
+    hist = _estimate_histogram_from_probe(probe_batch, vocab_size)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    C = lut_weight.shape[0]
+    if channel_names is None:
+        channel_names = [f"ch{i}" for i in range(C)]
+
+    for c in range(C):
+        results: BaselineResults = analyze_baselines(
+            lut_weight,
+            hist,
+            channel_idx=c,
+            scalar_mode=scalar_mode,
+        )
+        channel_label = channel_names[c] if c < len(channel_names) else f"ch{c}"
+        figure_path = output_dir / f"epoch{epoch:04d}_{channel_label}.png"
+        plot_baseline_comparison(
+            results,
+            str(figure_path),
+            channel_label=channel_label,
+            epoch=epoch,
+        )
+
 def log_lut_diagnostics_epoch(
     path: MetricInducedGibbsProbPath,
     probe_batch: Tensor,
@@ -99,6 +166,8 @@ def log_lut_diagnostics_epoch(
     prev_lut: Optional[Tensor] = None,
     wandb_run=None,
     channel_names: Optional[list] = None,
+    detailed_plot_dir: Optional[Path] = None,
+    scalar_mode: str = "uniform",
 ) -> Dict[str, Tensor]:
     """Compute and log LUT diagnostics for one epoch.
     
@@ -111,6 +180,8 @@ def log_lut_diagnostics_epoch(
         prev_lut: Previous epoch's LUT weights (for dynamics)
         wandb_run: Optional wandb/swanlab run object
         channel_names: Optional channel names (e.g., ['R', 'G', 'B'])
+        detailed_plot_dir: Optional path to save detailed quantile plots
+        scalar_mode: Scalarization mode passed to quantile analysis
     
     Returns:
         Dictionary of all computed metrics
@@ -123,7 +194,7 @@ def log_lut_diagnostics_epoch(
 
     # Get current LUT weights
     lut_weights_raw = path.learnable_lut.weight.detach()
-    lut_weights = _scalarize_lut_embeddings(lut_weights_raw, metric=metric_name)
+    lut_weights = _scalarize_lut_embeddings(lut_weights_raw, metric=metric_name, scalar_mode=scalar_mode)
     
     # Extract gradient and LR (if optimizer available)
     grad = None
@@ -136,12 +207,12 @@ def log_lut_diagnostics_epoch(
                 # Get gradient from parameter
                 if path.learnable_lut.weight.grad is not None:
                     grad = _scalarize_lut_embeddings(
-                        path.learnable_lut.weight.grad.detach(), metric=metric_name
+                        path.learnable_lut.weight.grad.detach(), metric=metric_name, scalar_mode=scalar_mode
                     )
                 break
     if grad is None and path.learnable_lut.weight.grad is not None:
         grad = _scalarize_lut_embeddings(
-            path.learnable_lut.weight.grad.detach(), metric=metric_name
+            path.learnable_lut.weight.grad.detach(), metric=metric_name, scalar_mode=scalar_mode
         )
     
     # Beta function for path quality metrics
@@ -159,12 +230,22 @@ def log_lut_diagnostics_epoch(
         embeddings=lut_weights,
         probe_batch=probe_batch,
         beta_fn=beta_fn,
-        embeddings_prev=_scalarize_lut_embeddings(prev_lut, metric=metric_name) if prev_lut is not None else None,
+        embeddings_prev=_scalarize_lut_embeddings(prev_lut, metric=metric_name, scalar_mode=scalar_mode) if prev_lut is not None else None,
         grad=grad,
         lr=lr,
         beta_values=beta_values,
     )
-    
+
+    if detailed_plot_dir is not None:
+        _save_detailed_quantile_plots(
+            path,
+            probe_batch,
+            epoch,
+            Path(detailed_plot_dir),
+            scalar_mode=scalar_mode,
+            channel_names=channel_names,
+        )
+
     # Log summary to console
     diagnostics.log_metrics_summary(metrics, epoch)
     

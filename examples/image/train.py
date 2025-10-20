@@ -247,6 +247,158 @@ def _record_cosine_calibration_summary(args, summary: Optional[Dict[str, Union[b
     if isinstance(t_values, list):
         setattr(args, "_mi_lut_cosine_t_mid_values", [float(t) for t in t_values if isinstance(t, (int, float))])
 
+
+def _compute_entropy_from_rows(dist_rows: torch.Tensor, beta: float) -> float:
+    """Return mean entropy over rows given pairwise distances and beta scalar."""
+    logits = (-beta) * dist_rows
+    logits = logits - logits.max(dim=-1, keepdim=True).values
+    probs = torch.softmax(logits, dim=-1)
+    probs = probs.clamp_min(1e-12)
+    entropy = -(probs * probs.log()).sum(dim=-1)
+    return float(entropy.mean().item())
+
+
+def _cosine_entropy_match_scale(
+    path: MetricInducedGibbsProbPath,
+    *,
+    t_values: Sequence[float],
+    weights: Sequence[float],
+    s_lo: float = 1.0,
+    s_hi: float = 200.0,
+    tol: float = 0.01,
+    max_iter: int = 12,
+) -> Dict[str, Union[float, int, list]]:
+    """Match cosine scale so weighted conditional entropy aligns with 1D baseline."""
+    assert getattr(path, "metric_name", "") == "cosine"
+    lut = getattr(path, "learnable_lut", None)
+    if lut is None:
+        raise RuntimeError("Entropy matching requires a learnable LUT.")
+
+    # Validate t grid
+    t_list = [float(t) for t in t_values if 0.0 < float(t) < 1.0]
+    if not t_list:
+        raise ValueError("At least one t value in (0,1) is required for entropy matching.")
+
+    # Normalize weights
+    weight_list = [float(w) for w in weights]
+    if len(weight_list) not in {1, len(t_list)}:
+        raise ValueError(
+            "Number of weights must be 1 or match the number of t values "
+            f"(got {len(weight_list)} weights for {len(t_list)} t values)."
+        )
+    if len(weight_list) == 1:
+        weight_list = weight_list * len(t_list)
+    weight_tensor = torch.tensor(weight_list, dtype=torch.float64)
+    if (weight_tensor < 0).any():
+        raise ValueError("Entropy matching weights must be non-negative.")
+    if weight_tensor.sum().item() == 0.0:
+        raise ValueError("Entropy matching weights must sum to a positive value.")
+    weight_tensor = weight_tensor / weight_tensor.sum()
+
+    vocab = int(path.vocab_size)
+    device_cpu = torch.device("cpu")
+    base_values = torch.linspace(-1.0, 1.0, vocab, device=device_cpu, dtype=torch.float64)
+    base_diff = (base_values.unsqueeze(0) - base_values.unsqueeze(1)).abs()
+
+    beta_list: list[float] = []
+    base_entropies: list[float] = []
+    for t_val in t_list:
+        t_tensor = torch.tensor([t_val], dtype=torch.float64, device=device_cpu)
+        beta_val = float(path.beta(t_tensor)[0].item())
+        beta_list.append(beta_val)
+        base_entropies.append(_compute_entropy_from_rows(base_diff, beta_val))
+
+    weighted_base = float(torch.tensor(base_entropies, dtype=torch.float64) @ weight_tensor)
+
+    lut_device = lut.weight.device
+    lut_dtype = lut.weight.dtype
+    initial_scale = float(getattr(path, "_lut_cosine_scale", 1.0))
+
+    def eval_cosine_entropy(scale_value: float) -> tuple[float, list[float]]:
+        previous_scale = float(getattr(path, "_lut_cosine_scale", 1.0))
+        try:
+            path._lut_cosine_scale = float(scale_value)
+            with torch.no_grad():
+                dist_table = path._build_lut_distance_table(device=lut_device, dtype=lut_dtype)
+            dist_rows = dist_table.to(device=device_cpu, dtype=torch.float64)
+            if dist_rows.dim() == 3:
+                dist_rows = dist_rows.mean(dim=0)
+            cos_entropies = [
+                _compute_entropy_from_rows(dist_rows, beta_val) for beta_val in beta_list
+            ]
+            weighted_cos = float(torch.tensor(cos_entropies, dtype=torch.float64) @ weight_tensor)
+            return weighted_cos, cos_entropies
+        finally:
+            path._lut_cosine_scale = previous_scale
+
+    weighted_lo, _ = eval_cosine_entropy(s_lo)
+    weighted_hi, _ = eval_cosine_entropy(s_hi)
+    if not (weighted_lo >= weighted_base >= weighted_hi):
+        # If the bracket does not contain the target, clamp to the closest endpoint.
+        if abs(weighted_lo - weighted_base) < abs(weighted_hi - weighted_base):
+            chosen_scale = s_lo
+            weighted_cos, cos_entropies = weighted_lo, eval_cosine_entropy(s_lo)[1]
+            iterations = 1
+        else:
+            chosen_scale = s_hi
+            weighted_cos, cos_entropies = weighted_hi, eval_cosine_entropy(s_hi)[1]
+            iterations = 1
+        path._lut_cosine_scale = float(chosen_scale)
+        path.clear_lut_cache()
+        rel_error = abs(weighted_cos - weighted_base) / max(weighted_base, 1e-12)
+        return {
+            "scale": float(chosen_scale),
+            "iterations": int(iterations),
+            "t_values": t_list,
+            "weights": weight_list,
+            "base_entropies": base_entropies,
+            "cosine_entropies": cos_entropies,
+            "weighted_base": weighted_base,
+            "weighted_cosine": weighted_cos,
+            "relative_error": float(rel_error),
+            "s_lo": float(s_lo),
+            "s_hi": float(s_hi),
+            "bracket_saturated": True,
+        }
+
+    lo, hi = float(s_lo), float(s_hi)
+    weighted_cos = weighted_lo
+    cos_entropies = eval_cosine_entropy(lo)[1]
+    iterations = 0
+    while iterations < max_iter:
+        mid = 0.5 * (lo + hi)
+        weighted_cos, cos_entropies = eval_cosine_entropy(mid)
+        rel_error = abs(weighted_cos - weighted_base) / max(weighted_base, 1e-12)
+        if rel_error <= tol:
+            lo = hi = mid
+            break
+        if weighted_cos < weighted_base:
+            hi = mid
+        else:
+            lo = mid
+        iterations += 1
+
+    chosen_scale = 0.5 * (lo + hi)
+    # Re-evaluate at chosen scale for final logging
+    weighted_cos, cos_entropies = eval_cosine_entropy(chosen_scale)
+    path._lut_cosine_scale = float(chosen_scale)
+    path.clear_lut_cache()
+    rel_error = abs(weighted_cos - weighted_base) / max(weighted_base, 1e-12)
+    return {
+        "scale": float(chosen_scale),
+        "iterations": int(iterations),
+        "t_values": t_list,
+        "weights": weight_list,
+        "base_entropies": base_entropies,
+        "cosine_entropies": cos_entropies,
+        "weighted_base": weighted_base,
+        "weighted_cosine": weighted_cos,
+        "relative_error": float(rel_error),
+        "s_lo": float(s_lo),
+        "s_hi": float(s_hi),
+        "bracket_saturated": False,
+    }
+
 def main(args):
     logging.basicConfig(
         level=logging.INFO,
@@ -755,6 +907,44 @@ def main(args):
             t_mid_values=getattr(args, "mi_lut_cosine_t_mid", (0.5,)),
         )
         _record_cosine_calibration_summary(args, summary)
+    entropy_summary: Optional[Dict[str, Union[float, int, list]]] = None
+    if (
+        getattr(args, "mi_metric", "lp") == "cosine"
+        and getattr(args, "mi_lut_cosine_entropy_match", False)
+        and metric_path is not None
+        and getattr(metric_path, "learnable_lut", None) is not None
+    ):
+        if distributed_mode.is_main_process():
+            try:
+                entropy_summary = _cosine_entropy_match_scale(
+                    metric_path,
+                    t_values=getattr(args, "mi_lut_cosine_entropy_t_mid", (0.3, 0.5, 0.7)),
+                    weights=getattr(args, "mi_lut_cosine_entropy_weights", (0.2, 0.6, 0.2)),
+                    s_lo=1.0,
+                    s_hi=200.0,
+                    tol=float(getattr(args, "mi_lut_cosine_entropy_tol", 0.01)),
+                    max_iter=int(getattr(args, "mi_lut_cosine_entropy_max_iter", 12)),
+                )
+                logger.info(
+                    "Entropy-matched cosine scale: %.4f (iters=%d, rel_err=%.3e)",
+                    entropy_summary["scale"],
+                    entropy_summary["iterations"],
+                    entropy_summary["relative_error"],
+                )
+            except Exception:
+                logger.exception("Cosine entropy matching failed; keeping current scale.")
+                entropy_summary = None
+        final_scale = float(getattr(metric_path, "_lut_cosine_scale", 1.0))
+        if distributed_mode.is_dist_avail_and_initialized():
+            import torch.distributed as dist
+
+            scale_tensor = torch.tensor([final_scale], device=device, dtype=torch.float32)
+            dist.broadcast(scale_tensor, src=0)
+            final_scale = float(scale_tensor.item())
+        metric_path._lut_cosine_scale = float(final_scale)
+        metric_path.clear_lut_cache()
+        if entropy_summary is not None:
+            setattr(args, "_mi_lut_cosine_entropy_summary", entropy_summary)
     if (
         beta_schedule_ema is not None
         and metric_path is not None
