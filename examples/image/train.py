@@ -24,7 +24,7 @@ import sys
 import time
 import math
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -83,64 +83,169 @@ def _warm_start_cosine_lut(path: MetricInducedGibbsProbPath) -> None:
 def _calibrate_cosine_scale(
     path: MetricInducedGibbsProbPath,
     *,
+    mode: str = "neighbor",
+    t_mid_values: Sequence[float] = (0.5,),
     num_samples: int = 4096,
-) -> None:
-    """Adjust cosine LUT scale so baseline and cosine distances have matched medians."""
+) -> Dict[str, Union[bool, float, str, list]]:
+    """
+    Calibrate cosine LUT scale by matching baseline and cosine distances.
+
+    Args:
+        path: Metric-induced path with cosine metric and learnable LUT.
+        mode: "neighbor" (adjacent-token distances) or "median" (full-table medians).
+        t_mid_values: Reference t values in (0,1); first value sets the applied scale,
+                      the full list is logged for diagnostics.
+        num_samples: Sampling budget used when mode=="median".
+    """
+    summary: Dict[str, Union[bool, float, str, list]] = {
+        "applied": False,
+        "mode": mode,
+        "t_mid_values": list(t_mid_values),
+    }
     if getattr(path, "metric_name", "") != "cosine":
-        return
+        return summary
     lut = getattr(path, "learnable_lut", None)
     if lut is None:
-        return
-    if num_samples is None or num_samples <= 0:
-        num_samples = 4096
+        return summary
 
     device = lut.weight.device
     dtype = lut.weight.dtype
     vocab = path.vocab_size
+    if vocab < 2:
+        logger.warning("Cosine calibration skipped: vocab size < 2")
+        return summary
+
+    t_mids: list[float] = [
+        float(t) for t in t_mid_values if isinstance(t, (int, float)) and 0.0 < float(t) < 1.0
+    ]
+    if not t_mids:
+        t_mids = [0.5]
+    summary["t_mid_values"] = t_mids
 
     with torch.no_grad():
-        base_table = path._get_base_distance_table(device=device, dtype=dtype)
-        base_table = base_table.to(device=device, dtype=dtype)
+        base_table = path._get_base_distance_table(device=device, dtype=dtype).to(device=device, dtype=dtype)
+        cos_table_scaled = path._build_lut_distance_table(device=device, dtype=dtype).to(device=device, dtype=dtype)
 
+    current_scale = float(getattr(path, "_lut_cosine_scale", 1.0) or 1.0)
+    scale_denom = max(current_scale, 1e-12)
+    cos_table_raw = cos_table_scaled / scale_denom
+
+    idx_adj = torch.arange(vocab - 1, device=device, dtype=torch.long)
+    neighbor_base = torch.median(base_table[idx_adj, idx_adj + 1]).item() if idx_adj.numel() > 0 else float("nan")
+    neighbor_cos = torch.median(cos_table_raw[:, idx_adj, idx_adj + 1]).item() if idx_adj.numel() > 0 else float("nan")
+    summary["neighbor_base"] = float(neighbor_base)
+    summary["neighbor_cos"] = float(neighbor_cos)
+
+    target_base = neighbor_base
+    cosine_stat = neighbor_cos
+
+    if mode == "median":
+        if num_samples is None or num_samples <= 0:
+            num_samples = 4096
         sample_count = int(min(vocab, num_samples))
         if sample_count < 1:
             logger.warning("Cosine calibration skipped: num_samples < 1")
-            return
+            return summary
 
         if sample_count >= vocab:
-            idx = torch.arange(vocab, device=device, dtype=torch.long)
+            sample_idx = torch.arange(vocab, device=device, dtype=torch.long)
         else:
             step = max(1, vocab // sample_count)
-            idx = torch.arange(0, vocab, step, device=device, dtype=torch.long)
-            idx = idx[:sample_count]
-            if idx.numel() > 0 and idx[-1].item() != vocab - 1:
-                idx[-1] = vocab - 1
+            sample_idx = torch.arange(0, vocab, step, device=device, dtype=torch.long)[:sample_count]
+            if sample_idx.numel() > 0 and sample_idx[-1].item() != vocab - 1:
+                sample_idx[-1] = vocab - 1
 
-        if idx.numel() == 0:
+        if sample_idx.numel() == 0:
             logger.warning("Cosine calibration skipped: no indices sampled")
-            return
+            return summary
 
-        base_rows = base_table.index_select(0, idx)
-        r_base = torch.median(base_rows).item()
+        base_rows = base_table.index_select(0, sample_idx)
+        cos_rows = cos_table_raw[:, sample_idx, :]
+        target_base = torch.median(base_rows).item()
+        cosine_stat = torch.median(cos_rows).item()
+        summary["median_base"] = float(target_base)
+        summary["median_cos"] = float(cosine_stat)
+    else:
+        summary["median_base"] = float(target_base)
+        summary["median_cos"] = float(cosine_stat)
 
-        cos_table = path._build_lut_distance_table(device=device, dtype=dtype)
-        cos_table = cos_table.to(device=device, dtype=dtype)
-        cos_rows = cos_table[:, idx, :]
-        r_new = torch.median(cos_rows).item()
-        if r_new <= 1e-12:
-            logger.warning(
-                "Cosine distance median too small (%.3e); skip calibration", r_new
-            )
-            return
+    if not math.isfinite(cosine_stat) or cosine_stat <= 1e-12:
+        logger.warning("Cosine calibration skipped: cosine_stat=%.3e", cosine_stat)
+        return summary
+    if not math.isfinite(target_base) or target_base <= 0.0:
+        logger.warning("Cosine calibration skipped: target_base=%.3e", target_base)
+        return summary
 
-        scale = r_base / r_new
-        path._lut_cosine_scale = float(scale)
-        logger.info(
-            "Calibrated cosine LUT scale: base=%.4e new=%.4e s=%.4f",
-            r_base,
-            r_new,
-            scale,
+    grid_entries: list[Dict[str, float]] = []
+    for t_mid in t_mids:
+        t_tensor = torch.tensor([t_mid], device=device, dtype=dtype)
+        beta_t, _ = path.beta(t_tensor)
+        beta_value = float(beta_t.item())
+        denom = max(beta_value * cosine_stat, 1e-12)
+        scale_value = target_base / denom
+        grid_entries.append(
+            {
+                "t_mid": float(t_mid),
+                "beta": beta_value,
+                "scale": scale_value,
+                "effective_neighbor": beta_value * scale_value * cosine_stat,
+                "ratio": (beta_value * scale_value * cosine_stat) / target_base,
+            }
         )
+
+    if not grid_entries:
+        return summary
+
+    summary["grid"] = grid_entries
+    applied = grid_entries[0]
+    path._lut_cosine_scale = float(applied["scale"])
+    summary["applied"] = True
+    summary["applied_scale"] = float(applied["scale"])
+    summary["applied_t_mid"] = float(applied["t_mid"])
+    summary["applied_beta"] = float(applied["beta"])
+    summary["applied_effective_neighbor"] = float(applied["effective_neighbor"])
+    summary["applied_ratio"] = float(applied["ratio"])
+
+    logger.info(
+        "Calibrated cosine LUT scale (mode=%s): base_neighbor=%.4e, raw_neighbor=%.4e, "
+        "applied_t_mid=%.3f, beta=%.4f, new_scale=%.4f, effective_neighbor=%.4e, ratio=%.4f",
+        mode,
+        target_base,
+        cosine_stat,
+        applied["t_mid"],
+        applied["beta"],
+        applied["scale"],
+        applied["effective_neighbor"],
+        applied["ratio"],
+    )
+    if len(grid_entries) > 1:
+        logger.info("t_mid grid diagnostics:")
+        for entry in grid_entries:
+            logger.info(
+                "  t_mid=%.3f -> beta=%.4f, scale=%.4f, effective_neighbor=%.4e, ratio=%.4f",
+                entry["t_mid"],
+                entry["beta"],
+                entry["scale"],
+                entry["effective_neighbor"],
+                entry["ratio"],
+            )
+
+    return summary
+
+
+def _record_cosine_calibration_summary(args, summary: Optional[Dict[str, Union[bool, float, str, list]]]) -> None:
+    if summary is None:
+        return
+    setattr(args, "_mi_lut_cosine_calibration", summary)
+    base_neighbor = summary.get("neighbor_base")
+    cos_neighbor = summary.get("neighbor_cos")
+    if isinstance(base_neighbor, float) and math.isfinite(base_neighbor):
+        setattr(args, "_mi_lut_cosine_base_neighbor", float(base_neighbor))
+    if isinstance(cos_neighbor, float) and math.isfinite(cos_neighbor):
+        setattr(args, "_mi_lut_cosine_neighbor_median", float(cos_neighbor))
+    t_values = summary.get("t_mid_values")
+    if isinstance(t_values, list):
+        setattr(args, "_mi_lut_cosine_t_mid_values", [float(t) for t in t_values if isinstance(t, (int, float))])
 
 def main(args):
     logging.basicConfig(
@@ -387,7 +492,12 @@ def main(args):
             _warm_start_cosine_lut(metric_path)
             if getattr(args, "mi_lut_cosine_calibrate", False):
                 logger.info("Calibrating cosine LUT scale against baseline distances (warm start).")
-                _calibrate_cosine_scale(metric_path)
+                summary = _calibrate_cosine_scale(
+                    metric_path,
+                    mode=str(getattr(args, "mi_lut_cosine_calibrate_mode", "neighbor")),
+                    t_mid_values=getattr(args, "mi_lut_cosine_t_mid", (0.5,)),
+                )
+                _record_cosine_calibration_summary(args, summary)
         
         # Apply loaded metric codes if available
         if loaded_metric_codes is not None:
@@ -639,7 +749,12 @@ def main(args):
         and metric_path is not None
     ):
         logger.info("Calibrating cosine LUT scale against baseline distances (post-load).")
-        _calibrate_cosine_scale(metric_path)
+        summary = _calibrate_cosine_scale(
+            metric_path,
+            mode=str(getattr(args, "mi_lut_cosine_calibrate_mode", "neighbor")),
+            t_mid_values=getattr(args, "mi_lut_cosine_t_mid", (0.5,)),
+        )
+        _record_cosine_calibration_summary(args, summary)
     if (
         beta_schedule_ema is not None
         and metric_path is not None

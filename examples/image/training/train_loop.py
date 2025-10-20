@@ -390,6 +390,9 @@ def train_one_epoch(
     batch_loss = MeanMetric().to(device, non_blocking=True)
     epoch_loss = MeanMetric().to(device, non_blocking=True)
     entropy_metric = MeanMetric().to(device, non_blocking=True)
+    cosine_scale_ratio_metric = MeanMetric().to(device, non_blocking=True)
+    cosine_effective_neighbor_metric = MeanMetric().to(device, non_blocking=True)
+    cosine_metrics_updated = False
     entropy_samples: list[torch.Tensor] = []
 
     accum_iter = args.accum_iter
@@ -451,6 +454,16 @@ def train_one_epoch(
         )
         kl_controller = None
         use_path_trust_region = False
+
+    cosine_monitor_enabled = (
+        isinstance(path, MetricInducedGibbsProbPath)
+        and getattr(path, "metric_name", "") == "cosine"
+        and getattr(path, "learnable_lut", None) is not None
+    )
+    cosine_base_neighbor = float(getattr(args, "_mi_lut_cosine_base_neighbor", 0.0) or 0.0)
+    cosine_raw_neighbor = float(getattr(args, "_mi_lut_cosine_neighbor_median", 0.0) or 0.0)
+    if not (cosine_monitor_enabled and cosine_base_neighbor > 0.0 and cosine_raw_neighbor > 0.0):
+        cosine_monitor_enabled = False
 
     kl_metric = kl_penalty_metric = None
     kl_updates_total = 0
@@ -561,6 +574,8 @@ def train_one_epoch(
         step_entropy_mean: Optional[float] = None
         step_entropy_median: Optional[float] = None
         step_entropy_p90: Optional[float] = None
+        step_scale_ratio: Optional[float] = None
+        step_effective_neighbor: Optional[float] = None
 
         if getattr(args, "ko_metric_induced", False):
             # KO: 256-way classification; no mask token
@@ -842,6 +857,31 @@ def train_one_epoch(
             if logbeta_reg_penalty is not None:
                 loss = loss + logbeta_reg_penalty
 
+            beta_t_values, _ = path.beta(t)
+            if cosine_monitor_enabled:
+                beta_mean_value = float(beta_t_values.mean().detach().item())
+                lut_scale = float(getattr(path, "_lut_cosine_scale", 1.0) or 1.0)
+                effective_neighbor = beta_mean_value * lut_scale * cosine_raw_neighbor
+                ratio = (
+                    effective_neighbor / cosine_base_neighbor
+                    if cosine_base_neighbor > 0.0
+                    else float("nan")
+                )
+                if math.isfinite(ratio):
+                    cosine_scale_ratio_metric.update(
+                        torch.tensor(ratio, device=device, dtype=torch.float32)
+                    )
+                    cosine_metrics_updated = True
+                if math.isfinite(effective_neighbor):
+                    cosine_effective_neighbor_metric.update(
+                        torch.tensor(effective_neighbor, device=device, dtype=torch.float32)
+                    )
+                    cosine_metrics_updated = True
+                step_scale_ratio = ratio if math.isfinite(ratio) else None
+                step_effective_neighbor = (
+                    effective_neighbor if math.isfinite(effective_neighbor) else None
+                )
+
             # KL trust region to baseline geometry for LUT (teacher = baseline distances)
             lut_kl_weight = float(getattr(args, "mi_lut_kl_weight", 0.0) or 0.0)
             if (
@@ -869,8 +909,7 @@ def train_one_epoch(
                 K = path.vocab_size
                 base_rows = base_table.index_select(0, x1_flat.view(-1)).view(B, S, K)
                 # Compute teacher probs from baseline with the same beta(t)
-                beta_t, _ = path.beta(t)
-                beta_t = beta_t.view(B, 1, 1).to(device=base_rows.device, dtype=base_rows.dtype)
+                beta_t = beta_t_values.view(B, 1, 1).to(device=base_rows.device, dtype=base_rows.dtype)
                 logits_base = -beta_t * base_rows
                 logits_base = logits_base - logits_base.max(dim=-1, keepdim=True).values
                 teacher_probs = torch.softmax(logits_base, dim=-1).to(device=path_probs.device, dtype=path_probs.dtype)
@@ -1290,6 +1329,10 @@ def train_one_epoch(
                 log_msg += f", H={step_entropy_mean:.3f}"
                 if step_entropy_median is not None:
                     log_msg += f" (p50={step_entropy_median:.3f})"
+            if step_scale_ratio is not None:
+                log_msg += f", cos_ratio={step_scale_ratio:.3f}"
+                if step_effective_neighbor is not None:
+                    log_msg += f" (eff={step_effective_neighbor:.3e})"
             
             # Add LUT diagnostics to log message
             if lut_grad_norm_value is not None:
@@ -1384,6 +1427,14 @@ def train_one_epoch(
                             "train/uw_loss": float(uw_loss) if 'uw_loss' in locals() else float(loss_value),
                             "train/lr": float(lr),
                             "epoch": int(epoch),
+                            **(
+                                {
+                                    "train/cosine_scale_ratio": float(step_scale_ratio),
+                                    "train/cosine_effective_neighbor": float(step_effective_neighbor),
+                                }
+                                if step_scale_ratio is not None and step_effective_neighbor is not None
+                                else {}
+                            ),
                             **metric_diagnostics,
                             **lut_diagnostics,
                             **({
@@ -1492,6 +1543,20 @@ def train_one_epoch(
                     "entropy/p50": float(torch.quantile(entropy_epoch_tensor, 0.5).item()),
                     "entropy/p90": float(torch.quantile(entropy_epoch_tensor, 0.9).item()),
                     "entropy/batch_mean": float(entropy_metric.compute().detach().cpu()),
+                }
+            )
+        except Exception:
+            pass
+    if cosine_monitor_enabled and cosine_metrics_updated:
+        try:
+            stats.update(
+                {
+                    "cosine/scale_ratio": float(
+                        cosine_scale_ratio_metric.compute().detach().cpu()
+                    ),
+                    "cosine/effective_neighbor": float(
+                        cosine_effective_neighbor_metric.compute().detach().cpu()
+                    ),
                 }
             )
         except Exception:

@@ -410,6 +410,26 @@ def get_args_parser():
         help="Calibrate cosine LUT scale against baseline distances after load (optional).",
     )
     parser.add_argument(
+        "--mi_lut_cosine_calibrate_mode",
+        default="neighbor",
+        choices=("neighbor", "median"),
+        help=(
+            "Cosine scale calibration mode. 'neighbor' matches adjacent-token distances "
+            "(recommended); 'median' matches the full-table medians (legacy behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_cosine_t_mid",
+        nargs="+",
+        type=float,
+        default=[0.3, 0.5, 0.7],
+        help=(
+            "One or more reference t values in (0,1) used when calibrating the cosine scale. "
+            "The first value sets the applied scale; all values are logged for diagnostics. "
+            "Default: 0.3 0.5 0.7."
+        ),
+    )
+    parser.add_argument(
         "--mi_lut_force_warm_start",
         action="store_true",
         help=(
