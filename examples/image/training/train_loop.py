@@ -547,6 +547,8 @@ def train_one_epoch(
     cosine_scale_ratio_metric = MeanMetric().to(device, non_blocking=True)
     geodesic_penalty_metric = MeanMetric().to(device, non_blocking=True)
     geodesic_penalty_updated = False
+    geometry_penalty_metric = MeanMetric().to(device, non_blocking=True)
+    geometry_penalty_updated = False
     lut_reg_align = float(getattr(args, "mi_lut_reg_align", 0.0))
     lut_reg_step = float(getattr(args, "mi_lut_reg_step", 0.0))
     lut_reg_curvature = float(getattr(args, "mi_lut_reg_curvature", 0.0))
@@ -1023,6 +1025,7 @@ def train_one_epoch(
 
             if logbeta_reg_penalty is not None:
                 loss = loss + logbeta_reg_penalty
+            geometry_penalty_value: Optional[torch.Tensor] = None
             if geometry_enabled:
                 penalty, geom_metrics = _compute_lut_regularizer_and_metrics(
                     path=path,
@@ -1033,7 +1036,10 @@ def train_one_epoch(
                     compute_metrics=lut_geometry_log or geometry_reg_enabled,
                 )
                 if geometry_reg_enabled:
+                    geometry_penalty_value = penalty.detach()
                     loss = loss + penalty
+                    geometry_penalty_metric.update(geometry_penalty_value)
+                    geometry_penalty_updated = True
                 if geom_metrics:
                     geom_metrics_step = geom_metrics
                     geometry_count += 1
@@ -1234,6 +1240,10 @@ def train_one_epoch(
                                 ),
                             }
                         )
+                if geometry_penalty_value is not None:
+                    wandb_log_data["loss/lut_geometry_penalty"] = float(
+                        geometry_penalty_value.cpu().item()
+                    )
                 if geom_metrics_step:
                     for key, value in geom_metrics_step.items():
                         wandb_log_data[key.replace("lut_", "lut/")] = float(value)
@@ -1599,10 +1609,11 @@ def train_one_epoch(
                     wandb_payload = {
                         "train/step_loss": float(batch_loss.compute().detach().cpu()),
                         "train/inst_loss": float(loss_value),
-                        "train/uw_loss": float(uw_loss) if "uw_loss" in locals() else float(loss_value),
                         "train/lr": float(lr),
                         "epoch": int(epoch),
                     }
+                    if logbeta_weights is not None and "uw_loss" in locals():
+                        wandb_payload["train/uw_loss"] = float(uw_loss)
                     if step_scale_ratio is not None and step_effective_neighbor is not None:
                         wandb_payload.update(
                             {
@@ -1649,6 +1660,10 @@ def train_one_epoch(
                                     ),
                                 }
                             )
+                    if geometry_penalty_value is not None:
+                        wandb_payload["loss/lut_geometry_penalty"] = float(
+                            geometry_penalty_value.cpu().item()
+                        )
                     if geom_metrics_step:
                         for key, value in geom_metrics_step.items():
                             wandb_payload[key.replace("lut_", "train/lut_")] = value
@@ -1664,6 +1679,13 @@ def train_one_epoch(
     setattr(args, "_mi_logbeta_reg_step", logbeta_reg_update_step)
     lr_schedule.step()
     stats = {"loss": float(epoch_loss.compute().detach().cpu())}
+    if geometry_penalty_updated:
+        try:
+            stats["loss/lut_geometry_penalty"] = float(
+                geometry_penalty_metric.compute().detach().cpu().item()
+            )
+        except Exception:
+            pass
     if geodesic_penalty_updated:
         try:
             stats["train/geodesic_penalty"] = float(
