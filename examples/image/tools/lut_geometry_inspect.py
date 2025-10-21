@@ -20,10 +20,12 @@
 #   - Optional: saves/prints a 1-D signed projection curve for visual inspection.
 
 import argparse
+import math
 from pathlib import Path
 from typing import Dict, Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 def _ensure_3d(weight: torch.Tensor) -> torch.Tensor:
@@ -51,6 +53,26 @@ def _linear_baseline(
         raise ValueError(f"Unsupported embed_range '{embed_range}'.")
     base = base.unsqueeze(0).expand(num_channels, -1)  # [C,V]
     weight[:] = base.unsqueeze(-1)  # broadcast across embed_dim
+    return weight
+
+
+def _great_circle_baseline(
+    num_channels: int,
+    vocab_size: int,
+    embed_dim: int,
+    device,
+    dtype,
+) -> torch.Tensor:
+    if embed_dim < 2:
+        raise ValueError("Great-circle baseline requires embedding dimension >= 2.")
+    weight = torch.zeros(num_channels, vocab_size, embed_dim, device=device, dtype=dtype)
+    theta = torch.linspace(0.0, math.pi, steps=vocab_size, device=device, dtype=dtype)
+    cos_theta = torch.cos(theta).unsqueeze(0).expand(num_channels, -1)
+    sin_theta = torch.sin(theta).unsqueeze(0).expand(num_channels, -1)
+    weight[:, :, 0] = cos_theta
+    weight[:, :, 1] = sin_theta
+    if embed_dim > 2:
+        weight[:, :, 2:] = 0.0
     return weight
 
 
@@ -102,6 +124,7 @@ def compute_geometry_metrics(
     lut_weight: torch.Tensor,
     baseline_weight: torch.Tensor,
     normalized_distance: bool = False,
+    sphere_mode: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """
     Args:
@@ -123,10 +146,16 @@ def compute_geometry_metrics(
     if V < 3:
         raise ValueError("Need vocab_size >= 3 to compute curvature/angles")
 
+    if sphere_mode:
+        lut_weight = F.normalize(lut_weight, p=2, dim=-1, eps=1e-12)
+        baseline_weight = F.normalize(baseline_weight, p=2, dim=-1, eps=1e-12)
+        if torch.isnan(lut_weight).any() or torch.isnan(baseline_weight).any():
+            raise ValueError("Encountered NaNs during unit normalization; check LUT/baseline weights.")
+
     diff = lut_weight[:, 1:, :] - lut_weight[:, :-1, :]
     diff_base = baseline_weight[:, 1:, :] - baseline_weight[:, :-1, :]
 
-    if normalized_distance:
+    if normalized_distance and not sphere_mode:
         scale = torch.sqrt(torch.tensor(float(D), device=lut_weight.device, dtype=lut_weight.dtype))
         diff = diff / scale
         diff_base = diff_base / scale
@@ -138,8 +167,14 @@ def compute_geometry_metrics(
     cos_theta = (a * b).sum(dim=-1) / denom
 
     # stretch ratio
-    dist = diff.norm(dim=-1)  # [C,V-1]
-    dist_base = diff_base.norm(dim=-1) + 1e-12
+    if sphere_mode:
+        dot = torch.sum(lut_weight[:, 1:, :] * lut_weight[:, :-1, :], dim=-1).clamp(-1.0, 1.0)
+        dist = torch.sqrt(torch.clamp(2.0 - 2.0 * dot, min=0.0))  # chord length on unit sphere
+        dot_base = torch.sum(baseline_weight[:, 1:, :] * baseline_weight[:, :-1, :], dim=-1).clamp(-1.0, 1.0)
+        dist_base = torch.sqrt(torch.clamp(2.0 - 2.0 * dot_base, min=0.0)) + 1e-12
+    else:
+        dist = diff.norm(dim=-1)  # [C,V-1]
+        dist_base = diff_base.norm(dim=-1) + 1e-12
     stretch = dist / dist_base
 
     # curvature magnitude
@@ -185,9 +220,18 @@ def main() -> None:
     parser.add_argument("--baseline", type=Path, default=None, help="Optional baseline LUT snapshot (.pt).")
     parser.add_argument("--lut-key", type=str, default="metric_learnable_lut", help="Key inside checkpoint['extra_modules'] for the learnable LUT.")
     parser.add_argument("--normalized", action="store_true", help="Use normalized distances (divide by sqrt(D)).")
+    parser.add_argument(
+        "--sphere",
+        action="store_true",
+        help=("Compute metrics on unit-normalized embeddings using chord lengths (cosine geometry). "
+              "When no baseline is provided, a great-circle baseline is used."),
+    )
     parser.add_argument("--projection-mode", choices=["none", "mean", "uniform"], default="none", help="Compute signed projection curve.")
     parser.add_argument("--export-projection", type=Path, default=None, help="Where to save projection curve (npz with per-channel arrays).")
     args = parser.parse_args()
+
+    if args.sphere and args.normalized:
+        print("Note: --normalized is ignored when --sphere is enabled (unit vectors already used).")
 
     if args.lut is not None:
         lut_weight, meta = load_lut_snapshot(args.lut)
@@ -200,20 +244,34 @@ def main() -> None:
     if args.baseline is not None:
         base_weight, _ = load_lut_snapshot(args.baseline)
         base_weight = _ensure_3d(base_weight)
+        if args.sphere and base_weight.shape[-1] < 2:
+            raise ValueError("Sphere mode requires a baseline with embedding dimension >= 2.")
     else:
-        base_weight = _linear_baseline(
-            num_channels=meta["num_channels"],
-            vocab_size=meta["vocab_size"],
-            embed_range=meta.get("embed_range", "pm1"),
-            device=lut_weight.device,
-            dtype=lut_weight.dtype,
-            embed_dim=lut_weight.shape[-1],
-        )
+        if args.sphere:
+            if lut_weight.shape[-1] < 2:
+                raise ValueError("Sphere mode requires embedding dimension >= 2.")
+            base_weight = _great_circle_baseline(
+                num_channels=meta["num_channels"],
+                vocab_size=meta["vocab_size"],
+                embed_dim=lut_weight.shape[-1],
+                device=lut_weight.device,
+                dtype=lut_weight.dtype,
+            )
+        else:
+            base_weight = _linear_baseline(
+                num_channels=meta["num_channels"],
+                vocab_size=meta["vocab_size"],
+                embed_range=meta.get("embed_range", "pm1"),
+                device=lut_weight.device,
+                dtype=lut_weight.dtype,
+                embed_dim=lut_weight.shape[-1],
+            )
 
     metrics = compute_geometry_metrics(
         lut_weight,
         base_weight,
         normalized_distance=args.normalized,
+        sphere_mode=args.sphere,
     )
 
     print(f"LUT source: {lut_source}")
