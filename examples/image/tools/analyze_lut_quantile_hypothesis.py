@@ -108,17 +108,6 @@ def load_lut_from_checkpoint(checkpoint_path: str) -> Tuple[torch.Tensor, dict]:
     return lut_weight, metadata
 
 
-def scalarize_embedding(e_raw: torch.Tensor, mode: str = "uniform") -> torch.Tensor:
-    """Backward-compatible shim around :func:`scalarize_embedding`."""
-    warnings.warn(
-        "scalarize_embedding is deprecated; use scalarize_embedding from "
-        "lut_quantile_analysis instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return scalarize_embedding(e_raw, mode)
-
-
 def estimate_data_histogram(
     data_path: Optional[str] = None,
     vocab_size: int = 256,

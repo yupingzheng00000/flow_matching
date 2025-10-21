@@ -541,6 +541,52 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--mi_lut_param_mode",
+        default="none",
+        choices=["none", "line2d", "arc2d"],
+        help=(
+            "Optional geometric parameterization for learnable LUT. "
+            "'line2d' constrains embeddings to a monotone line in a 2D subspace "
+            "(stable warm start, expandable); 'arc2d' uses a monotone spherical arc; "
+            "'none' keeps the original free-form LUT."
+        ),
+    )
+    parser.add_argument(
+        "--mi_lut_monotone_mode",
+        default="softplus",
+        choices=["softplus"],
+        help="Monotone parameterization mode for the 1D curve (currently only 'softplus').",
+    )
+    parser.add_argument(
+        "--mi_lut_arc_radius",
+        default=1.0,
+        type=float,
+        help="Base radius used for arc2d parameterization (per-channel learnable).",
+    )
+    parser.add_argument(
+        "--mi_lut_reg_align",
+        default=0.0,
+        type=float,
+        help="Regularizer weight for neighbor alignment (1 - cos(E_i, E_{i+1})).",
+    )
+    parser.add_argument(
+        "--mi_lut_reg_step",
+        default=0.0,
+        type=float,
+        help="Regularizer weight for step consistency max(0, -cos(ΔE_i, ΔE_{i+1})).",
+    )
+    parser.add_argument(
+        "--mi_lut_reg_curvature",
+        default=0.0,
+        type=float,
+        help="Regularizer weight for second-order smoothness ||Δ^2E_i||_2^2.",
+    )
+    parser.add_argument(
+        "--mi_lut_geometry_log",
+        action="store_true",
+        help="Enable detailed LUT geometry logging/diagnostics during training.",
+    )
+    parser.add_argument(
         "--mi_lp",
         default=3.0,
         type=float,

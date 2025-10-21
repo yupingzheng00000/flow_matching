@@ -7,11 +7,12 @@ import argparse
 import gc
 import logging
 import math
-from collections import deque
+from collections import deque, defaultdict
 from typing import Iterable, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from flow_matching.path import (
     CondOTProbPath,
@@ -32,10 +33,163 @@ from training import distributed_mode
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_wandb_module(args: argparse.Namespace) -> Optional[object]:
+    """
+    Try importing swanlab (preferred) and fall back to the official wandb client.
+    Cache the result on args to reuse the module across logging paths.
+    """
+    if not getattr(args, "wandb", False):
+        return None
+    cached = getattr(args, "_cached_wandb_module", None)
+    attempted = getattr(args, "_cached_wandb_attempted", False)
+    if attempted:
+        return cached
+    setattr(args, "_cached_wandb_attempted", True)
+    if not distributed_mode.is_main_process():
+        setattr(args, "_cached_wandb_module", None)
+        return None
+
+    module: Optional[object] = None
+    try:
+        import swanlab as wandb  # type: ignore
+
+        module = wandb
+    except ImportError:
+        try:
+            import wandb  # type: ignore
+
+            module = wandb
+        except ImportError:
+            module = None
+            if not getattr(args, "_wandb_import_warned", False):
+                logger.warning(
+                    "Weights & Biases logging disabled: unable to import swanlab or wandb."
+                )
+                setattr(args, "_wandb_import_warned", True)
+    setattr(args, "_cached_wandb_module", module)
+    return module
+
+
 # NOTE: KO metric-induced path trains on 256-way tokens (no mask token).
 # The original mixture path branch used a MASK_TOKEN=256 scheme.
 MASK_TOKEN = 256
 PRINT_FREQUENCY = 10
+
+
+def _ks_uniform_metric(values: torch.Tensor) -> float:
+    if values.numel() <= 1:
+        return 0.0
+    sorted_vals, _ = torch.sort(values)
+    n = sorted_vals.numel()
+    min_val = sorted_vals[0]
+    max_val = sorted_vals[-1]
+    if (max_val - min_val).abs() < 1e-9:
+        return 0.0
+    standardized = (sorted_vals - min_val) / (max_val - min_val + 1e-12)
+    uniform_cdf = torch.linspace(0.0, 1.0, n, device=sorted_vals.device, dtype=sorted_vals.dtype)
+    d = torch.max(torch.abs(standardized - uniform_cdf))
+    return float(d.detach().cpu())
+
+
+def _compute_lut_regularizer_and_metrics(
+    path: ProbPath,
+    device: torch.device,
+    reg_align: float,
+    reg_step: float,
+    reg_curv: float,
+    compute_metrics: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    lut = getattr(path, "learnable_lut", None)
+    if lut is None:
+        return torch.tensor(0.0, device=device), {}
+    weight = lut.weight if hasattr(lut, "weight") else lut()
+    if weight is None:
+        return torch.tensor(0.0, device=device), {}
+    weight = weight.to(device=device)
+    if weight.size(1) < 2:
+        return torch.tensor(0.0, device=device), {}
+    dtype = weight.dtype
+    normed = F.normalize(weight, dim=-1, eps=1e-12)
+
+    align_term = (1.0 - (normed[:, :-1, :] * normed[:, 1:, :]).sum(dim=-1)).mean()
+
+    diff = normed[:, 1:, :] - normed[:, :-1, :]
+    if diff.size(1) >= 2:
+        diff_prev = diff[:, :-1, :]
+        diff_next = diff[:, 1:, :]
+        denom = diff_prev.norm(dim=-1) * diff_next.norm(dim=-1) + 1e-12
+        cos_steps = (diff_prev * diff_next).sum(dim=-1) / denom
+        step_term = torch.clamp(-cos_steps, min=0.0).mean()
+    else:
+        cos_steps = torch.empty(0, device=device, dtype=dtype)
+        step_term = weight.new_tensor(0.0)
+
+    if weight.size(1) >= 3:
+        curvature_mag = (normed[:, 2:, :] - 2 * normed[:, 1:-1, :] + normed[:, :-2, :]).norm(dim=-1)
+        curvature_term = curvature_mag.mean()
+    else:
+        curvature_mag = torch.empty(0, device=device, dtype=dtype)
+        curvature_term = weight.new_tensor(0.0)
+
+    penalty = (
+        reg_align * align_term
+        + reg_step * step_term
+        + reg_curv * curvature_term
+    )
+
+    metrics: dict[str, float] = {}
+    if compute_metrics:
+        angles_cos = torch.clamp(
+            (normed[:, :-1, :] * normed[:, 1:, :]).sum(dim=-1),
+            -1.0 + 1e-6,
+            1.0 - 1e-6,
+        )
+        angles = torch.acos(angles_cos)
+        if angles.numel() > 0:
+            angles_flat = angles.reshape(-1)
+            angle_p50 = float(
+                torch.quantile(angles_flat, 0.5).detach().cpu() * (180.0 / math.pi)
+            )
+            angle_p90 = float(
+                torch.quantile(angles_flat, 0.9).detach().cpu() * (180.0 / math.pi)
+            )
+        else:
+            angle_p50 = angle_p90 = 0.0
+        flip_rate = (
+            float((cos_steps < 0).float().mean().detach().cpu())
+            if cos_steps.numel() > 0
+            else 0.0
+        )
+        if cos_steps.numel() > 0:
+            cos_flat = cos_steps.detach().reshape(-1).float()
+            direction_mean = float(cos_flat.mean().cpu())
+            direction_std = float(cos_flat.std(unbiased=False).cpu())
+            direction_p10 = float(torch.quantile(cos_flat, 0.1).cpu())
+            direction_p90 = float(torch.quantile(cos_flat, 0.9).cpu())
+        else:
+            direction_mean = 0.0
+            direction_std = 0.0
+            direction_p10 = 0.0
+            direction_p90 = 0.0
+        proj_vector = torch.ones(normed.shape[-1], device=device, dtype=normed.dtype)
+        proj_vector = proj_vector / (proj_vector.norm() + 1e-12)
+        proj_vals = torch.matmul(weight, proj_vector)
+        ks = _ks_uniform_metric(proj_vals.reshape(-1))
+        metrics = {
+            "lut_align": float(align_term.detach().cpu()),
+            "lut_step": float(step_term.detach().cpu()),
+            "lut_curvature": float(curvature_term.detach().cpu()),
+            "lut_flip_rate": flip_rate,
+            "lut_angle_p50_deg": angle_p50,
+            "lut_angle_p90_deg": angle_p90,
+            "lut_ks_uniform": ks,
+            "lut_step_cos_mean": direction_mean,
+            "lut_step_cos_std": direction_std,
+            "lut_step_cos_p10": direction_p10,
+            "lut_step_cos_p90": direction_p90,
+        }
+    return penalty, metrics
 
 
 # Compatibility autocast wrapper: prefer torch.amp.autocast('cuda', ...) if available,
@@ -391,6 +545,18 @@ def train_one_epoch(
     epoch_loss = MeanMetric().to(device, non_blocking=True)
     entropy_metric = MeanMetric().to(device, non_blocking=True)
     cosine_scale_ratio_metric = MeanMetric().to(device, non_blocking=True)
+    geodesic_penalty_metric = MeanMetric().to(device, non_blocking=True)
+    geodesic_penalty_updated = False
+    lut_reg_align = float(getattr(args, "mi_lut_reg_align", 0.0))
+    lut_reg_step = float(getattr(args, "mi_lut_reg_step", 0.0))
+    lut_reg_curvature = float(getattr(args, "mi_lut_reg_curvature", 0.0))
+    lut_geometry_log = bool(getattr(args, "mi_lut_geometry_log", False))
+    geometry_reg_enabled = any(w > 0.0 for w in (lut_reg_align, lut_reg_step, lut_reg_curvature))
+    geometry_enabled = getattr(args, "mi_learnable_lut", False) and (geometry_reg_enabled or lut_geometry_log)
+    geometry_accum = defaultdict(float)
+    geometry_count = 0
+    last_geometry_metrics: dict[str, float] = {}
+
     cosine_effective_neighbor_metric = MeanMetric().to(device, non_blocking=True)
     cosine_metrics_updated = False
     entropy_samples: list[torch.Tensor] = []
@@ -564,6 +730,7 @@ def train_one_epoch(
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
+        geom_metrics_step: dict[str, float] = {}
         if torch.rand(1) < args.class_drop_prob:
             conditioning = {}
         else:
@@ -856,6 +1023,24 @@ def train_one_epoch(
 
             if logbeta_reg_penalty is not None:
                 loss = loss + logbeta_reg_penalty
+            if geometry_enabled:
+                penalty, geom_metrics = _compute_lut_regularizer_and_metrics(
+                    path=path,
+                    device=device,
+                    reg_align=lut_reg_align,
+                    reg_step=lut_reg_step,
+                    reg_curv=lut_reg_curvature,
+                    compute_metrics=lut_geometry_log or geometry_reg_enabled,
+                )
+                if geometry_reg_enabled:
+                    loss = loss + penalty
+                if geom_metrics:
+                    geom_metrics_step = geom_metrics
+                    geometry_count += 1
+                    last_geometry_metrics = geom_metrics
+                    for k, v in geom_metrics.items():
+                        geometry_accum[k] += v
+
 
             beta_t_values, _ = path.beta(t)
             if cosine_monitor_enabled:
@@ -997,10 +1182,13 @@ def train_one_epoch(
                             
                             # Add to total loss
                             loss = loss + geo_penalty
-                            
+
                             # Store for logging (detach to avoid gradients)
                             geodesic_energy_val = geo_energy.detach()
-                            
+                            geodesic_penalty = geo_penalty.detach()
+                            geodesic_penalty_metric.update(geodesic_penalty)
+                            geodesic_penalty_updated = True
+
                             # Announce once per training
                             if not getattr(args, "_geodesic_energy_announced", False):
                                 logger.info(
@@ -1009,14 +1197,7 @@ def train_one_epoch(
                                 )
                                 setattr(args, "_geodesic_energy_announced", True)
 
-            wandb_logger = None
-            if getattr(args, "wandb", False) and distributed_mode.is_main_process():
-                try:
-                    import swanlab as wandb  # type: ignore
-                    wandb_logger = wandb
-                except ImportError:
-                    wandb_logger = None
-
+            wandb_logger = _resolve_wandb_module(args)
             if wandb_logger is not None:
                 weighted_entropy = _importance_weighted_mean(target_entropy, logbeta_weights)
                 wandb_log_data = {
@@ -1053,6 +1234,9 @@ def train_one_epoch(
                                 ),
                             }
                         )
+                if geom_metrics_step:
+                    for key, value in geom_metrics_step.items():
+                        wandb_log_data[key.replace("lut_", "lut/")] = float(value)
                 
                 # Log geodesic energy regularization
                 if geodesic_energy_val is not None:
@@ -1061,7 +1245,7 @@ def train_one_epoch(
                     )
                 if geodesic_penalty is not None:
                     wandb_log_data["train/geodesic_penalty"] = float(
-                        geodesic_penalty.detach().cpu().item()
+                        geodesic_penalty.cpu().item()
                     )
 
                 # Log bounded residual scale parameters and penalty
@@ -1343,22 +1527,18 @@ def train_one_epoch(
             logger.info(log_msg)
 
             # Optional Weights & Biases step-level logging (main process only)
-            if getattr(args, "wandb", False) and distributed_mode.is_main_process():
+            wandb_logger = _resolve_wandb_module(args)
+            if wandb_logger is not None:
                 try:
-                    import swanlab as wandb  # type: ignore
-                    if _dl_len is not None:
-                        global_step = epoch * _dl_len + data_iter_step
-                    else:
-                        global_step = None
-                    
-                    # Compute metric diagnostics for logging
+                    global_step = epoch * _dl_len + data_iter_step if _dl_len is not None else None
+
                     metric_diagnostics = {}
                     if hasattr(path, "learnable_metric") and path.learnable_metric is not None:
                         with torch.no_grad():
                             Z = path.learnable_metric.transformed_codes(
                                 device=device, dtype=torch.float32
                             )
-                            fro_norm = torch.linalg.norm(Z, ord='fro')
+                            fro_norm = torch.linalg.norm(Z, ord="fro")
                             dist_table = path.learnable_metric.pairwise_distance_table(
                                 device=device, dtype=torch.float32
                             )
@@ -1369,32 +1549,28 @@ def train_one_epoch(
                                 "metric/distance_max": float(dist_table.max().cpu()),
                                 "metric/distance_min": float(dist_table.min().cpu()),
                             }
-                            # Log learned scale (in reparameterization mode)
-                            if hasattr(path.learnable_metric, 'log_scale'):
+                            if hasattr(path.learnable_metric, "log_scale"):
                                 metric_diagnostics["metric/learned_scale"] = float(
                                     torch.exp(path.learnable_metric.log_scale).cpu()
                                 )
                             if metric_grad_norm_value is not None:
                                 metric_diagnostics["metric/grad_norm"] = float(
-                                    metric_grad_norm_value.cpu() if isinstance(metric_grad_norm_value, torch.Tensor) 
+                                    metric_grad_norm_value.cpu()
+                                    if isinstance(metric_grad_norm_value, torch.Tensor)
                                     else metric_grad_norm_value
                                 )
-                    
-                    # Add LUT diagnostics
+
                     lut_diagnostics = {}
                     if hasattr(path, "learnable_lut") and path.learnable_lut is not None:
                         with torch.no_grad():
-                            # Use forward() to get renormalized weights if enabled
                             lut_weight = path.learnable_lut()
                             lut_diagnostics["lut/weight_mean"] = float(lut_weight.mean().cpu())
                             lut_diagnostics["lut/weight_std"] = float(lut_weight.std().cpu())
                             lut_diagnostics["lut/weight_min"] = float(lut_weight.min().cpu())
                             lut_diagnostics["lut/weight_max"] = float(lut_weight.max().cpu())
                             lut_diagnostics["lut/weight_abs_max"] = float(lut_weight.abs().max().cpu())
-                            # Per-channel std
                             for ch_idx in range(lut_weight.shape[0]):
                                 lut_diagnostics[f"lut/ch{ch_idx}_std"] = float(lut_weight[ch_idx].std().cpu())
-                            # Per-channel Frobenius norms
                             lut_flat = lut_weight.view(lut_weight.shape[0], -1)
                             channel_fro = torch.linalg.vector_norm(lut_flat, ord=2, dim=1)
                             lut_diagnostics["lut/fro_norm_mean"] = float(channel_fro.mean().cpu())
@@ -1419,119 +1595,95 @@ def train_one_epoch(
                             )
                         if lut_param_delta is not None:
                             lut_diagnostics["lut/param_delta"] = float(lut_param_delta)
-                    
-                    wandb.log(  # type: ignore[attr-defined]
-                        {
-                            "train/step_loss": float(batch_loss.compute().detach().cpu()),
-                            "train/inst_loss": float(loss_value),
-                            "train/uw_loss": float(uw_loss) if 'uw_loss' in locals() else float(loss_value),
-                            "train/lr": float(lr),
-                            "epoch": int(epoch),
-                            **(
+
+                    wandb_payload = {
+                        "train/step_loss": float(batch_loss.compute().detach().cpu()),
+                        "train/inst_loss": float(loss_value),
+                        "train/uw_loss": float(uw_loss) if "uw_loss" in locals() else float(loss_value),
+                        "train/lr": float(lr),
+                        "epoch": int(epoch),
+                    }
+                    if step_scale_ratio is not None and step_effective_neighbor is not None:
+                        wandb_payload.update(
+                            {
+                                "train/cosine_scale_ratio": float(step_scale_ratio),
+                                "train/cosine_effective_neighbor": float(step_effective_neighbor),
+                            }
+                        )
+                    wandb_payload.update(metric_diagnostics)
+                    wandb_payload.update(lut_diagnostics)
+                    if grad_norm is not None and not grad_step_skipped:
+                        wandb_payload["train/model_grad_norm"] = float(
+                            grad_norm.cpu() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                        )
+                    if use_path_trust_region and schedule_kl_value is not None:
+                        wandb_payload["train/schedule_kl"] = float(schedule_kl_value.detach().cpu())
+                        if schedule_kl_penalty is not None:
+                            wandb_payload["train/schedule_kl_penalty"] = float(
+                                schedule_kl_penalty.detach().cpu()
+                            )
+                        wandb_payload["train/schedule_kl_weight"] = float(kl_controller.current_weight())
+                        if kl_avg_for_logging is not None:
+                            wandb_payload["train/schedule_kl_avg"] = float(kl_avg_for_logging)
+                    if gumbel_schedule_active and current_gumbel_tau is not None:
+                        wandb_payload["train/gumbel_tau"] = float(current_gumbel_tau)
+                    if tau_progress is not None:
+                        wandb_payload["train/gumbel_tau_progress"] = float(tau_progress)
+                    if step_entropy_mean is not None:
+                        wandb_payload["train/entropy_mean"] = float(step_entropy_mean)
+                    if step_entropy_median is not None:
+                        wandb_payload["train/entropy_median"] = float(step_entropy_median)
+                    if step_entropy_p90 is not None:
+                        wandb_payload["train/entropy_p90"] = float(step_entropy_p90)
+                    if metric_interp_active and current_metric_interp is not None:
+                        wandb_payload["train/metric_interp_lambda"] = float(current_metric_interp)
+                    if logbeta_reg_penalty is not None:
+                        wandb_payload["train/logbeta_reg_penalty"] = float(logbeta_reg_penalty.detach().cpu())
+                        if logbeta_reg_terms is not None:
+                            wandb_payload.update(
                                 {
-                                    "train/cosine_scale_ratio": float(step_scale_ratio),
-                                    "train/cosine_effective_neighbor": float(step_effective_neighbor),
-                                }
-                                if step_scale_ratio is not None and step_effective_neighbor is not None
-                                else {}
-                            ),
-                            **metric_diagnostics,
-                            **lut_diagnostics,
-                            **({
-                                "train/model_grad_norm": float(
-                                    grad_norm.cpu() if isinstance(grad_norm, torch.Tensor) else grad_norm
-                                )
-                            } if grad_norm is not None and not grad_step_skipped else {}),
-                            **(
-                                {
-                                    "train/schedule_kl": float(
-                                        schedule_kl_value.detach().cpu()
-                                    ),
-                                    "train/schedule_kl_penalty": float(
-                                        schedule_kl_penalty.detach().cpu()
-                                    ),
-                                    "train/schedule_kl_weight": float(
-                                        kl_controller.current_weight()
-                                    ),
-                                    **(
-                                        {
-                                            "train/schedule_kl_avg": float(
-                                                kl_avg_for_logging
-                                            )
-                                        }
-                                        if kl_avg_for_logging is not None
-                                        else {}
-                                    ),
-                                }
-                                if use_path_trust_region and schedule_kl_value is not None
-                                else {}
-                            ),
-                            **(
-                                {
-                                    "train/gumbel_tau": float(current_gumbel_tau)
-                                }
-                                if gumbel_schedule_active and current_gumbel_tau is not None
-                                else {}
-                            ),
-                            **(
-                                {
-                                    "train/gumbel_tau_progress": float(tau_progress)
-                                }
-                                if tau_progress is not None
-                                else {}
-                            ),
-                            **(
-                                {
-                                    "train/entropy_mean": float(step_entropy_mean),
-                                    "train/entropy_median": float(step_entropy_median),
-                                    "train/entropy_p90": float(step_entropy_p90),
-                                }
-                                if step_entropy_mean is not None
-                                else {}
-                            ),
-                            **(
-                                {
-                                    "train/metric_interp_lambda": float(
-                                        current_metric_interp
-                                    )
-                                }
-                                if metric_interp_active
-                                and current_metric_interp is not None
-                                else {}
-                            ),
-                            **(
-                                {
-                                    "train/logbeta_reg_penalty": float(
-                                        logbeta_reg_penalty.detach().cpu()
-                                    ),
-                                    **(
-                                        {
-                                            "train/logbeta_reg_delta": float(
-                                                logbeta_reg_terms["delta"].detach().cpu()
-                                            ),
-                                            "train/logbeta_reg_delta2": float(
-                                                logbeta_reg_terms["delta2"].detach().cpu()
-                                            ),
-                                            "train/logbeta_reg_endpoint": float(
-                                                logbeta_reg_terms["endpoint"].detach().cpu()
-                                            ),
-                                        }
-                                        if logbeta_reg_terms is not None
-                                        else {}
+                                    "train/logbeta_reg_delta": float(logbeta_reg_terms["delta"].detach().cpu()),
+                                    "train/logbeta_reg_delta2": float(logbeta_reg_terms["delta2"].detach().cpu()),
+                                    "train/logbeta_reg_endpoint": float(
+                                        logbeta_reg_terms["endpoint"].detach().cpu()
                                     ),
                                 }
-                                if logbeta_reg_penalty is not None
-                                else {}
-                            ),
-                        },
-                        step=global_step,
-                    )
-                except Exception:
-                    pass
+                            )
+                    if geom_metrics_step:
+                        for key, value in geom_metrics_step.items():
+                            wandb_payload[key.replace("lut_", "train/lut_")] = value
+                    if geodesic_energy_val is not None:
+                        wandb_payload["train/geodesic_energy"] = float(geodesic_energy_val.cpu().item())
+                    if geodesic_penalty is not None:
+                        wandb_payload["train/geodesic_penalty"] = float(geodesic_penalty.cpu().item())
+
+                    wandb_logger.log(wandb_payload, step=global_step)
+                except Exception as exc:
+                    logger.warning(f"WandB logging failed at step {data_iter_step}: {exc}")
 
     setattr(args, "_mi_logbeta_reg_step", logbeta_reg_update_step)
     lr_schedule.step()
     stats = {"loss": float(epoch_loss.compute().detach().cpu())}
+    if geodesic_penalty_updated:
+        try:
+            stats["train/geodesic_penalty"] = float(
+                geodesic_penalty_metric.compute().detach().cpu().item()
+            )
+        except Exception:
+            pass
+    if geometry_count > 0:
+        try:
+            avg_metrics = {
+                key: value / float(geometry_count) for key, value in geometry_accum.items()
+            }
+            for key, value in avg_metrics.items():
+                stats[f"{key.replace('lut_', 'lut/')}_mean"] = float(value)
+            stats["lut/geometry_updates"] = float(geometry_count)
+            if last_geometry_metrics:
+                for key, value in last_geometry_metrics.items():
+                    stats[f"{key.replace('lut_', 'lut/')}_last"] = float(value)
+        except Exception:
+            logger.exception("Failed to aggregate LUT geometry metrics")
     if entropy_samples:
         try:
             entropy_epoch_tensor = torch.cat(entropy_samples)
@@ -1849,17 +2001,16 @@ def _log_lut_diagnostics(path: MetricInducedGibbsProbPath, epoch: int, logger: l
         logger.info(f"LUT diagnostics visualization saved to {save_path}")
         
         # Log to wandb if available
-        if getattr(args, 'wandb', False):
+        wandb_logger = _resolve_wandb_module(args)
+        if wandb_logger is not None:
             try:
-                import wandb
-                # Only log if wandb is actually initialized
-                if wandb.run is not None:
-                    wandb.log({"lut/diagnostics": wandb.Image(save_path)}, step=epoch)
-                    logger.info(f"✓ LUT diagnostics uploaded to wandb (run: {wandb.run.name})")
+                run = getattr(wandb_logger, "run", None)
+                if run is not None:
+                    wandb_logger.log({"lut/diagnostics": wandb_logger.Image(save_path)}, step=epoch)
+                    run_name = getattr(run, "name", "unknown")
+                    logger.info(f"LUT diagnostics uploaded to wandb (run: {run_name})")
                 else:
                     logger.info("wandb not initialized, image saved locally only")
-            except ImportError:
-                logger.info("wandb not installed, image saved locally only")
             except Exception as e:
                 logger.info(f"wandb upload skipped ({type(e).__name__}), image saved locally")
         
