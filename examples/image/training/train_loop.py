@@ -34,20 +34,35 @@ from training import distributed_mode
 logger = logging.getLogger(__name__)
 
 
+_WANDB_CACHE: dict[str, Optional[object]] = {"module": None}
+_WANDB_ATTEMPTED = False
+_WANDB_WARNED = False
+
+
 def _resolve_wandb_module(args: argparse.Namespace) -> Optional[object]:
     """
     Try importing swanlab (preferred) and fall back to the official wandb client.
-    Cache the result on args to reuse the module across logging paths.
+
+    The resolved module is cached at the module level (not on ``args``) so that
+    checkpoint serialization never encounters an un-picklable module object.
     """
+
+    global _WANDB_ATTEMPTED
     if not getattr(args, "wandb", False):
         return None
-    cached = getattr(args, "_cached_wandb_module", None)
-    attempted = getattr(args, "_cached_wandb_attempted", False)
-    if attempted:
-        return cached
-    setattr(args, "_cached_wandb_attempted", True)
+    # Backwards compatibility: remove stale attributes set by older checkpoints
+    for legacy_attr in ("_cached_wandb_module", "_cached_wandb_attempted", "_wandb_import_warned"):
+        if hasattr(args, legacy_attr):
+            try:
+                delattr(args, legacy_attr)
+            except AttributeError:
+                setattr(args, legacy_attr, None)
+    if _WANDB_ATTEMPTED:
+        return _WANDB_CACHE["module"]
+    _WANDB_ATTEMPTED = True
+
     if not distributed_mode.is_main_process():
-        setattr(args, "_cached_wandb_module", None)
+        _WANDB_CACHE["module"] = None
         return None
 
     module: Optional[object] = None
@@ -62,12 +77,13 @@ def _resolve_wandb_module(args: argparse.Namespace) -> Optional[object]:
             module = wandb
         except ImportError:
             module = None
-            if not getattr(args, "_wandb_import_warned", False):
+            global _WANDB_WARNED
+            if not _WANDB_WARNED:
                 logger.warning(
                     "Weights & Biases logging disabled: unable to import swanlab or wandb."
                 )
-                setattr(args, "_wandb_import_warned", True)
-    setattr(args, "_cached_wandb_module", module)
+                _WANDB_WARNED = True
+    _WANDB_CACHE["module"] = module
     return module
 
 
