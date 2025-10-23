@@ -598,16 +598,15 @@ def main(args):
         if getattr(args, "mi_learnable_metric", False) and getattr(args, "mi_learnable_lut", False):
             raise ValueError("Cannot enable both --mi_learnable_metric and --mi_learnable_lut at the same time.")
 
-    metric_kwargs = {}
-    if getattr(args, "mi_metric", "lp") == "cosine" and getattr(args, "mi_lut_param_mode", "none") not in ("none", None):
-        logger.warning("mi_lut_param_mode has no effect when metric='cosine'; using standard LUT")
-        setattr(args, "mi_lut_param_mode", "none")
-    if getattr(args, "mi_learnable_metric", False):
-        metric_kwargs.update(
-            learnable_metric_dim=int(getattr(args, "mi_metric_dim", 0)),
-            learnable_metric_diag_eps=float(getattr(args, "mi_metric_diag_eps", 1e-4)),
-            metric_interp_lambda=float(getattr(args, "mi_metric_interp_start", 0.0)),
-        )
+        metric_kwargs = {}
+        if getattr(args, "mi_metric", "lp") == "cosine" and getattr(args, "mi_lut_param_mode", "none") not in ("none", None):
+            logger.warning("mi_lut_param_mode has no effect when metric='cosine'; using standard LUT")
+            setattr(args, "mi_lut_param_mode", "none")
+        if getattr(args, "mi_learnable_metric", False):
+            metric_kwargs.update(
+                learnable_metric_dim=int(getattr(args, "mi_metric_dim", 0)),
+                learnable_metric_diag_eps=float(getattr(args, "mi_metric_diag_eps", 1e-4)),
+                metric_interp_lambda=float(getattr(args, "mi_metric_interp_start", 0.0)),
             )
         if getattr(args, "mi_learnable_lut", False):
             metric_kwargs.update(
@@ -624,10 +623,6 @@ def main(args):
                 lut_param_mode=getattr(args, "mi_lut_param_mode", "none"),
                 lut_monotone_mode=str(getattr(args, "mi_lut_monotone_mode", "softplus")),
                 lut_arc_radius=float(getattr(args, "mi_lut_arc_radius", 1.0)),
-                lut_reg_align=float(getattr(args, "mi_lut_reg_align", 0.0)),
-                lut_reg_step=float(getattr(args, "mi_lut_reg_step", 0.0)),
-                lut_reg_curvature=float(getattr(args, "mi_lut_reg_curvature", 0.0)),
-                lut_geometry_log=bool(getattr(args, "mi_lut_geometry_log", False)),
             )
         args.mi_metric_interp_start = float(getattr(args, "mi_metric_interp_start", 0.0))
         args.mi_metric_interp_end = float(getattr(args, "mi_metric_interp_end", 1.0))

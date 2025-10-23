@@ -120,13 +120,13 @@ class TestLearnableScalarLUT(unittest.TestCase):
             dtype=torch.float32,
             renormalize_to_init_norm=True,
         )
-        init_norm = lut._init_fro_norm.item()
+        init_norm = lut._base_fro_norm_per_channel.detach().clone()
 
         with torch.no_grad():
             lut.weight.mul_(5.0)
 
-    effective = torch.linalg.vector_norm(lut()).item()
-        self.assertAlmostEqual(effective, init_norm, places=6)
+        effective = torch.linalg.vector_norm(lut(), dim=(1, 2))
+        self.assertTrue(torch.allclose(effective, init_norm, atol=1e-6))
 
     def test_forward_renorm_preserves_gradient(self):
         """Renormalization should keep gradient flow intact."""
@@ -233,10 +233,11 @@ class TestMetricInducedPathWithLUT(unittest.TestCase):
             lut_num_channels=2,
             lut_renorm_to_init_norm=True,
         )
-        init_norm = path.learnable_lut._init_fro_norm.item()
+        init_norm = torch.linalg.norm(path.learnable_lut._base_fro_norm_per_channel).item()
         with torch.no_grad():
             path.learnable_lut.weight.mul_(7.0)
-        effective = torch.linalg.norm(path.learnable_lut(), ord="fro").item()
+        per_channel_norm = torch.linalg.vector_norm(path.learnable_lut(), dim=(1, 2))
+        effective = torch.linalg.norm(per_channel_norm).item()
         self.assertAlmostEqual(effective, init_norm, places=6)
     
     def test_lut_distance_table_shape(self):
@@ -526,7 +527,10 @@ class TestLUTEdgeCases(unittest.TestCase):
         )
         
         self.assertEqual(path.learnable_lut.num_channels, 16)
-        self.assertEqual(path.learnable_lut.weight.shape, (16, 16))
+        self.assertEqual(
+            path.learnable_lut.weight.shape,
+            (16, 16, path.learnable_lut.emb_dim),
+        )
 
 
 if __name__ == "__main__":

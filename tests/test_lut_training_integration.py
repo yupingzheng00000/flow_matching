@@ -208,7 +208,12 @@ class TestLUTCheckpointSaving(unittest.TestCase):
         # LUT module should have state_dict
         lut_state = path.learnable_lut.state_dict()
         self.assertIn("weight", lut_state)
-        self.assertEqual(lut_state["weight"].shape, (3, 256))
+        weight_tensor = lut_state["weight"]
+        self.assertEqual(weight_tensor.shape[0], 3)
+        self.assertEqual(weight_tensor.shape[1], 256)
+        self.assertGreaterEqual(weight_tensor.ndim, 2)
+        if weight_tensor.ndim >= 3 and hasattr(path.learnable_lut, "emb_dim"):
+            self.assertEqual(weight_tensor.shape[-1], path.learnable_lut.emb_dim)
     
     def test_lut_load_state_dict(self):
         """Test loading LUT from state_dict."""
