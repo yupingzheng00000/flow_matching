@@ -24,11 +24,12 @@ import math
 import os
 from argparse import Namespace
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Union, cast
+from typing import Callable, Dict, Iterable, Optional, Union, cast
 
 import PIL.Image
 
 import torch
+import torch.distributed as dist
 
 def _autocast_cuda():
     """Return an autocast context manager for CUDA with torch.amp if available, else torch.cuda.amp."""
@@ -38,7 +39,10 @@ def _autocast_cuda():
     except Exception:  # pragma: no cover
         return torch.cuda.amp.autocast()
 from flow_matching.path import MixtureDiscreteProbPath, MetricInducedGibbsProbPath
+from flow_matching.path.beta_schedules import ExpMonotoneRQSSchedule
+from flow_matching.path.metric_ema import LearnableMetricEMA
 from flow_matching.path.scheduler import PolynomialConvexScheduler
+from flow_matching.path.metric_analysis import analyze_metric, quick_metric_check
 from flow_matching.solver import MixtureDiscreteEulerSolver, KODiscreteGibbsEulerSolver
 from flow_matching.solver.ode_solver import ODESolver
 from flow_matching.utils import ModelWrapper
@@ -47,14 +51,813 @@ from models.ema import EMA
 from torch.nn.modules import Module
 from torch.nn.parallel import DistributedDataParallel
 from torchmetrics.image.fid import FrechetInceptionDistance
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 from training import distributed_mode
 from training.edm_time_discretization import get_time_discretization
+from training.model_diagnostics import DiagnosticsRunner
 from training.train_loop import MASK_TOKEN
 
 logger = logging.getLogger(__name__)
 
-PRINT_FREQUENCY = 50
+PRINT_FREQUENCY = 1
+
+
+def _save_sampling_gif(
+    trajectories: torch.Tensor,
+    output_root: Path,
+    epoch: int,
+    step: int,
+    *,
+    is_discrete: bool,
+    max_batch: int,
+    stride: int,
+    fps: int,
+    log_to_wandb: bool,
+    wandb_step: int,
+) -> Optional[Path]:
+    """Persist a GIF visualizing sampling trajectories as a tiled grid."""
+
+    if trajectories.ndim < 4:
+        logger.debug(
+            "Skipping GIF export because trajectory tensor has unexpected rank %d",
+            trajectories.ndim,
+        )
+        return None
+
+    max_batch = max(1, int(max_batch))
+    stride = max(1, int(stride))
+    fps = max(1, int(fps))
+
+    frames = trajectories.detach().to(device="cpu", dtype=torch.float32)[::stride]
+    if frames.shape[0] == 0:
+        logger.debug("Skipping GIF export because no frames remain after striding")
+        return None
+
+    frames = frames[:, :max_batch]
+    if frames.shape[1] == 0:
+        logger.debug(
+            "Skipping GIF export because max_batch=%d removed all samples", max_batch
+        )
+        return None
+
+    if frames.ndim == 4:
+        frames = frames.unsqueeze(2)
+
+    if is_discrete:
+        frames = frames / 255.0
+    else:
+        frames = torch.clamp(frames, -1.0, 1.0) * 0.5 + 0.5
+    frames = torch.clamp(frames, 0.0, 1.0)
+
+    num_samples = frames.shape[1]
+    nrow = int(math.sqrt(num_samples))
+    if nrow * nrow < num_samples:
+        nrow += 1
+    nrow = max(1, nrow)
+
+    frame_images = []
+    for frame in frames:
+        grid = make_grid(frame, nrow=nrow, padding=2)
+        if grid.shape[0] == 1:
+            grid = grid.repeat(3, 1, 1)
+        elif grid.shape[0] == 2:
+            grid = torch.cat((grid, grid[:1]), dim=0)
+        elif grid.shape[0] > 3:
+            grid = grid[:3]
+        grid = torch.clamp(grid, 0.0, 1.0)
+        grid_np = (
+            (grid * 255.0)
+            .round()
+            .to(torch.uint8)
+            .permute(1, 2, 0)
+            .cpu()
+            .numpy()
+        )
+        frame_images.append(PIL.Image.fromarray(grid_np))
+
+    if not frame_images:
+        logger.debug("Skipping GIF export because no frame images were generated")
+        return None
+
+    gif_dir = output_root / "gifs"
+    gif_dir.mkdir(parents=True, exist_ok=True)
+    gif_path = gif_dir / f"epoch_{epoch:04d}_step_{step:04d}.gif"
+    duration_ms = max(1, int(1000 / fps))
+    frame_images[0].save(
+        gif_path,
+        save_all=True,
+        append_images=frame_images[1:],
+        duration=duration_ms,
+        loop=0,
+    )
+
+    if log_to_wandb:
+        try:
+            try:
+                import swanlab as wandb  # type: ignore
+            except Exception:  # pragma: no cover - swanlab not installed
+                import wandb  # type: ignore
+
+            if hasattr(wandb, "Video"):
+                wandb.log(  # type: ignore[attr-defined]
+                    {
+                        "eval/sample_gif": wandb.Video(  # type: ignore[attr-defined]
+                            str(gif_path), fps=fps, format="gif"
+                        )
+                    },
+                    step=wandb_step,
+                )
+        except Exception as wandb_exc:  # pragma: no cover - wandb unavailable
+            logger.debug("Unable to log evaluation GIF to wandb: %s", wandb_exc)
+
+    logger.info("Saved evaluation GIF to %s", gif_path)
+    return gif_path
+
+
+def _build_metric_infer_time_grid(
+    args: Namespace,
+    path: MetricInducedGibbsProbPath,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, str]:
+    grid_type = str(getattr(args, "mi_infer_grid", "uniform_t"))
+    
+    # Get evaluation alpha: if not specified, fall back to training alpha
+    eval_alpha_cfg = getattr(args, "mi_logbeta_eval_alpha", None)
+    if eval_alpha_cfg is None:
+        eval_alpha = float(getattr(args, "mi_logbeta_mis_alpha", 0.0))
+    else:
+        eval_alpha = float(eval_alpha_cfg)
+    eval_alpha = min(max(eval_alpha, 0.0), 1.0)  # Clamp to [0, 1]
+    
+    steps_cfg = getattr(args, "mi_infer_steps", None)
+    if steps_cfg is None:
+        steps = int(getattr(args, "discrete_fm_steps", 1024))
+    else:
+        steps = int(steps_cfg)
+    steps = max(1, steps)
+    num_points = steps + 1
+
+    if grid_type == "uniform_logbeta":
+        schedule = getattr(path, "beta_schedule", None)
+        if isinstance(schedule, ExpMonotoneRQSSchedule):
+            ell_min = getattr(args, "mi_logbeta_min", None)
+            ell_max = getattr(args, "mi_logbeta_max", None)
+            band_lo_cfg = getattr(args, "mi_logbeta_band_t_lo", None)
+            band_hi_cfg = getattr(args, "mi_logbeta_band_t_hi", None)
+            cfg_t_eps = float(schedule.config.t_eps)
+            default_lo = cfg_t_eps
+            default_hi = 1.0 - cfg_t_eps
+            band_lo = max(
+                default_lo,
+                float(band_lo_cfg) if band_lo_cfg is not None else default_lo,
+            )
+            band_hi = min(
+                default_hi,
+                float(band_hi_cfg) if band_hi_cfg is not None else default_hi,
+            )
+            if band_hi <= band_lo:
+                band_hi = min(default_hi, band_lo + 1e-6)
+            with torch.no_grad():
+                t_bounds = torch.tensor(
+                    [band_lo, band_hi],
+                    device=schedule.y0.device,
+                    dtype=schedule.y0.dtype,
+                )
+                ell_bounds = schedule.ell_from_t(t_bounds)
+                derived_min = float(torch.min(ell_bounds).item())
+                derived_max = float(torch.max(ell_bounds).item())
+            ell_min = (
+                derived_min if ell_min is None else max(float(ell_min), derived_min)
+            )
+            ell_max = (
+                derived_max if ell_max is None else min(float(ell_max), derived_max)
+            )
+            if not math.isfinite(ell_min) or not math.isfinite(ell_max):
+                raise ValueError("mi_logbeta_min/max must be finite when using uniform_logbeta grid")
+            if ell_max <= ell_min:
+                raise ValueError("mi_logbeta_max must exceed mi_logbeta_min for uniform_logbeta grid")
+            
+            # Get sampling strategy
+            sampling_strategy = str(getattr(args, "mi_logbeta_sampling_strategy", "uniform"))
+            
+            # Compute mu and sigma based on strategy
+            def compute_lognormal_params():
+                """Compute mu and sigma for log-normal sampling"""
+                mu_cfg = getattr(args, "mi_logbeta_lognormal_mu", None)
+                sigma_cfg = getattr(args, "mi_logbeta_lognormal_sigma", None)
+                
+                if sampling_strategy == "log_normal_broad":
+                    # Broad: center on full interval
+                    mu_default = (ell_min + ell_max) / 2
+                    sigma_default = (ell_max - ell_min) / 4
+                    mu = mu_default if mu_cfg is None else float(mu_cfg)
+                    sigma = sigma_default if sigma_cfg is None else float(sigma_cfg)
+                    return mu, sigma
+                    
+                elif sampling_strategy == "log_normal_focused":
+                    # Focused: center on informative region
+                    # First, compute informative region in beta space
+                    vocab_size = getattr(path, "vocab_size", 256)  # From metric geometry
+                    H_max = math.log(vocab_size)
+                    H_min_ratio = float(getattr(args, "mi_logbeta_informative_H_min_ratio", 0.01))
+                    H_max_ratio = float(getattr(args, "mi_logbeta_informative_H_max_ratio", 0.99))
+                    H_min_threshold = H_min_ratio * H_max
+                    H_max_threshold = H_max_ratio * H_max
+                    
+                    # Use sigmoid model to find corresponding beta values
+                    # H(beta) = H_max / (1 + exp(-beta/beta_transition + shift))
+                    # Solve for beta: beta = beta_transition * (shift - log(H_max/H - 1))
+                    beta_transition = 1.0
+                    shift = 3.0
+                    
+                    beta_info_min = beta_transition * (shift - math.log(H_max / H_min_threshold - 1))
+                    beta_info_max = beta_transition * (shift - math.log(H_max / H_max_threshold - 1))
+                    
+                    # Clamp beta to positive range (avoid log of negative/zero)
+                    beta_info_min = max(beta_info_min, 0.01)  # Minimum β = 0.01
+                    beta_info_max = max(beta_info_max, 0.02)  # Ensure β_max > β_min
+                    
+                    # Ensure β_max > β_min
+                    if beta_info_max <= beta_info_min:
+                        beta_info_max = beta_info_min * 2.0
+                    
+                    # Convert to log-beta
+                    ell_info_min = math.log(beta_info_min)
+                    ell_info_max = math.log(beta_info_max)
+                    
+                    # Mu: center of informative region
+                    mu_default = (ell_info_min + ell_info_max) / 2
+                    # Sigma: 1-sigma covers informative region
+                    sigma_default = (ell_info_max - ell_info_min) / 2
+                    
+                    mu = mu_default if mu_cfg is None else float(mu_cfg)
+                    sigma = sigma_default if sigma_cfg is None else float(sigma_cfg)
+                    
+                    logger.info(
+                        f"Focused log-normal auto-computed: "
+                        f"H_informative=[{H_min_threshold:.2f}, {H_max_threshold:.2f}] nats, "
+                        f"beta_informative=[{beta_info_min:.2f}, {beta_info_max:.2f}], "
+                        f"log_beta_informative=[{ell_info_min:.3f}, {ell_info_max:.3f}], "
+                        f"mu={mu:.4f}, sigma={sigma:.4f}"
+                    )
+                    return mu, sigma
+                    
+                else:
+                    # Default values if needed
+                    mu = 0.0 if mu_cfg is None else float(mu_cfg)
+                    sigma = 2.5 if sigma_cfg is None else float(sigma_cfg)
+                    return mu, sigma
+            
+            # Implement mixed sampling if eval_alpha > 0
+            if eval_alpha > 0:
+                # Number of samples from each component
+                n_uniform = int(eval_alpha * num_points)
+                n_logbeta = num_points - n_uniform
+                
+                # Generate uniform-t component
+                t_uniform = torch.linspace(
+                    0.0,
+                    1.0,
+                    steps=n_uniform,
+                    device=schedule.y0.device,
+                    dtype=schedule.y0.dtype,
+                )
+                
+                # Generate log-β component (depends on sampling strategy)
+                if sampling_strategy in ["log_normal_broad", "log_normal_focused"]:
+                    mu, sigma = compute_lognormal_params()
+                    
+                    # Sample from N(mu, sigma^2) and clip to [ell_min, ell_max]
+                    ell_samples = torch.randn(
+                        n_logbeta,
+                        device=schedule.y0.device,
+                        dtype=schedule.y0.dtype,
+                    ) * sigma + mu
+                    ell_grid_logbeta = torch.clamp(ell_samples, ell_min, ell_max)
+                else:
+                    # Uniform sampling in log-β space
+                    ell_grid_logbeta = torch.linspace(
+                        ell_min,
+                        ell_max,
+                        steps=n_logbeta,
+                        device=schedule.y0.device,
+                        dtype=schedule.y0.dtype,
+                    )
+                
+                t_logbeta, _ = schedule.t_from_ell(ell_grid_logbeta)
+                t_logbeta = t_logbeta.clamp(schedule.config.t_eps, 1.0 - schedule.config.t_eps)
+                
+                # Combine and sort
+                t_vals = torch.cat([t_uniform, t_logbeta])
+                t_vals = torch.sort(t_vals)[0]
+                
+                # Create descriptive label
+                if sampling_strategy == "log_normal_broad":
+                    strategy_suffix = "_broad"
+                elif sampling_strategy == "log_normal_focused":
+                    strategy_suffix = "_focused"
+                else:
+                    strategy_suffix = ""
+                grid_label = f"mixed_alpha{eval_alpha:.2f}{strategy_suffix}"
+                return t_vals.to(device=device, dtype=torch.float32), grid_label
+            else:
+                # Pure log-β sampling (alpha=0)
+                if sampling_strategy in ["log_normal_broad", "log_normal_focused"]:
+                    mu, sigma = compute_lognormal_params()
+                    
+                    # Sample from N(mu, sigma^2) and clip to [ell_min, ell_max]
+                    ell_samples = torch.randn(
+                        num_points,
+                        device=schedule.y0.device,
+                        dtype=schedule.y0.dtype,
+                    ) * sigma + mu
+                    ell_grid = torch.clamp(ell_samples, ell_min, ell_max)
+                    
+                    if sampling_strategy == "log_normal_focused":
+                        grid_label = "focused_logbeta"
+                    else:
+                        grid_label = "broad_logbeta"
+                else:
+                    # Uniform sampling in log-β space
+                    ell_grid = torch.linspace(
+                        ell_min,
+                        ell_max,
+                        steps=num_points,
+                        device=schedule.y0.device,
+                        dtype=schedule.y0.dtype,
+                    )
+                    grid_label = grid_type
+                
+                t_vals, _ = schedule.t_from_ell(ell_grid)
+                t_vals = t_vals.clamp(schedule.config.t_eps, 1.0 - schedule.config.t_eps)
+                t_vals = torch.sort(t_vals)[0]
+                return t_vals.to(device=device, dtype=torch.float32), grid_label
+        else:
+            logger.warning(
+                "mi_infer_grid=uniform_logbeta requested but β schedule is not ExpMonotoneRQSSchedule; falling back to uniform_t."
+            )
+
+    t_vals = torch.linspace(0.0, 1.0, steps=num_points, device=device, dtype=torch.float32)
+    return t_vals, "uniform_t"
+
+
+def _pad_samples_to_square_grid(samples: torch.Tensor) -> torch.Tensor:
+    """Pad a batch of images by repeating early samples to fill a square grid."""
+
+    if samples.ndim != 4:
+        return samples
+    batch = samples.shape[0]
+    if batch == 0:
+        return samples
+
+    grid = int(math.ceil(math.sqrt(batch)))
+    target = grid * grid
+    if target <= batch:
+        return samples
+
+    pad = target - batch
+    if pad <= 0:
+        return samples
+
+    repeat = samples[:pad]
+    if repeat.numel() == 0:
+        return samples
+
+    return torch.cat((samples, repeat), dim=0)
+
+
+def _select_metric_eval_indices(vocab_size: int, subset: int) -> torch.Tensor:
+    subset = int(subset)
+    if subset <= 0 or subset >= vocab_size:
+        return torch.arange(vocab_size, dtype=torch.long)
+    return torch.arange(subset, dtype=torch.long)
+
+
+def _upper_triangle_values(matrix: torch.Tensor) -> torch.Tensor:
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("matrix must be square")
+    n = matrix.shape[0]
+    if n <= 1:
+        return matrix.new_empty(0)
+    idx = torch.triu_indices(n, n, offset=1, device=matrix.device)
+    return matrix[idx[0], idx[1]]
+
+
+def _rankdata(values: torch.Tensor) -> torch.Tensor:
+    order = torch.argsort(values, stable=True)
+    ranks = torch.empty_like(values, dtype=torch.float64)
+    ranks[order] = torch.arange(values.numel(), dtype=torch.float64, device=values.device)
+    unique_vals, inverse, counts = torch.unique(
+        values, sorted=True, return_inverse=True, return_counts=True
+    )
+    if torch.any(counts > 1):
+        cumsum = torch.cumsum(counts, dim=0)
+        start = torch.cat((counts.new_zeros(1), cumsum[:-1]), dim=0)
+        avg = (start + cumsum - 1).to(torch.float64) / 2.0
+        ranks += avg[inverse] - ranks
+    return ranks
+
+
+def _spearman_corrcoef(x: torch.Tensor, y: torch.Tensor) -> Optional[float]:
+    if x.numel() != y.numel() or x.numel() < 2:
+        return None
+    x_rank = _rankdata(x)
+    y_rank = _rankdata(y)
+    x_rank = x_rank - x_rank.mean()
+    y_rank = y_rank - y_rank.mean()
+    x_std = x_rank.std(unbiased=False)
+    y_std = y_rank.std(unbiased=False)
+    denom = x_std * y_std
+    denom_val = float(denom.item()) if denom.numel() == 1 else float(denom)
+    if denom_val <= 0.0 or not math.isfinite(denom_val):
+        return None
+    cov = torch.mean(x_rank * y_rank)
+    cov_val = float(cov.item()) if cov.numel() == 1 else float(cov)
+    if not math.isfinite(cov_val):
+        return None
+    return cov_val / denom_val
+
+
+def _knn_indices(dist: torch.Tensor, k: int) -> Optional[torch.Tensor]:
+    if dist.ndim != 2 or dist.shape[0] != dist.shape[1]:
+        raise ValueError("dist must be square")
+    n = dist.shape[0]
+    if n <= 1 or k <= 0:
+        return None
+    k = min(k, n - 1)
+    dist_clone = dist.clone()
+    eye = torch.eye(n, dtype=torch.bool, device=dist_clone.device)
+    dist_clone[eye] = float("inf")
+    _, indices = torch.topk(dist_clone, k=k, dim=1, largest=False)
+    return indices
+
+
+def _knn_overlap(base: torch.Tensor, other: torch.Tensor, k: int) -> Optional[float]:
+    base_idx = _knn_indices(base, k)
+    other_idx = _knn_indices(other, k)
+    if base_idx is None or other_idx is None:
+        return None
+    n = base_idx.shape[0]
+    device = base_idx.device
+    mask_base = torch.zeros(n, base.shape[0], dtype=torch.bool, device=device)
+    rows = torch.arange(n, device=device).unsqueeze(1).expand_as(base_idx)
+    mask_base[rows, base_idx] = True
+    mask_other = torch.zeros_like(mask_base)
+    mask_other[rows, other_idx] = True
+    intersection = torch.logical_and(mask_base, mask_other).sum(dim=1)
+    union = torch.logical_or(mask_base, mask_other).sum(dim=1).clamp_min(1)
+    overlap = (intersection.to(torch.float64) / union.to(torch.float64)).mean()
+    return float(overlap.item())
+
+
+def _export_metric_heatmap(
+    base: torch.Tensor,
+    other: torch.Tensor,
+    *,
+    output_dir: Path,
+    epoch: int,
+    label: str,
+    log_to_wandb: bool,
+    wandb_step: int,
+) -> Optional[Path]:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - matplotlib optional
+        logger.warning(
+            "Skipping metric heatmap for %s because matplotlib is unavailable: %s",
+            label,
+            exc,
+        )
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    base_np = base.detach().cpu().numpy()
+    other_np = other.detach().cpu().numpy()
+    delta_np = other_np - base_np
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    for ax, data, title in zip(
+        axes,
+        (base_np, other_np, delta_np),
+        ("baseline", label, f"{label} - baseline"),
+    ):
+        im = ax.imshow(data, cmap="magma")
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle(f"Metric geometry ({label}) epoch {epoch}")
+    fig.tight_layout()
+
+    file_path = output_dir / f"epoch_{epoch:04d}_{label}.png"
+    fig.savefig(file_path, bbox_inches="tight")
+    plt.close(fig)
+
+    if log_to_wandb:
+        try:
+            try:
+                import swanlab as wandb  # type: ignore
+            except Exception:  # pragma: no cover - swanlab not installed
+                import wandb  # type: ignore
+
+            if hasattr(wandb, "Image"):
+                wandb.log(  # type: ignore[attr-defined]
+                    {f"eval/metric_heatmap_{label}": wandb.Image(str(file_path))},  # type: ignore[attr-defined]
+                    step=wandb_step,
+                )
+        except Exception as wandb_exc:  # pragma: no cover - wandb unavailable
+            logger.debug(
+                "Unable to log metric heatmap %s to wandb: %s", label, wandb_exc
+            )
+
+    logger.info("Saved metric heatmap (%s) to %s", label, file_path)
+    return file_path
+
+
+def _evaluate_metric_geometry(
+    path: MetricInducedGibbsProbPath,
+    *,
+    args: Namespace,
+    epoch: int,
+    metric_ema: Optional[LearnableMetricEMA],
+    output_root: Optional[Path],
+) -> Dict[str, float]:
+    stats: Dict[str, float] = {}
+    vocab_size = int(path.vocab_size)
+    subset_cfg = int(getattr(args, "mi_metric_eval_subset", 0))
+    subset_idx = _select_metric_eval_indices(vocab_size, subset_cfg)
+    subset_count = int(subset_idx.numel())
+
+    stats["metric_geom_vocab"] = float(vocab_size)
+    stats["metric_geom_tokens"] = float(subset_count)
+    lam = float(path.get_metric_interpolation_lambda())
+    stats["metric_geom_lambda"] = lam
+
+    eval_device = torch.device("cpu")
+    eval_dtype = torch.float32
+
+    base_full = path._get_base_distance_table(device=eval_device, dtype=eval_dtype)
+    base_subset = (
+        base_full.index_select(0, subset_idx)
+        .index_select(1, subset_idx)
+        .to(dtype=torch.float64)
+    )
+
+    tables: Dict[str, torch.Tensor] = {}
+    student_full = path._learned_distance_table(
+        device=eval_device, dtype=eval_dtype
+    )
+    if student_full is not None:
+        tables["student"] = (
+            student_full.index_select(0, subset_idx)
+            .index_select(1, subset_idx)
+            .to(dtype=torch.float64)
+        )
+
+    teacher_module = getattr(metric_ema, "teacher", None) if metric_ema else None
+    if isinstance(teacher_module, torch.nn.Module):
+        teacher_full = path._learned_distance_table(
+            device=eval_device,
+            dtype=eval_dtype,
+            metric_module=teacher_module,
+        )
+        if teacher_full is not None:
+            tables["teacher"] = (
+                teacher_full.index_select(0, subset_idx)
+                .index_select(1, subset_idx)
+                .to(dtype=torch.float64)
+            )
+
+    if lam > 0.0:
+        if "student" in tables:
+            if lam >= 1.0:
+                tables["blended"] = tables["student"]
+            else:
+                tables["blended"] = (
+                    (1.0 - lam) * base_subset + lam * tables["student"]
+                )
+        else:
+            tables["blended"] = base_subset
+
+    base_pairs_all = _upper_triangle_values(base_subset)
+    pair_total = int(base_pairs_all.numel())
+    stats["metric_geom_pairs_total"] = float(pair_total)
+
+    pair_sample_cfg = max(0, int(getattr(args, "mi_metric_eval_pair_samples", 0)))
+    sample_indices = None
+    if pair_total >= 2 and 0 < pair_sample_cfg < pair_total:
+        generator = torch.Generator(device=base_pairs_all.device)
+        generator.manual_seed(int(getattr(args, "mi_metric_eval_seed", 0)))
+        perm = torch.randperm(pair_total, generator=generator)
+        sample_indices = perm[:pair_sample_cfg]
+        stats["metric_geom_pairs_used"] = float(sample_indices.numel())
+    else:
+        stats["metric_geom_pairs_used"] = float(pair_total)
+
+    if pair_total < 2:
+        logger.warning(
+            "Not enough off-diagonal pairs (%d) to compute Spearman correlation.",
+            pair_total,
+        )
+    else:
+        base_pairs = (
+            base_pairs_all
+            if sample_indices is None
+            else base_pairs_all.index_select(0, sample_indices)
+        )
+        for name, table in tables.items():
+            other_pairs = _upper_triangle_values(table)
+            if sample_indices is not None:
+                other_pairs = other_pairs.index_select(0, sample_indices)
+            rho = _spearman_corrcoef(base_pairs, other_pairs)
+            if rho is not None:
+                stats[f"metric_geom_spearman_{name}"] = rho
+
+    k_cfg = max(0, int(getattr(args, "mi_metric_eval_knn_k", 5)))
+    if subset_count > 1 and k_cfg > 0:
+        k_eff = min(k_cfg, subset_count - 1)
+        stats["metric_geom_knn_k"] = float(k_eff)
+        for key in ("student", "teacher", "blended"):
+            table = tables.get(key)
+            if table is None:
+                continue
+            overlap = _knn_overlap(base_subset, table, k_eff)
+            if overlap is not None:
+                stats[f"metric_geom_knn_overlap_{key}@{k_eff}"] = overlap
+    else:
+        stats["metric_geom_knn_k"] = 0.0
+
+    if getattr(args, "mi_metric_eval_heatmap", False):
+        if output_root is None:
+            logger.warning(
+                "Skipping metric geometry heatmaps because --output_dir is not set."
+            )
+        elif subset_count < 2:
+            logger.warning(
+                "Skipping metric geometry heatmaps because the evaluated subset has < 2 tokens."
+            )
+        else:
+            heatmap_limit = int(getattr(args, "mi_metric_eval_heatmap_subset", 0))
+            heatmap_count = (
+                subset_count if heatmap_limit <= 0 else min(heatmap_limit, subset_count)
+            )
+            heatmap_dir = output_root / "metric_geometry"
+            base_heatmap = base_subset[:heatmap_count, :heatmap_count].to(torch.float32)
+            for key in ("student", "teacher"):
+                table = tables.get(key)
+                if table is None:
+                    continue
+                _export_metric_heatmap(
+                    base_heatmap,
+                    table[:heatmap_count, :heatmap_count].to(torch.float32),
+                    output_dir=heatmap_dir,
+                    epoch=epoch,
+                    label=key,
+                    log_to_wandb=bool(getattr(args, "wandb", False)),
+                    wandb_step=epoch,
+                )
+
+    metric_keys = [
+        key
+        for key in stats.keys()
+        if key.startswith("metric_geom_spearman")
+        or key.startswith("metric_geom_knn_overlap")
+    ]
+    if metric_keys:
+        summary = ", ".join(
+            f"{key}={stats[key]:.4f}" for key in sorted(metric_keys)
+        )
+        logger.info(
+            "Metric geometry diagnostics (tokens=%d, λ=%.4f): %s",
+            subset_count,
+            lam,
+            summary,
+        )
+
+    return stats
+
+
+def _run_detailed_metric_analysis(
+    path: MetricInducedGibbsProbPath,
+    *,
+    args: Namespace,
+    epoch: int,
+    metric_ema: Optional[LearnableMetricEMA],
+    output_root: Optional[Path],
+) -> Dict[str, float]:
+    """
+    Run comprehensive metric analysis including t-SNE/UMAP visualizations.
+    This provides deep insights into what the metric learned.
+    """
+    if not getattr(args, "mi_metric_detailed_analysis", False):
+        return {}
+    
+    if not distributed_mode.is_main_process():
+        return {}
+    
+    if output_root is None:
+        logger.warning("Skipping detailed metric analysis because --output_dir is not set.")
+        return {}
+    
+    learnable_metric = getattr(path, "learnable_metric", None)
+    if learnable_metric is None:
+        logger.warning("Skipping detailed metric analysis because no learnable metric found.")
+        return {}
+    
+    # Create output directory for this epoch's analysis
+    analysis_dir = output_root / "metric_analysis" / f"epoch_{epoch:04d}"
+    
+    try:
+        # Use UMAP if available, fall back to t-SNE
+        # Default: enable both if not explicitly disabled
+        use_umap = getattr(args, "mi_metric_use_umap", False)
+        use_tsne = getattr(args, "mi_metric_use_tsne", False)
+        
+        # If neither flag is set, enable both by default
+        if not use_umap and not use_tsne:
+            use_umap = True
+            use_tsne = True
+        
+        logger.info("Running detailed metric analysis (epoch %d)...", epoch)
+        
+        # Run analysis on student metric
+        device = str(learnable_metric.codes.device)
+        student_results = analyze_metric(
+            learnable_metric,
+            output_dir=str(analysis_dir / "student"),
+            device=device,
+            use_umap=use_umap,
+            use_tsne=use_tsne,
+            verbose=False,  # Don't clutter logs
+            save_plots=True,
+        )
+        
+        # Also analyze EMA teacher metric if available
+        teacher_module = getattr(metric_ema, "teacher", None) if metric_ema else None
+        if isinstance(teacher_module, torch.nn.Module):
+            logger.info("Running detailed metric analysis for EMA teacher...")
+            teacher_results = analyze_metric(
+                teacher_module,
+                output_dir=str(analysis_dir / "teacher"),
+                device=device,
+                use_umap=use_umap,
+                use_tsne=use_tsne,
+                verbose=False,
+                save_plots=True,
+            )
+            # Prefix teacher stats
+            teacher_results = {f"teacher_{k}": v for k, v in teacher_results.items()}
+            student_results.update(teacher_results)
+        
+        # Log key metrics to wandb
+        if getattr(args, "wandb", False):
+            try:
+                try:
+                    import swanlab as wandb  # type: ignore
+                except Exception:  # pragma: no cover
+                    import wandb  # type: ignore
+                
+                # Log key statistics (only numeric values, exclude complex types)
+                wandb_metrics = {}
+                for k, v in student_results.items():
+                    # Skip paths, nearest_neighbors dicts, and other complex types
+                    if k.endswith("_path") or k.endswith("neighbors") or isinstance(v, (dict, list)):
+                        continue
+                    if isinstance(v, (int, float)):
+                        wandb_metrics[f"metric_analysis/{k}"] = v
+                
+                # Log visualizations as images
+                viz_keys = [k for k in student_results.keys() if k.endswith("_path")]
+                for key in viz_keys:
+                    path_str = student_results[key]
+                    if isinstance(path_str, str) and Path(path_str).exists():
+                        img_key = key.replace("_path", "").replace("_", "/")
+                        try:
+                            wandb_metrics[f"metric_analysis/{img_key}"] = wandb.Image(path_str)  # type: ignore
+                        except Exception:
+                            # Swanlab might not support wandb.Image, skip silently
+                            pass
+                
+                if wandb_metrics:
+                    wandb.log(wandb_metrics, step=epoch)  # type: ignore
+                    
+            except Exception as wandb_exc:  # pragma: no cover
+                logger.debug("Failed to log metric analysis to wandb: %s", wandb_exc)
+        
+        logger.info(
+            "Detailed metric analysis complete: distance_std=%.4f, CV=%.4f",
+            student_results.get("distance_std", 0.0),
+            student_results.get("coefficient_of_variation", 0.0),
+        )
+        
+        return student_results
+        
+    except Exception as analysis_exc:  # pragma: no cover
+        logger.warning("Detailed metric analysis failed: %s", analysis_exc)
+        return {}
 
 
 class CFGScaledModel(ModelWrapper):
@@ -112,12 +915,41 @@ def eval_model(
     fid_samples: int,
     args: Namespace,
     metric_path: Optional[MetricInducedGibbsProbPath] = None,
+    metric_ema: Optional[LearnableMetricEMA] = None,
+    schedule_ema: Optional["BetaScheduleEMA"] = None,  # NEW: Use EMA schedule for eval
+    fid_metric: Optional[FrechetInceptionDistance] = None,
 ):
     gc.collect()
     cfg_scaled_model = CFGScaledModel(model=model)
     # For KO solver we need logits; instantiate a logits-returning view lazily
     cfg_scaled_logits_model = None
     cfg_scaled_model.train(False)
+
+    infer_time_grid: Optional[torch.Tensor] = None
+    infer_grid_label: Optional[str] = None
+    infer_grid_logged = False
+
+    def get_infer_time_grid(
+        batch_device: torch.device, path_obj: MetricInducedGibbsProbPath
+    ) -> torch.Tensor:
+        nonlocal infer_time_grid, infer_grid_label, infer_grid_logged
+        if infer_time_grid is None or infer_time_grid.device != batch_device:
+            time_grid, label = _build_metric_infer_time_grid(
+                args,
+                path_obj,
+                device=batch_device,
+            )
+            infer_time_grid = time_grid
+            infer_grid_label = label
+            infer_grid_logged = False
+        if not infer_grid_logged and infer_time_grid is not None and infer_grid_label is not None:
+            logger.info(
+                "Metric-induced inference grid '%s' using %d steps",
+                infer_grid_label,
+                max(int(infer_time_grid.numel()) - 1, 0),
+            )
+            infer_grid_logged = True
+        return infer_time_grid
 
     if args.discrete_flow_matching:
         # Branch between mixture path (Meta) and metric-induced path (KO-style)
@@ -141,12 +973,15 @@ def eval_model(
         cont_solver = ODESolver(velocity_model=cfg_scaled_model)
         cont_ode_opts = args.ode_options
 
-    fid_metric = FrechetInceptionDistance(normalize=True).to(
-        device=device, non_blocking=True
-    )
+    owns_fid_metric = fid_metric is None
+    if fid_metric is None:
+        fid_metric = FrechetInceptionDistance(normalize=True)
+    fid_metric = fid_metric.to(device=device, non_blocking=True)
 
     num_synthetic = 0
+    num_real = 0
     snapshots_saved = False
+    gif_logged = False
     if args.output_dir:
         (Path(args.output_dir) / "snapshots").mkdir(parents=True, exist_ok=True)
 
@@ -158,8 +993,130 @@ def eval_model(
 
     # Lazily constructed KO solver and path (once K is known)
     ko_solver = None
+    # Use EMA schedule for eval if available (train/eval consistency)
     ko_path = metric_path
+    ko_path_raw = None  # For comparison
+    use_ema_for_eval = schedule_ema is not None and metric_path is not None
+    compare_schedules = use_ema_for_eval and getattr(args, "mi_compare_schedule_eval", False)
+    
+    if use_ema_for_eval:
+        # Create a temporary path with EMA schedule AND EMA metric for evaluation
+        # This ensures UNet is evaluated on the same schedule/metric it was trained on
+        import copy
+        ko_path = copy.copy(metric_path)  # Shallow copy
+        # Use schedule_ema.teacher (the EMA-tracked parameters) which has full schedule interface
+        # NOT schedule_ema itself (which only wraps beta_and_derivative)
+        ko_path.beta_schedule = schedule_ema.teacher  # Replace with EMA's teacher
+        
+        # CRITICAL: Also replace metric with EMA metric (if available)
+        # This ensures train/eval consistency for the entire path
+        # User can override with --mi_eval_use_raw_metric to test raw student metric
+        use_raw_metric = getattr(args, "mi_eval_use_raw_metric", False)
+        
+        if metric_ema is not None and hasattr(metric_ema, 'teacher') and metric_ema.teacher is not None:
+            if not use_raw_metric:
+                # Default: Use EMA teacher (smooth, stable)
+                ko_path.learnable_metric = metric_ema.teacher
+                logger.info("Eval using EMA schedule + EMA metric (train/eval consistency)")
+                # Precompute learned metric distance table for eval (huge speedup!)
+                ko_path.precompute_learned_metric_table(
+                    device=device, dtype=torch.float32, metric_module=metric_ema.teacher
+                )
+            else:
+                # User requested: Use raw student metric
+                logger.info("Eval using EMA schedule + RAW student metric (--mi_eval_use_raw_metric enabled)")
+                # Precompute with raw student metric
+                if ko_path.learnable_metric is not None:
+                    ko_path.precompute_learned_metric_table(
+                        device=device, dtype=torch.float32
+                    )
+        else:
+            logger.info("Eval using EMA schedule (train/eval consistency)")
+            # Also precompute if we have a learnable metric (even without EMA)
+            if ko_path.learnable_metric is not None:
+                ko_path.precompute_learned_metric_table(
+                    device=device, dtype=torch.float32
+                )
+        
+        if compare_schedules:
+            # Keep raw path for comparison
+            ko_path_raw = metric_path
+            logger.info("Will also evaluate with raw schedule for comparison")
+    elif metric_path is not None:
+        logger.info("Eval using raw schedule (no EMA available)")
+    
     schedule_snapshot_logged = False
+    geometry_stats: Dict[str, float] = {}
+    geometry_logged = False
+    
+    # Track whether we need to clear cached resources at the end
+    need_clear_metric_cache = False
+    need_clear_lut_cache = False
+    if ko_path is not None and ko_path.learnable_metric is not None:
+        need_clear_metric_cache = True
+    if (
+        getattr(args, "mi_eval_cache_lut", False)
+        and ko_path is not None
+        and ko_path.learnable_lut is not None
+    ):
+        cache_dtype = ko_path.embedding.weight.dtype
+        ko_path.precompute_lut_distance_table(device=device, dtype=cache_dtype)
+        need_clear_lut_cache = True
+
+    diagnostics_enabled = bool(getattr(args, "diag_enable", False))
+    if diagnostics_enabled and distributed_mode.is_main_process():
+        try:
+            DiagnosticsRunner(
+                model=model,
+                device=device,
+                args=args,
+                data_loader=data_loader,
+            ).run(metric_path=ko_path)
+        except Exception as diag_exc:  # pragma: no cover - diagnostics failures should not crash eval
+            logger.warning("Diagnostics run failed: %s", diag_exc)
+    if diagnostics_enabled and distributed_mode.is_dist_avail_and_initialized():
+        dist.barrier()
+
+    def maybe_run_metric_geometry(path_obj: Optional[MetricInducedGibbsProbPath]) -> None:
+        nonlocal geometry_logged, geometry_stats
+        if geometry_logged:
+            return
+        if not getattr(args, "mi_metric_eval_geometry", False):
+            geometry_logged = True
+            return
+        if path_obj is None:
+            return
+        if not distributed_mode.is_main_process():
+            geometry_logged = True
+            return
+
+        output_root = (
+            Path(getattr(args, "output_dir"))
+            if getattr(args, "output_dir", None)
+            else None
+        )
+        try:
+            geometry_stats = _evaluate_metric_geometry(
+                path_obj,
+                args=args,
+                epoch=epoch,
+                metric_ema=metric_ema,
+                output_root=output_root,
+            )
+            
+            # Run detailed metric analysis (t-SNE/UMAP visualizations)
+            detailed_stats = _run_detailed_metric_analysis(
+                path_obj,
+                args=args,
+                epoch=epoch,
+                metric_ema=metric_ema,
+                output_root=output_root,
+            )
+            geometry_stats.update(detailed_stats)
+            
+        except Exception as geom_exc:  # pragma: no cover - diagnostic failures
+            logger.warning("Metric geometry evaluation failed: %s", geom_exc)
+        geometry_logged = True
 
     def maybe_log_schedule_snapshot(path_obj: MetricInducedGibbsProbPath) -> None:
         nonlocal schedule_snapshot_logged
@@ -292,17 +1249,39 @@ def eval_model(
 
     if ko_path is not None:
         maybe_log_schedule_snapshot(ko_path)
+        maybe_run_metric_geometry(ko_path)
 
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        fid_metric.update(samples, real=True)
 
-        if num_synthetic < fid_samples:
+        remaining_real = max(fid_samples - num_real, 0)
+        if remaining_real > 0 and samples.shape[0] > 0:
+            real_batch = samples[:remaining_real]
+            fid_metric.update(real_batch, real=True)
+            num_real += real_batch.shape[0]
+
+        remaining_fake = max(fid_samples - num_synthetic, 0)
+        if remaining_fake > 0 and samples.shape[0] > 0:
+            conditioning_samples = samples[:remaining_fake]
+            conditioning_labels = labels[:remaining_fake]
+        else:
+            conditioning_samples = samples[:0]
+            conditioning_labels = labels[:0]
+
+        if conditioning_samples.shape[0] > 0 and num_synthetic < fid_samples:
             # Reset NFE counter on the wrapper that will actually be used
             # For mixture/continuous branches we use cfg_scaled_model; for metric-induced we use cfg_scaled_logits_model
             # Note: metric-induced branch performs a dummy forward to infer K; we reset AFTER that to avoid +1 in the count
             cfg_scaled_model.reset_nfe_counter()
+            record_gif = (
+                bool(getattr(args, "save_eval_gif", False))
+                and bool(getattr(args, "output_dir", None))
+                and not gif_logged
+                and distributed_mode.is_main_process()
+            )
+            gif_trajectories: Optional[torch.Tensor] = None
+
             if args.discrete_flow_matching:
                 # Discrete sampling
                 if args.sym_func:
@@ -313,6 +1292,7 @@ def eval_model(
                     sym: Union[float, Callable[[float], float]] = sym_schedule
                 else:
                     sym: Union[float, Callable[[float], float]] = float(args.sym)
+
                 if getattr(args, "metric_induced", False):
                     # Metric-induced Gibbs path using dedicated KO solver
                     # Lazily build logits-wrapper and KO solver with correct vocab size K
@@ -320,13 +1300,15 @@ def eval_model(
                         cfg_scaled_logits_model = CFGScaledModel(model=model, return_logits=True)
                     if ko_solver is None or ko_path is None:
                         # infer K by one forward pass at t=0
-                        x_dummy = torch.zeros(samples.shape, dtype=torch.long, device=device)
+                        x_dummy = torch.zeros(
+                            conditioning_samples.shape, dtype=torch.long, device=device
+                        )
                         # IMPORTANT: do not apply CFG scaling with discrete logits
                         logits_dummy = cfg_scaled_logits_model(
                             x=x_dummy,
                             t=torch.tensor(0.0, device=device),
                             cfg_scale=0.0,
-                            label=labels,
+                            label=conditioning_labels,
                         )
                         K = int(logits_dummy.shape[-1])
                         # Build path
@@ -355,48 +1337,74 @@ def eval_model(
                                 dtype=torch.float32,
                             )
                         maybe_log_schedule_snapshot(ko_path)
+                        maybe_run_metric_geometry(ko_path)
                         ko_solver = KODiscreteGibbsEulerSolver(
                             model=cfg_scaled_logits_model,
                             path=ko_path,
                             vocabulary_size=K,
                         )
                     # Reset NFE counter on the logits wrapper before stepping to avoid counting the dummy forward
-                    cfg_scaled_logits_model.reset_nfe_counter()
+                    if cfg_scaled_logits_model is not None:
+                        cfg_scaled_logits_model.reset_nfe_counter()
                     # Start tokens: uniform over [0, K) since β(0)=0 ⇒ p0 is uniform
                     K_init = ko_solver.vocabulary_size
-                    x_0 = torch.randint(0, K_init, samples.shape, device=device, dtype=torch.long)
+                    x_0 = torch.randint(
+                        0,
+                        K_init,
+                        conditioning_samples.shape,
+                        device=device,
+                        dtype=torch.long,
+                    )
                     dtype_cat = torch.float32 if args.sampling_dtype == "float32" else torch.float64
-                    synthetic_samples = ko_solver.sample(
+                    time_grid = get_infer_time_grid(conditioning_samples.device, ko_solver.path)
+                    sample_result = ko_solver.sample(
                         x_init=x_0,
-                        step_size=1.0 / args.discrete_fm_steps,
+                        step_size=None,
                         dtype_categorical=dtype_cat,
-                        label=labels,
+                        time_grid=time_grid,
+                        label=conditioning_labels,
                         # IMPORTANT: disable CFG scaling when using discrete logits
                         cfg_scale=0.0,
                         symmetrize=sym,
+                        return_intermediates=record_gif,
                     )
+                    if record_gif:
+                        gif_trajectories = sample_result
+                        synthetic_samples = sample_result[-1]
+                    else:
+                        synthetic_samples = sample_result
                 else:
                     x_0 = (
-                        torch.zeros(samples.shape, dtype=torch.long, device=device)
+                        torch.zeros(
+                            conditioning_samples.shape, dtype=torch.long, device=device
+                        )
                         + MASK_TOKEN
                     )
                     dtype = torch.float32 if args.sampling_dtype == "float32" else torch.float64
 
                     # Guard against missing solver (should never be None in this branch)
                     assert disc_solver is not None, "Discrete solver not initialized"
-                    synthetic_samples = disc_solver.sample(
+                    sample_result = disc_solver.sample(
                         x_init=x_0,
                         step_size=1.0 / args.discrete_fm_steps,
                         verbose=False,
                         div_free=sym,
                         dtype_categorical=dtype,
-                        label=labels,
+                        label=conditioning_labels,
                         # Disable CFG scaling for discrete models (logits)
                         cfg_scale=0.0,
+                        return_intermediates=record_gif,
                     )
+                    if record_gif:
+                        gif_trajectories = sample_result
+                        synthetic_samples = sample_result[-1]
+                    else:
+                        synthetic_samples = sample_result
             else:
                 # Continuous sampling
-                x_0 = torch.randn(samples.shape, dtype=torch.float32, device=device)
+                x_0 = torch.randn(
+                    conditioning_samples.shape, dtype=torch.float32, device=device
+                )
 
                 # Safe defaults for ODE options
                 nfe_default = 50
@@ -421,22 +1429,26 @@ def eval_model(
 
                 # Guard against missing solver
                 assert cont_solver is not None, "Continuous solver not initialized"
-                synthetic_samples = cont_solver.sample(
+                sample_result = cont_solver.sample(
                     time_grid=time_grid,
                     x_init=x_0,
                     method=args.ode_method,
-                    return_intermediates=False,
+                    return_intermediates=record_gif,
                     atol=ode_atol,
                     rtol=ode_rtol,
                     step_size=ode_step,
-                    label=labels,
+                    label=conditioning_labels,
                     cfg_scale=args.cfg_scale,
                 )
 
                 # Scaling to [0, 1] from [-1, 1]
-                if isinstance(synthetic_samples, (list, tuple)):
-                    synthetic_samples = synthetic_samples[-1]
+                if isinstance(sample_result, (list, tuple)):
+                    synthetic_samples = sample_result[-1]
+                else:
+                    synthetic_samples = sample_result
                 synthetic_samples = cast(torch.Tensor, synthetic_samples)
+                if record_gif and isinstance(sample_result, torch.Tensor):
+                    gif_trajectories = sample_result
                 synthetic_samples = torch.clamp(
                     synthetic_samples * 0.5 + 0.5, min=0.0, max=1.0
                 )
@@ -446,16 +1458,20 @@ def eval_model(
             _nfe_model = (
                 cfg_scaled_logits_model if getattr(args, "metric_induced", False) and 'cfg_scaled_logits_model' in locals() and cfg_scaled_logits_model is not None else cfg_scaled_model
             )
+            batch_generated = synthetic_samples.shape[0]
             logger.info(
-                f"{samples.shape[0]} samples generated in {_nfe_model.get_nfe()} evaluations."
+                f"{batch_generated} samples generated in {_nfe_model.get_nfe()} evaluations."
             )
             if num_synthetic + synthetic_samples.shape[0] > fid_samples:
                 synthetic_samples = synthetic_samples[: fid_samples - num_synthetic]
             fid_metric.update(synthetic_samples, real=False)
-            num_synthetic += synthetic_samples.shape[0]
+            num_synthetic = min(num_synthetic + synthetic_samples.shape[0], fid_samples)
             if not snapshots_saved and args.output_dir:
+                snapshot_batch = synthetic_samples
+                if snapshot_batch.ndim == 4:
+                    snapshot_batch = _pad_samples_to_square_grid(snapshot_batch)
                 save_image(
-                    synthetic_samples,
+                    snapshot_batch,
                     fp=Path(args.output_dir)
                     / "snapshots"
                     / f"{epoch}_{data_iter_step}.png",
@@ -480,6 +1496,30 @@ def eval_model(
                     )
                     PIL.Image.fromarray(image_np, "RGB").save(image_path)
 
+            if (
+                gif_trajectories is not None
+                and getattr(args, "output_dir", None)
+                and not gif_logged
+                and distributed_mode.is_main_process()
+            ):
+                try:
+                    _save_sampling_gif(
+                        gif_trajectories,
+                        Path(args.output_dir),
+                        epoch,
+                        data_iter_step,
+                        is_discrete=args.discrete_flow_matching,
+                        max_batch=getattr(args, "eval_gif_max_batch", 8),
+                        stride=getattr(args, "eval_gif_stride", 16),
+                        fps=getattr(args, "eval_gif_fps", 8),
+                        log_to_wandb=getattr(args, "wandb", False),
+                        wandb_step=epoch,
+                    )
+                except Exception as gif_exc:  # pragma: no cover - PIL/image errors
+                    logger.warning("Failed to save evaluation GIF: %s", gif_exc)
+                finally:
+                    gif_logged = True
+
         if not args.compute_fid:
             return {}
 
@@ -487,15 +1527,61 @@ def eval_model(
             # Sync fid metric to ensure that the processes dont deviate much.
             gc.collect()
             running_fid = fid_metric.compute()
+            if distributed_mode.is_dist_avail_and_initialized():
+                counts = torch.tensor(
+                    [num_real, num_synthetic],
+                    dtype=torch.float64,
+                    device=device,
+                )
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+                total_real = float(counts[0].item())
+                total_fake = float(counts[1].item())
+                target_total = float(
+                    getattr(
+                        args,
+                        "fid_samples",
+                        fid_samples * distributed_mode.get_world_size(),
+                    )
+                )
+            else:
+                total_real = float(num_real)
+                total_fake = float(num_synthetic)
+                target_total = float(fid_samples)
+            target_total = max(target_total, 1.0)
             if _data_loader_len_for_log is not None:
                 _len_str = str(_data_loader_len_for_log)
             else:
                 _len_str = "?"
             logger.info(
-                f"Evaluating [{data_iter_step}/{_len_str}] samples generated [{num_synthetic}/{fid_samples}] running fid {running_fid}"
+                "Evaluating ["
+                f"{data_iter_step}/{_len_str}] samples generated [{total_fake:.0f}/{target_total}] "
+                f"reals [{total_real:.0f}/{target_total}] running fid {running_fid}"
             )
 
         if args.test_run:
             break
 
-    return {"fid": float(fid_metric.compute().detach().cpu())}
+        if num_real >= fid_samples and num_synthetic >= fid_samples:
+            break
+
+    fid_value = float(fid_metric.compute().detach().cpu())
+    stats = {"fid": fid_value}
+    stats.update(geometry_stats)
+    if owns_fid_metric:
+        try:
+            fid_metric.reset()
+        except Exception:
+            pass
+        del fid_metric
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Clear learned metric cache if we used it
+    if ko_path is not None:
+        if need_clear_metric_cache:
+            ko_path.clear_learned_metric_cache()
+        if need_clear_lut_cache:
+            ko_path.clear_lut_cache()
+    
+    return stats

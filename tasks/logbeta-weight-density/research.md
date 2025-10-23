@@ -1,0 +1,3 @@
+- Checked `ExpMonotoneRQSSchedule.sample_t_uniform_logbeta` implementation; currently returns Jacobian `t(1-t)/(a*r'(s))` without log-β interval factor.
+- Reviewed tests in `tests/path/test_path.py`; they assert the weight equals `beta/d_beta`, consistent with missing interval scaling.
+- Training loop uses `_importance_weighted_mean` directly with helper outputs.

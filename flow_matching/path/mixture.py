@@ -4,13 +4,18 @@
 # This source code is licensed under the CC-by-NC license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import math
+from typing import Iterable, Optional, Union
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from typing import Iterable, Optional, Union
 
 from torch import Tensor
+
+logger = logging.getLogger(__name__)
 
 
 def _inv_softplus_tensor(x: Tensor) -> Tensor:
@@ -19,8 +24,643 @@ def _inv_softplus_tensor(x: Tensor) -> Tensor:
     return torch.log(torch.expm1(x))
 
 
+def _linear_lut_baseline(
+    *,
+    num_channels: int,
+    vocab_size: int,
+    emb_dim: int,
+    embed_range: str,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> Tensor:
+    """Deterministic linear baseline used by learnable LUTs."""
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    linspace_kwargs = {"dtype": dtype}
+    if device is not None:
+        linspace_kwargs["device"] = device
+    if embed_range == "pm1":
+        values = torch.linspace(-1.0, 1.0, steps=vocab_size, **linspace_kwargs)
+    else:
+        values = torch.linspace(0.0, 1.0, steps=vocab_size, **linspace_kwargs)
+    base = torch.zeros(
+        num_channels,
+        vocab_size,
+        emb_dim,
+        dtype=dtype,
+        device=device,
+    )
+    base_pattern = values.unsqueeze(0).expand(num_channels, -1)  # [C, V]
+    base[:] = base_pattern.unsqueeze(-1)
+    return base
+
+
+class LearnableScalarLUT(nn.Module):
+    """Per-channel learnable embedding lookup table.
+
+    This module stores C independent embedding lookup tables, each with vocab_size
+    entries of dimension emb_dim. It is designed for the metric-induced probability
+    path where the distance is defined by Lp norm between embeddings.
+    
+    Shape: weight [num_channels, vocab_size, emb_dim]
+    - When emb_dim=1: behaves as scalar LUT (backward compatible)
+    - When emb_dim>1: uses vector embeddings with Lp distance
+    """
+
+    def __init__(
+        self,
+        *,
+        num_channels: int,
+        vocab_size: int,
+        emb_dim: int = 1,
+        embed_range: str,
+        device: Optional[torch.device],
+        dtype: torch.dtype,
+        lp_order: float = 1.0,
+        renormalize_to_init_norm: bool = False,
+        renorm_eps: float = 1e-12,
+        bounded_residual_scale: bool = False,
+        scale_baseline: float = 1.0,
+        scale_epsilon: float = 0.25,
+        init_method: str = "linear",
+        init_noise_scale: float = 0.01,
+    ) -> None:
+        super().__init__()
+        if num_channels <= 0:
+          raise ValueError("num_channels must be positive")
+        if vocab_size <= 0:
+          raise ValueError("vocab_size must be positive")
+        if emb_dim <= 0:
+          raise ValueError("emb_dim must be positive")
+        if embed_range not in {"pm1", "unit"}:
+          raise ValueError("embed_range must be 'pm1' or 'unit'")
+
+        self.num_channels = int(num_channels)
+        self.vocab_size = int(vocab_size)
+        self.emb_dim = int(emb_dim)
+        self.embed_range = embed_range
+        self.lp_order = float(lp_order)
+
+        # Set initialization parameters before calling _init_weight
+        self.init_method = str(init_method)
+        self.init_noise_scale = float(init_noise_scale)
+        if self.init_method == "small_noise_qr" and self.emb_dim > self.vocab_size:
+            raise ValueError(
+                "small_noise_qr initialization requires emb_dim <= vocab_size "
+                f"(got emb_dim={self.emb_dim}, vocab_size={self.vocab_size})"
+            )
+
+        weight = self._init_weight()
+        if device is not None:
+            weight = weight.to(device=device)
+        weight = weight.to(dtype=dtype)
+        self.weight = nn.Parameter(weight)
+        
+        # Compute base norm (without noise) PER CHANNEL for renormalization target
+        # Shape: [num_channels] - each channel has its own target norm
+        base_weight = self._linear_init_base()
+        if device is not None:
+            base_weight = base_weight.to(device=device)
+        base_weight = base_weight.to(dtype=dtype)
+        # Compute norm per channel: norm over dims (vocab_size, emb_dim)
+        base_norm_per_channel = torch.linalg.vector_norm(base_weight, dim=(1, 2))  # [num_channels]
+        self.register_buffer("_base_fro_norm_per_channel", base_norm_per_channel, persistent=False)
+        
+        self.renormalize_to_init_norm = bool(renormalize_to_init_norm)
+        self.renorm_eps = float(renorm_eps)
+        
+        # Bounded residual scale parameterization
+        self.bounded_residual_scale = bool(bounded_residual_scale)
+        self.scale_baseline = float(scale_baseline)  # s_0
+        self.scale_epsilon = float(scale_epsilon)    # ε
+        
+        if self.bounded_residual_scale:
+            # Learnable scale parameter c per channel: [num_channels]
+            # Initialized to 0 (tanh(0) = 0, so s = s_0 initially)
+            self.scale_c = nn.Parameter(torch.zeros(num_channels, dtype=dtype))
+        else:
+            self.scale_c = None
+
+    def _init_weight(self) -> Tensor:
+        """Initialize LUT weights using the selected initialization method."""
+        if self.init_method == "linear":
+            return self._linear_init()
+        elif self.init_method == "small_noise_qr":
+            return self._small_noise_qr_init()
+        else:
+            raise ValueError(f"Unknown init_method: {self.init_method}")
+
+    def _linear_init(self) -> Tensor:
+        """Initialize LUT with linearly spaced values along each dimension.
+
+        Returns:
+            Tensor of shape [num_channels, vocab_size, emb_dim]
+        """
+        weight = _linear_lut_baseline(
+            num_channels=self.num_channels,
+            vocab_size=self.vocab_size,
+            emb_dim=self.emb_dim,
+            embed_range=self.embed_range,
+        )
+        noise = torch.randn_like(weight) * 1e-3
+        return weight + noise
+
+    def _linear_init_base(self) -> Tensor:
+        """Baseline (noise-free) linear LUT initialization."""
+        return _linear_lut_baseline(
+            num_channels=self.num_channels,
+            vocab_size=self.vocab_size,
+            emb_dim=self.emb_dim,
+            embed_range=self.embed_range,
+        )
+
+    def _small_noise_qr_init(self) -> Tensor:
+        """Initialize LUT with small noise QR decomposition for orthogonal warm start.
+        
+        This method provides an orthogonal initialization that balances:
+        - Orthogonality: QR decomposition ensures dimension-wise independence
+        - Warm start: Small noise prevents exact orthogonality for gradient flow
+        - Stability: Maintains consistent norms across channels and dimensions
+        
+        Returns:
+            Tensor of shape [num_channels, vocab_size, emb_dim]
+        """
+        # Step 1: Compute baseline unit vector (linear spacing normalized)
+        if self.embed_range == "pm1":
+            base_values = torch.linspace(-1.0, 1.0, steps=self.vocab_size)
+        else:
+            base_values = torch.linspace(0.0, 1.0, steps=self.vocab_size)
+        
+        # Normalize to unit vector for each dimension
+        base_unit = base_values / torch.linalg.vector_norm(base_values, ord=2)
+        
+        # Step 2: Build matrix A with small noise for QR decomposition
+        # A will be [vocab_size, emb_dim] - we want orthogonal columns
+        A = torch.zeros(self.vocab_size, self.emb_dim)
+        
+        # First column: baseline unit vector
+        A[:, 0] = base_unit
+        
+        # Remaining columns: add small noise to break symmetry
+        if self.emb_dim > 1:
+            # Generate small orthogonal noise
+            noise_scale = self.init_noise_scale
+            for d in range(1, self.emb_dim):
+                # Start with small random perturbation of the baseline
+                noise = torch.randn(self.vocab_size) * noise_scale
+                A[:, d] = base_unit + noise
+        
+        # Step 3: Apply QR decomposition for orthogonality
+        Q, _ = torch.linalg.qr(A)
+        
+        # Step 4: Scale to target norm (same as linear init for consistency)
+        # Target norm should match the linear initialization norm
+        target_norm = torch.linalg.vector_norm(base_values, ord=2)
+        current_norm = torch.linalg.vector_norm(Q, dim=0)  # norm per column
+        scale_factors = target_norm / (current_norm + 1e-8)
+        Q_scaled = Q * scale_factors.unsqueeze(0)  # broadcast to [vocab_size, emb_dim]
+        
+        # Step 5: Replicate across channels (with small channel-wise noise)
+        weight = torch.zeros(self.num_channels, self.vocab_size, self.emb_dim)
+        for c in range(self.num_channels):
+            if c == 0:
+                # First channel: use the QR result directly
+                weight[c] = Q_scaled
+            else:
+                # Other channels: add small channel-specific noise
+                channel_noise = torch.randn_like(Q_scaled) * (noise_scale * 0.1)
+                weight[c] = Q_scaled + channel_noise
+        
+        return weight
+
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        init_weight = self._init_weight().to(device=self.weight.device, dtype=self.weight.dtype)
+        self.weight.copy_(init_weight)
+        
+        # Recompute base norm per channel (without noise)
+        base_weight = self._linear_init_base().to(device=self.weight.device, dtype=self.weight.dtype)
+        base_norm_per_channel = torch.linalg.vector_norm(base_weight, dim=(1, 2))  # [num_channels]
+        self._base_fro_norm_per_channel.copy_(base_norm_per_channel)
+        
+        # Reset scale parameter c to 0 if using bounded residual
+        if self.bounded_residual_scale and self.scale_c is not None:
+            self.scale_c.zero_()
+
+    def forward(self) -> Tensor:
+        """Return LUT weights, optionally renormalized to base norm PER CHANNEL.
+        
+        When renormalize_to_init_norm=True:
+            - Renormalizes EACH channel independently to match its base (no-noise) norm
+            - Each channel maintains its own geometry (single-channel norm ≈ 9.27)
+            - Preserves gradients (scaling is differentiable)
+            - Keeps noise injection benefits while maintaining consistent geometry
+        
+        When bounded_residual_scale=True:
+            - Uses bounded residual parameterization: s = s_0 * (1 + ε * tanh(c))
+            - c is learnable per channel, L2 penalty keeps it near 0
+            - s_0 is baseline scale, ε controls maximum deviation
+            - Trust region approach prevents extreme scale changes
+        
+        Returns:
+            Tensor of shape [num_channels, vocab_size, emb_dim]
+        """
+        if self.bounded_residual_scale and self.scale_c is not None:
+            # Bounded residual scale: s = s_0 * (1 + ε * tanh(c))
+            # c is per-channel learnable parameter initialized to 0
+            scale = self.scale_baseline * (1.0 + self.scale_epsilon * torch.tanh(self.scale_c))
+            # Apply per-channel scaling: scale.view(C, 1, 1) * weight[C, V, D]
+            return self.weight * scale.view(-1, 1, 1)
+        
+        if not self.renormalize_to_init_norm:
+            return self.weight
+        
+        # Renormalize each channel independently to its base norm
+        # target: [num_channels] - target norm for each channel
+        # current: [num_channels] - current norm for each channel
+        target = self._base_fro_norm_per_channel.to(device=self.weight.device, dtype=self.weight.dtype)
+        current = torch.linalg.vector_norm(self.weight, dim=(1, 2))  # [num_channels]
+        scale = target / (current + self.renorm_eps)  # [num_channels]
+        
+        # Apply per-channel scaling: scale.view(C, 1, 1) * weight[C, V, D]
+        # Broadcasting: [C, 1, 1] * [C, V, D] -> [C, V, D]
+        return self.weight * scale.view(-1, 1, 1)
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_channels={self.num_channels}, vocab_size={self.vocab_size}, "
+            f"emb_dim={self.emb_dim}, embed_range='{self.embed_range}', "
+            f"lp_order={self.lp_order}, bounded_residual_scale={self.bounded_residual_scale}, "
+            f"init_method='{self.init_method}', init_noise_scale={self.init_noise_scale}"
+        )
+
+
+def _pava_1d(values: Tensor) -> Tensor:
+    """Pool Adjacent Violators Algorithm for 1D isotonic regression."""
+    v = values.detach().cpu().double().numpy()
+    n = v.shape[0]
+    y = v.copy()
+    w = np.ones(n, dtype=np.double)
+    i = 0
+    while i < n - 1:
+        if y[i] > y[i + 1]:
+            s = y[i] * w[i] + y[i + 1] * w[i + 1]
+            w_new = w[i] + w[i + 1]
+            y[i] = y[i + 1] = s / w_new
+            w[i] = w[i + 1] = w_new
+            j = i
+            while j > 0 and y[j - 1] > y[j]:
+                s = y[j - 1] * w[j - 1] + y[j] * w[j]
+                w_new = w[j - 1] + w[j]
+                y[j - 1] = y[j] = s / w_new
+                w[j - 1] = w[j] = w_new
+                j -= 1
+            i = j
+        else:
+            i += 1
+    return torch.from_numpy(y).to(values)
+
+
+def _pava_projection(values: Tensor) -> Tensor:
+    """Apply PAVA independently along the last dimension."""
+    if values.dim() == 1:
+        return _pava_1d(values)
+    out = torch.empty_like(values)
+    for idx in range(values.shape[0]):
+        out[idx] = _pava_1d(values[idx])
+    return out
+
+
+class _Line2DLUTParam(nn.Module):
+    """1D monotone curve embedded along a single direction."""
+
+    def __init__(
+        self,
+        *,
+        num_channels: int,
+        vocab_size: int,
+        embed_dim: int,
+        monotone_mode: str = "softplus",
+        min_step: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        if vocab_size < 2:
+            raise ValueError("vocab_size must be >= 2 for line2d parameterization")
+        if monotone_mode != "softplus":
+            raise ValueError(f"Unsupported monotone_mode '{monotone_mode}' for line2d")
+        self.num_channels = num_channels
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.monotone_mode = monotone_mode
+        self.min_step = float(min_step)
+
+        direction_init = torch.randn(num_channels, embed_dim)
+        delta_init = torch.full((num_channels, vocab_size - 1), 0.01)
+        start_init = torch.zeros(num_channels)
+
+        self.direction_raw = nn.Parameter(direction_init)
+        self.delta_raw = nn.Parameter(_inv_softplus_tensor(delta_init))
+        self.start = nn.Parameter(start_init)
+
+    def forward(self) -> Tensor:
+        direction = self._normalized_direction()  # [C, D]
+        delta = F.softplus(self.delta_raw) + self.min_step  # [C, V-1]
+        cumulative = torch.cumsum(delta, dim=-1)
+        tail = self.start.unsqueeze(-1) + cumulative
+        tau = torch.cat([self.start.unsqueeze(-1), tail], dim=-1)  # [C, V]
+        emb = direction.unsqueeze(1) * tau.unsqueeze(-1)  # [C, V, D]
+        return emb
+
+    def _normalized_direction(self) -> Tensor:
+        direction = self.direction_raw
+        return direction / (direction.norm(dim=-1, keepdim=True) + 1e-12)
+
+    @torch.no_grad()
+    def initialize_from_weight(self, weight: Tensor) -> None:
+        """Warm start from an existing [C,V,D] weight tensor."""
+        C, V, D = weight.shape
+        assert C == self.num_channels and V == self.vocab_size and D == self.embed_dim
+        device = weight.device
+        for c in range(C):
+            W = weight[c]  # [V, D]
+            try:
+                _, _, vh = torch.linalg.svd(W, full_matrices=False)
+                basis = vh[0]
+            except RuntimeError:
+                basis = W.mean(dim=0)
+            if basis.norm() < 1e-8:
+                basis = torch.zeros_like(basis)
+                basis[0] = 1.0
+            basis = basis / (basis.norm() + 1e-12)
+            coords = W @ basis  # [V]
+            tokens = torch.arange(V, device=device, dtype=coords.dtype)
+            centered_tokens = tokens - tokens.mean()
+            centered_coords = coords - coords.mean()
+            cov = (centered_tokens * centered_coords).mean()
+            if cov < 0:
+                coords = -coords
+                basis = -basis
+            coords = _pava_projection(coords)
+            delta = coords[1:] - coords[:-1]
+            delta = torch.clamp(delta, min=self.min_step + 1e-6)
+            start_val = coords[0]
+            self.direction_raw.data[c] = basis
+            self.start.data[c] = start_val
+            target = delta - self.min_step
+            target = torch.clamp(target, min=1e-6)
+            self.delta_raw.data[c] = _inv_softplus_tensor(target)
+
+
+class _Arc2DLUTParam(nn.Module):
+    """Monotone arc parameterization on a great/small circle."""
+
+    def __init__(
+        self,
+        *,
+        num_channels: int,
+        vocab_size: int,
+        embed_dim: int,
+        monotone_mode: str = "softplus",
+        radius: float = 1.0,
+        min_step: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        if embed_dim < 2:
+            raise ValueError("arc2d parameterization requires embed_dim >= 2")
+        if vocab_size < 2:
+            raise ValueError("vocab_size must be >=2")
+        if monotone_mode != "softplus":
+            raise ValueError(f"Unsupported monotone_mode '{monotone_mode}' for arc2d")
+        self.num_channels = num_channels
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.min_step = float(min_step)
+        self.radius = nn.Parameter(torch.full((num_channels,), float(radius)))
+
+        basis_init = torch.randn(num_channels, embed_dim, 2)
+        delta_init = torch.full((num_channels, vocab_size - 1), 0.01)
+        theta_start = torch.zeros(num_channels)
+        self.basis_raw = nn.Parameter(basis_init)
+        self.delta_raw = nn.Parameter(_inv_softplus_tensor(delta_init))
+        self.theta_start = nn.Parameter(theta_start)
+
+    def forward(self) -> Tensor:
+        basis = self._orthonormal_basis()  # [C, D, 2]
+        delta = F.softplus(self.delta_raw) + self.min_step  # [C, V-1]
+        theta = self.theta_start.unsqueeze(-1) + torch.cumsum(delta, dim=-1)
+        theta = torch.cat(
+            [self.theta_start.unsqueeze(-1), theta], dim=-1
+        )  # prepend start
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+        coords = torch.stack([cos_t, sin_t], dim=-1)  # [C, V, 2]
+        coords = coords * self.radius.view(self.num_channels, 1, 1)
+        emb = torch.einsum("cdk,cvk->cvd", basis, coords)
+        return emb
+
+    def _orthonormal_basis(self) -> Tensor:
+        q, _ = torch.linalg.qr(self.basis_raw, mode="reduced")
+        return q
+
+    @torch.no_grad()
+    def initialize_from_weight(self, weight: Tensor) -> None:
+        C, V, D = weight.shape
+        assert C == self.num_channels and V == self.vocab_size and D == self.embed_dim
+        device = weight.device
+        for c in range(C):
+            W = weight[c]  # [V, D]
+            try:
+                _, _, vh = torch.linalg.svd(W, full_matrices=False)
+                basis = vh[:2].T  # [D,2]
+            except RuntimeError:
+                basis = torch.zeros(D, 2, device=device, dtype=W.dtype)
+                basis[:, 0] = torch.randn(D, device=device, dtype=W.dtype)
+                basis[:, 0] = basis[:, 0] / (basis[:, 0].norm() + 1e-12)
+                basis[:, 1] = torch.randn(D, device=device, dtype=W.dtype)
+                basis[:, 1] -= basis[:, 0] * (basis[:, 1] * basis[:, 0]).sum()
+                basis[:, 1] = basis[:, 1] / (basis[:, 1].norm() + 1e-12)
+            coords = W @ basis  # [V,2]
+            radius_vals = torch.linalg.vector_norm(coords, dim=-1)
+            r = radius_vals.median()
+            radius_vals = torch.clamp(radius_vals, min=1e-6)
+            unit = coords / radius_vals.unsqueeze(-1)
+            theta = torch.atan2(unit[:, 1], unit[:, 0])
+            theta_np = theta.detach().cpu().numpy()
+            theta_np = np.unwrap(theta_np)
+            theta_tensor = torch.from_numpy(theta_np).to(device=device, dtype=W.dtype)
+            tokens = torch.arange(V, device=device, dtype=W.dtype)
+            centered_tokens = tokens - tokens.mean()
+            centered_theta = theta_tensor - theta_tensor.mean()
+            cov = (centered_tokens * centered_theta).mean()
+            if cov < 0:
+                theta_tensor = -theta_tensor
+                basis[:, 0] = -basis[:, 0]
+            theta_tensor = _pava_projection(theta_tensor)
+            delta = theta_tensor[1:] - theta_tensor[:-1]
+            delta = torch.clamp(delta, min=self.min_step + 1e-6)
+            target = delta - self.min_step
+            target = torch.clamp(target, min=1e-6)
+            self.basis_raw.data[c] = basis
+            self.radius.data[c] = r
+            self.theta_start.data[c] = theta_tensor[0]
+            self.delta_raw.data[c] = _inv_softplus_tensor(target)
+
+
+class LearnableParametricLUT(nn.Module):
+    """Parametric LUT with geometric constraints (line/arc)."""
+
+    def __init__(
+        self,
+        *,
+        num_channels: int,
+        vocab_size: int,
+        embed_dim: int,
+        param_mode: str = "line2d",
+        monotone_mode: str = "softplus",
+        embed_range: str = "pm1",
+        device: Optional[torch.device],
+        dtype: torch.dtype,
+        arc_radius: float = 1.0,
+        renormalize_to_init_norm: bool = False,
+        renorm_eps: float = 1e-12,
+        bounded_residual_scale: bool = False,
+        scale_baseline: float = 1.0,
+        scale_epsilon: float = 0.25,
+    ) -> None:
+        super().__init__()
+        if embed_range not in {"pm1", "unit"}:
+            raise ValueError("embed_range must be 'pm1' or 'unit'")
+        self.param_mode = param_mode
+        self.embed_range = embed_range
+        self.num_channels = int(num_channels)
+        self.vocab_size = int(vocab_size)
+        self.emb_dim = int(embed_dim)
+        self.renormalize_to_init_norm = bool(renormalize_to_init_norm)
+        self.renorm_eps = float(renorm_eps)
+        self.bounded_residual_scale = bool(bounded_residual_scale)
+        self.scale_baseline = float(scale_baseline)
+        self.scale_epsilon = float(scale_epsilon)
+
+        if param_mode == "line2d":
+            self.param = _Line2DLUTParam(
+                num_channels=num_channels,
+                vocab_size=vocab_size,
+                embed_dim=embed_dim,
+                monotone_mode=monotone_mode,
+            )
+        elif param_mode == "arc2d":
+            self.param = _Arc2DLUTParam(
+                num_channels=num_channels,
+                vocab_size=vocab_size,
+                embed_dim=embed_dim,
+                monotone_mode=monotone_mode,
+                radius=arc_radius,
+            )
+        else:
+            raise ValueError(f"Unknown param_mode '{param_mode}'")
+
+        baseline_dtype = torch.get_default_dtype()
+        base_weight = (
+            self._default_arc_baseline(
+                num_channels,
+                vocab_size,
+                embed_dim,
+                dtype=baseline_dtype,
+                device=None,
+                radius=arc_radius,
+            )
+            if self.param_mode == "arc2d"
+            else self._default_baseline(
+                num_channels,
+                vocab_size,
+                embed_dim,
+                embed_range,
+                dtype=baseline_dtype,
+                device=None,
+            )
+        )
+        self.initialize_from_weight(base_weight)
+        base_norm = torch.linalg.vector_norm(base_weight, dim=(1, 2))
+        self.register_buffer("_base_fro_norm_per_channel", base_norm, persistent=False)
+
+        if self.bounded_residual_scale:
+            self.scale_c = nn.Parameter(torch.zeros(self.num_channels))
+        else:
+            self.scale_c = None
+
+        if device is not None or dtype is not None:
+            self.to(device=device, dtype=dtype)
+
+    def forward(self) -> Tensor:
+        weight = self.param()
+        if self.bounded_residual_scale and self.scale_c is not None:
+            scale = self.scale_baseline * (1.0 + self.scale_epsilon * torch.tanh(self.scale_c))
+            weight = weight * scale.view(-1, 1, 1)
+        if not self.renormalize_to_init_norm:
+            return weight
+        target = self._base_fro_norm_per_channel.to(device=weight.device, dtype=weight.dtype)
+        current = torch.linalg.vector_norm(weight, dim=(1, 2))
+        scale = target / (current + self.renorm_eps)
+        return weight * scale.view(-1, 1, 1)
+
+    def initialize_from_weight(self, weight: Tensor) -> None:
+        self.param.initialize_from_weight(weight)
+
+    @property
+    def weight(self) -> Tensor:
+        return self.forward()
+
+    @staticmethod
+    def _default_baseline(
+        num_channels: int,
+        vocab_size: int,
+        embed_dim: int,
+        embed_range: str,
+        *,
+        dtype: torch.dtype,
+        device: Optional[torch.device],
+    ) -> Tensor:
+        return _linear_lut_baseline(
+            num_channels=num_channels,
+            vocab_size=vocab_size,
+            emb_dim=embed_dim,
+            embed_range=embed_range,
+            dtype=dtype,
+            device=device,
+        )
+
+    @staticmethod
+    def _default_arc_baseline(
+        num_channels: int,
+        vocab_size: int,
+        embed_dim: int,
+        *,
+        dtype: torch.dtype,
+        device: Optional[torch.device],
+        radius: float = 1.0,
+    ) -> Tensor:
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+        linspace_kwargs = {"dtype": dtype}
+        if device is not None:
+            linspace_kwargs["device"] = device
+        base = torch.zeros(num_channels, vocab_size, embed_dim, dtype=dtype, device=device)
+        theta = torch.linspace(0.0, math.pi, steps=vocab_size, **linspace_kwargs)
+        base[:, :, 0] = torch.cos(theta) * radius
+        if embed_dim > 1:
+            base[:, :, 1] = torch.sin(theta) * radius
+        return base
 class MahalanobisTokenMetric(nn.Module):
-    """Learnable PSD metric defined via token codes and a lower-triangular map."""
+    """Learnable PSD metric with unit-Frobenius retraction constraint.
+    
+    Uses reparameterization to enforce unit Frobenius norm ||Z||_F = 1:
+    - codes_raw: learnable parameters [vocab_size, metric_dim]
+    - codes (property): per-row normalized codes = normalize(codes_raw, dim=-1)
+    - Z = codes @ L^T is normalized to ||Z||_F = 1 via stop-gradient retraction
+    
+    This removes scale ambiguity with β schedule (β controls all distance scaling).
+    Similar to weight normalization: separates direction (learnable) from magnitude (controlled by β).
+    """
 
     def __init__(
         self,
@@ -29,6 +669,8 @@ class MahalanobisTokenMetric(nn.Module):
         *,
         init_codes: Optional[Tensor] = None,
         diag_eps: float = 1e-4,
+        target_norm: float = 1.0,
+        use_reparameterization: bool = False,  # Disabled by default for backward compatibility
     ) -> None:
         super().__init__()
         if vocab_size <= 0:
@@ -41,8 +683,19 @@ class MahalanobisTokenMetric(nn.Module):
         self.vocab_size = int(vocab_size)
         self.metric_dim = int(metric_dim)
         self.diag_eps = float(diag_eps)
+        self.target_norm = float(target_norm)
+        self.use_reparameterization = bool(use_reparameterization)
 
-        self.codes = nn.Parameter(torch.zeros(self.vocab_size, self.metric_dim))
+        if self.use_reparameterization:
+            # Reparameterization mode: unit-Frobenius constraint by construction
+            # Only codes_raw is learnable; Frobenius norm enforced via retraction
+            self.codes_raw = nn.Parameter(torch.zeros(self.vocab_size, self.metric_dim))
+            # No log_scale: scale ambiguity removed (β schedule controls all scaling)
+        else:
+            # Legacy mode: direct parameter (requires post-update projection)
+            # Directly register parameter to avoid property getter trigger
+            self._parameters['codes'] = nn.Parameter(torch.zeros(self.vocab_size, self.metric_dim))
+        
         self._lower_params = nn.Parameter(torch.zeros(self.metric_dim, self.metric_dim))
 
         self.reset_parameters(init_codes=init_codes)
@@ -54,13 +707,88 @@ class MahalanobisTokenMetric(nn.Module):
                 raise ValueError(
                     "init_codes must have shape (vocab_size, metric_dim)"
                 )
-            self.codes.copy_(init_codes)
+            if self.use_reparameterization:
+                # Initialize codes_raw such that normalized version equals init_codes
+                # Compute current norm of init_codes
+                init_norm = torch.linalg.norm(init_codes, ord='fro')
+                if init_norm > 1e-8:
+                    # Simply normalize per-row (Frobenius constraint applied in distance computation)
+                    self.codes_raw.copy_(F.normalize(init_codes, dim=-1))
+                else:
+                    # Fallback: small random initialization
+                    std = 1.0 / math.sqrt(self.vocab_size * self.metric_dim)
+                    self.codes_raw.normal_(0, std)
+            else:
+                # Legacy mode: set parameter directly
+                param = self._parameters.get('codes')
+                if param is not None:
+                    param.copy_(init_codes)
         else:
-            self.codes.zero_()
+            # Default initialization: unit-Frobenius constraint
+            if self.use_reparameterization:
+                # Initialize so that E[||Z||_F] = 1 after Frobenius normalization
+                # E[||Z||²_F] = vocab_size × metric_dim × σ²
+                # Want E[||Z||_F] = 1 => σ = 1 / sqrt(vocab_size × metric_dim)
+                std = 1.0 / math.sqrt(self.vocab_size * self.metric_dim)
+                self.codes_raw.normal_(0, std)
+            else:
+                # Legacy mode: zero initialization
+                param = self._parameters.get('codes')
+                if param is not None:
+                    param.zero_()
 
         self._lower_params.zero_()
         inv_sp_one = _inv_softplus_tensor(torch.ones(self.metric_dim, dtype=self._lower_params.dtype))
         torch.diagonal(self._lower_params).copy_(inv_sp_one)
+    
+    @property
+    def codes(self) -> Tensor:
+        """Return codes (learnable per-token embeddings).
+        
+        In reparameterization mode:
+            codes = codes_raw (already normalized per-row during updates)
+            Frobenius normalization is applied later in distance computation.
+        
+        In legacy mode:
+            codes = self.codes (direct parameter)
+        
+        NOTE: In reparameterization mode, codes_raw is kept normalized after
+        each gradient update via projection. Direct modifications to codes
+        (via .mul_, .add_, etc.) will break normalization and should be avoided.
+        Use optimizer updates instead.
+        """
+        if self.use_reparameterization:
+            # Return codes_raw directly (already per-row normalized)
+            return self.codes_raw
+        else:
+            # Legacy mode: return parameter directly (fallback for old checkpoints)
+            param = self._parameters.get('codes')
+            if param is None:
+                raise RuntimeError("Legacy codes parameter not found")
+            return param
+    
+    @codes.setter
+    def codes(self, value: Tensor) -> None:
+        """Allow setting codes (mainly for checkpoint loading).
+        
+        In reparameterization mode:
+            Normalize and assign to codes_raw (Frobenius norm enforced at distance computation)
+        In legacy mode:
+            Sets codes parameter directly
+        """
+        if value.shape != (self.vocab_size, self.metric_dim):
+            raise ValueError(f"codes must have shape ({self.vocab_size}, {self.metric_dim})")
+        
+        if self.use_reparameterization:
+            with torch.no_grad():
+                # Simply normalize per-row and assign
+                # Frobenius normalization happens in pairwise_distance_table
+                self.codes_raw.copy_(F.normalize(value, dim=-1))
+        else:
+            # Legacy mode: set parameter directly (fallback for old checkpoints)
+            param = self._parameters.get('codes')
+            if param is not None:
+                param.copy_(value)
 
     def cholesky_factor(self) -> Tensor:
         lower = torch.tril(self._lower_params)
@@ -70,23 +798,59 @@ class MahalanobisTokenMetric(nn.Module):
         return lower
 
     def transformed_codes(self, *, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> Tensor:
-        codes = self.codes
+        """Return Z = C @ L^T (before Frobenius normalization).
+        
+        Note: Frobenius normalization ||Z||_F = 1 is applied in pairwise_distance_table()
+        with stop-gradient to enable manifold optimization.
+        
+        In reparameterization mode (if enabled):
+            - Per-row normalization enforced on-the-fly (to handle manual modifications)
+            - Frobenius normalization happens at distance computation
+        
+        In legacy mode (default):
+            - Direct parameter access (backward compatibility)
+        """
+        codes = self.codes  # In reparam mode (if enabled), this returns codes_raw
         if device is not None or dtype is not None:
             codes = codes.to(device=device or codes.device, dtype=dtype or codes.dtype)
+        
+        # In reparameterization mode, enforce per-row normalization on-the-fly
+        # This handles cases where codes may have been modified directly (e.g., in tests)
+        # Only apply if reparameterization is actually enabled
+        if self.use_reparameterization:
+            codes = F.normalize(codes, dim=-1)
+        
         lower = self.cholesky_factor().to(device=codes.device, dtype=codes.dtype)
-        return codes @ lower.T
+        Z = codes @ lower.T  # [K, d]
+        return Z
 
     def pairwise_distance_table(
         self, *, device: torch.device, dtype: torch.dtype
     ) -> Tensor:
+        """Compute pairwise distance table with unit-Frobenius normalization.
+        
+        Applies Frobenius normalization: Z = Z_raw / ||Z_raw||_F
+        Gradient flows through both the norm and the normalized matrix.
+        """
         transformed = self.transformed_codes(device=device, dtype=dtype)
+        
+        # Unit-Frobenius normalization (gradient flows through norm)
+        fro_norm = torch.linalg.norm(transformed, ord='fro')  # gradient enabled
+        transformed = transformed / (fro_norm + 1e-6)  # normalized to ||Z||_F = 1
+        
         return torch.cdist(transformed, transformed, p=2.0)
 
     def get_extra_state(self) -> dict:
-        return {"diag_eps": self.diag_eps}
+        return {
+            "diag_eps": self.diag_eps,
+            "target_norm": self.target_norm,
+            "use_reparameterization": self.use_reparameterization,
+        }
 
     def set_extra_state(self, state: dict) -> None:  # pragma: no cover - API requirement
         self.diag_eps = float(state.get("diag_eps", self.diag_eps))
+        self.target_norm = float(state.get("target_norm", getattr(self, "target_norm", 1.0)))
+        self.use_reparameterization = bool(state.get("use_reparameterization", getattr(self, "use_reparameterization", True)))
 
 from flow_matching.path.beta_schedules import BetaSchedule
 from flow_matching.path.path import ProbPath
@@ -94,26 +858,6 @@ from flow_matching.path.path import ProbPath
 from flow_matching.path.path_sample import DiscretePathSample
 from flow_matching.path.scheduler import ConvexScheduler
 from flow_matching.utils import expand_tensor_like, unsqueeze_to_match
-    
-def _offdiag_mad_float(matrix: Tensor) -> float:
-    """Return the off-diagonal median absolute deviation of a square matrix."""
-
-    if matrix.ndim != 2 or matrix.size(0) != matrix.size(1):
-        raise ValueError("matrix must be square")
-    if matrix.size(0) <= 1:
-        return 0.0
-
-    mat = matrix.detach().to(dtype=torch.float64)
-    n = mat.size(0)
-    mask = ~torch.eye(n, dtype=torch.bool, device=mat.device)
-    values = mat.masked_select(mask)
-    if values.numel() == 0:
-        return 0.0
-
-    median = torch.median(values)
-    deviations = (values - median).abs()
-    mad = torch.median(deviations)
-    return float(mad)
 
 
 class MixtureDiscreteProbPath(ProbPath):
@@ -252,6 +996,21 @@ class MetricInducedGibbsProbPath(ProbPath):
         learnable_metric_dim: int = 0,
         learnable_metric_diag_eps: float = 1e-4,
         metric_interp_lambda: float = 0.0,
+        learnable_lut: bool = False,
+        lut_num_channels: int = 3,
+        lut_emb_dim: int = 1,
+        lut_share_across_channels: bool = False,
+        lut_renorm_to_init_norm: bool = False,
+        lut_bounded_residual_scale: bool = False,
+        lut_scale_baseline: float = 1.0,
+        lut_scale_epsilon: float = 0.25,
+        lut_init_method: str = "linear",
+        lut_init_noise_scale: float = 0.01,
+        use_normalized_distance: bool = False,
+        lut_cosine_scale: float = 1.0,
+        lut_param_mode: Optional[str] = None,
+        lut_monotone_mode: str = "softplus",
+        lut_arc_radius: float = 1.0,
     ):
         super().__init__()
         self.metric_name = metric
@@ -268,7 +1027,8 @@ class MetricInducedGibbsProbPath(ProbPath):
         self.use_gumbel = bool(use_gumbel)
         self.gumbel_tau = float(gumbel_tau)
         self.gumbel_hard = bool(gumbel_hard)
-
+        self._lut_init_method = str(lut_init_method)
+        self._lut_init_noise_scale = float(lut_init_noise_scale)
         self.embedding = self._build_embedding(
             embedding_path_or_weight, vocab_size, emb_dim, device, dtype
         )
@@ -277,6 +1037,74 @@ class MetricInducedGibbsProbPath(ProbPath):
             p.requires_grad_(False)
 
         self.learnable_metric: Optional[MahalanobisTokenMetric] = None
+        self.learnable_lut: Optional[nn.Module] = None
+        self._lut_num_channels = int(max(1, lut_num_channels))
+        self._lut_share_across_channels = bool(lut_share_across_channels)
+        self._lut_renorm_to_init_norm = bool(lut_renorm_to_init_norm)
+        self._lut_bounded_residual_scale = bool(lut_bounded_residual_scale)
+        self._lut_scale_baseline = float(lut_scale_baseline)
+        self._lut_scale_epsilon = float(lut_scale_epsilon)
+        self._use_normalized_distance = bool(use_normalized_distance)
+        # Optional cosine metric scale (applied to 1-cos distance)
+        self._lut_cosine_scale: float = float(lut_cosine_scale)
+        lut_param_mode = lut_param_mode or None
+        if lut_param_mode is not None and lut_param_mode.lower() in {"none", "free"}:
+            lut_param_mode = None
+        self._lut_param_mode = lut_param_mode
+        self._lut_monotone_mode = str(lut_monotone_mode)
+        self._lut_arc_radius = float(lut_arc_radius)
+
+        if learnable_lut:
+            if learnable_metric_dim > 0:
+                raise ValueError("Cannot enable both learnable_metric and learnable_lut")
+            if metric not in {"lp", "euclidean", "cosine"}:
+                raise ValueError(
+                    "learnable_lut supports metrics: 'lp', 'euclidean', or 'cosine'"
+                )
+            if metric == "cosine":
+                logger.info(
+                    "Initializing learnable LUT with cosine distance (scale=%.3f)",
+                    self._lut_cosine_scale,
+                )
+            num_channels = 1 if self._lut_share_across_channels else self._lut_num_channels
+            if self._lut_param_mode is not None:
+                lut_module = LearnableParametricLUT(
+                    num_channels=num_channels,
+                    vocab_size=vocab_size,
+                    embed_dim=int(lut_emb_dim),
+                    param_mode=self._lut_param_mode,
+                    monotone_mode=self._lut_monotone_mode,
+                    embed_range="pm1" if embed_range == "pm1" else "unit",
+                    device=device,
+                    dtype=dtype,
+                    arc_radius=self._lut_arc_radius,
+                    renormalize_to_init_norm=self._lut_renorm_to_init_norm,
+                    bounded_residual_scale=self._lut_bounded_residual_scale,
+                    scale_baseline=self._lut_scale_baseline,
+                    scale_epsilon=self._lut_scale_epsilon,
+                )
+            else:
+                lut_module = LearnableScalarLUT(
+                    num_channels=num_channels,
+                    vocab_size=vocab_size,
+                    emb_dim=int(lut_emb_dim),
+                    embed_range="pm1" if embed_range == "pm1" else "unit",
+                    device=device,
+                    dtype=dtype,
+                    lp_order=float(lp_order),
+                    renormalize_to_init_norm=self._lut_renorm_to_init_norm,
+                    bounded_residual_scale=self._lut_bounded_residual_scale,
+                    scale_baseline=self._lut_scale_baseline,
+                    scale_epsilon=self._lut_scale_epsilon,
+                    init_method=self._lut_init_method,
+                    init_noise_scale=self._lut_init_noise_scale,
+                )
+            if device is not None:
+                lut_module = lut_module.to(device=device, dtype=dtype)
+            else:
+                lut_module = lut_module.to(dtype=dtype)
+            self.learnable_lut = lut_module
+
         if learnable_metric_dim > 0:
             init_codes = self._build_metric_init_codes(
                 metric_dim=int(learnable_metric_dim),
@@ -300,6 +1128,10 @@ class MetricInducedGibbsProbPath(ProbPath):
         self._cached_emb_weight: Optional[Tensor] = None  # reference to detect invalidation
         self._cached_metric_name: Optional[str] = None
         self._cached_lp_order: Optional[float] = None
+        # Cache for learned metric during eval (parameters frozen)
+        self._cached_learned_dist_table: Optional[Tensor] = None  # [K,K]
+        # Cache for learnable LUT distance tables during eval
+        self._cached_lut_dist_table: Optional[Tensor] = None  # [C,K,K]
 
         self.metric_interp_lambda = 0.0
         self.set_metric_interpolation_lambda(metric_interp_lambda)
@@ -347,12 +1179,25 @@ class MetricInducedGibbsProbPath(ProbPath):
     def _build_metric_init_codes(
         self, *, metric_dim: int, device: torch.device, dtype: torch.dtype
     ) -> Tensor:
-        base = self.embedding.weight.detach().to(device=device, dtype=dtype)
-        codes = torch.zeros(base.size(0), metric_dim, device=device, dtype=dtype)
-        dims = min(base.size(1), metric_dim)
-        if dims > 0:
-            codes[:, :dims] = base[:, :dims]
-        return codes
+        """
+        Initialize metric codes using Classical MDS from L_p distance structure.
+        
+        This provides a rank-d initialization that captures the intrinsic geometry
+        of the L_p metric, enabling faster convergence compared to rank-1 baseline.
+        
+        For metric_dim=8: Spearman correlation ≈ 0.82 with L_p distances.
+        """
+        from flow_matching.path.mds_init import initialize_metric_from_lp
+        
+        init_codes = initialize_metric_from_lp(
+            vocab_size=self.vocab_size,
+            metric_dim=metric_dim,
+            lp_order=self.lp_order,
+            embed_range=self.embed_range,
+            device=device,
+            dtype=dtype
+        )
+        return init_codes
 
     def _embedding_to_tokens(self, emb: Tensor) -> Tensor:
         if emb.shape[-1] < 1:
@@ -380,6 +1225,11 @@ class MetricInducedGibbsProbPath(ProbPath):
 
     def set_metric_interpolation_lambda(self, value: float) -> None:
         clamped = float(min(max(value, 0.0), 1.0))
+        if self.learnable_lut is not None and clamped > 0.0:
+            logger.warning(
+                "Interpolation lambda has no effect when learnable_lut is enabled; forcing to 0."
+            )
+            clamped = 0.0
         self.metric_interp_lambda = clamped
 
     def get_metric_interpolation_lambda(self) -> float:
@@ -403,14 +1253,6 @@ class MetricInducedGibbsProbPath(ProbPath):
         d_beta_t = self.c * self.a * (y ** (self.a - 1.0)) * dy_dt
         return beta_t, d_beta_t
 
-    def learnable_parameters(self) -> Iterable[nn.Parameter]:
-        params: list[nn.Parameter] = []
-        if isinstance(self.beta_schedule, nn.Module):
-            params.extend(self.beta_schedule.parameters())
-        if self.learnable_metric is not None:
-            params.extend(self.learnable_metric.parameters())
-        return params
-
     def schedule_parameters(self) -> Iterable[nn.Parameter]:
         if isinstance(self.beta_schedule, nn.Module):
             yield from self.beta_schedule.parameters()
@@ -418,6 +1260,10 @@ class MetricInducedGibbsProbPath(ProbPath):
     def metric_parameters(self) -> Iterable[nn.Parameter]:
         if self.learnable_metric is not None:
             yield from self.learnable_metric.parameters()
+
+    def lut_parameters(self) -> Iterable[nn.Parameter]:
+        if self.learnable_lut is not None:
+            yield from self.learnable_lut.parameters()
 
     # ---------- Distance on the embedding space ----------
     def _pairwise_dist(self, z_flat: Tensor, E: Tensor) -> Tensor:
@@ -449,6 +1295,9 @@ class MetricInducedGibbsProbPath(ProbPath):
 
     # ---------- Precompute and use fast token-indexed distances ----------
     def _get_base_distance_table(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        if self.learnable_lut is not None:
+            return self._build_lut_distance_table(device=device, dtype=dtype)
+
         E = self.embedding.weight
         metric_changed = (
             self._cached_metric_name != self.metric_name
@@ -471,16 +1320,185 @@ class MetricInducedGibbsProbPath(ProbPath):
             self._cached_emb_weight = E
             self._cached_metric_name = self.metric_name
             self._cached_lp_order = float(self.lp_order)
-            try:
-                self._base_dist_offdiag_scale = _offdiag_mad_float(dist_cpu)
-            except ValueError:
-                self._base_dist_offdiag_scale = None
 
         base = self._base_dist_table_cpu
         assert base is not None
         if base.device != device or base.dtype != dtype:
             base = base.to(device=device, dtype=dtype)
         return base
+
+    def _build_lut_distance_table(self, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """Build pairwise distance table for LUT embeddings.
+        
+        When use_normalized_distance=True:
+            Uses normalized distance: \tilde d = ||E[v] - E[x_1]||_2 / \sqrt{m}
+            where m is the embedding dimension (for vector embeddings) or 1 (for scalar)
+        
+        Returns:
+            Tensor of shape [num_channels, vocab_size, vocab_size] containing
+            pairwise Lp distances between all token embeddings.
+        """
+        assert self.learnable_lut is not None
+        weight = self.learnable_lut()
+        if weight.device != device or weight.dtype != dtype:
+            weight = weight.to(device=device, dtype=dtype)
+        channels, vocab_size, emb_dim = weight.shape
+
+        # Cosine metric: compute 1 - cosine similarity on unit-normalized embeddings
+        if self.metric_name == "cosine":
+            wn = F.normalize(weight, p=2, dim=-1, eps=1e-12)  # [C,V,D]
+            sim = torch.matmul(wn, wn.transpose(-1, -2))      # [C,V,V]
+            dist = (1.0 - sim) * float(self._lut_cosine_scale)
+            return dist
+
+        # Compute pairwise differences: [C, V, V, D]
+        diff = weight[:, :, None, :] - weight[:, None, :, :]  # [C, V, 1, D] - [C, 1, V, D]
+
+        if self._use_normalized_distance and emb_dim > 1:
+            # Normalized distance: ||diff||_2 / sqrt(m) for vector embeddings
+            m = float(emb_dim)
+            dist = torch.linalg.vector_norm(diff, dim=-1) / math.sqrt(m)  # [C, V, V]
+        else:
+            # Metric-controlled Lp distance (scalar or vector embeddings)
+            if emb_dim == 1:
+                dist = diff.abs().squeeze(-1)  # [C, V, V]
+            else:
+                if self.metric_name == "lp":
+                    p = float(self.lp_order)
+                else:
+                    p = 2.0  # euclidean fallback
+                if math.isclose(p, 1.0):
+                    dist = diff.abs().sum(dim=-1)
+                elif math.isclose(p, 2.0):
+                    dist = torch.linalg.vector_norm(diff, ord=2.0, dim=-1)
+                else:
+                    dist = (diff.abs() ** p).sum(dim=-1) ** (1.0 / p)
+
+        return dist
+
+    def _lut_channel_assignments(self, tokens: Tensor) -> Tensor:
+        assert self.learnable_lut is not None
+        channels = self.learnable_lut.num_channels
+        B, S = tokens.shape
+        if channels == 1:
+            return torch.zeros((B, S), device=tokens.device, dtype=torch.long)
+        if S % channels != 0:
+            raise ValueError(
+                f"Token sequence length {S} is not divisible by lut channels {channels}."
+            )
+        per_channel = S // channels
+        base = torch.arange(S, device=tokens.device) // per_channel
+        return base.unsqueeze(0).expand(B, -1)
+
+    def _lut_rows(self, dist_table: Tensor, token_indices: Tensor) -> Tensor:
+        assert self.learnable_lut is not None
+        channels = dist_table.shape[0]
+        B, S = token_indices.shape
+        channel_ids = self._lut_channel_assignments(token_indices).reshape(-1)
+        flat_tokens = token_indices.reshape(-1)
+        lookup = dist_table.reshape(channels * self.vocab_size, self.vocab_size)
+        combined = channel_ids * self.vocab_size + flat_tokens
+        rows = lookup.index_select(0, combined)
+        return rows.view(B, S, self.vocab_size)
+
+    def _lut_pair_distance(self, dist_table: Tensor, x_tokens: Tensor, x1_tokens: Tensor) -> Tensor:
+        assert self.learnable_lut is not None
+        channels = dist_table.shape[0]
+        assignments = self._lut_channel_assignments(x_tokens).reshape(-1)
+        flat = x_tokens.reshape(-1)
+        flat1 = x1_tokens.reshape(-1)
+        lookup = dist_table.reshape(channels * self.vocab_size, self.vocab_size)
+        combined = assignments * self.vocab_size + flat
+        rows = lookup.index_select(0, combined)
+        dist = rows.gather(1, flat1.view(-1, 1))
+        return dist.view(x_tokens.shape + (1,))
+
+    def precompute_lut_distance_table(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Precompute and cache the learnable LUT distance table for evaluation.
+
+        This should be called at the start of evaluation when LUT parameters are
+        frozen so that repeated sampling steps can reuse the cached distances.
+        """
+        if self.learnable_lut is None:
+            logger.warning("precompute_lut_distance_table is a no-op (learnable_lut is None)")
+            return
+        with torch.no_grad():
+            table = self._build_lut_distance_table(device=device, dtype=dtype).detach()
+        self._cached_lut_dist_table = table
+        logger.info(
+            "Precomputed learnable LUT distance table [%s] on %s with dtype %s",
+            tuple(table.shape),
+            device,
+            dtype,
+        )
+
+    def clear_lut_cache(self) -> None:
+        """Clear the cached LUT distance table (if any)."""
+        if self._cached_lut_dist_table is not None:
+            logger.info("Clearing cached learnable LUT distance table")
+            self._cached_lut_dist_table = None
+
+    def precompute_learned_metric_table(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        metric_module: Optional[MahalanobisTokenMetric] = None,
+    ) -> None:
+        """Precompute and cache learned metric distance table for evaluation.
+
+        Args:
+            device: Device to store the cached table on.
+            dtype: Data type for the cached table.
+            metric_module: Optional override for the metric (e.g., EMA teacher).
+                When omitted, uses ``self.learnable_metric``.
+        """
+        if self.learnable_lut is not None:
+            logger.warning(
+                "precompute_learned_metric_table is intended for learnable metrics; "
+                "call precompute_lut_distance_table when using a learnable LUT instead."
+            )
+            return
+        learned_table = self._learned_distance_table(
+            device=device,
+            dtype=dtype,
+            metric_module=metric_module,
+        )
+        if learned_table is not None:
+            self._cached_learned_dist_table = learned_table
+            logger.info(
+                f"Precomputed learned metric distance table [{learned_table.shape}] "
+                f"on {device} with dtype {dtype}"
+            )
+        else:
+            logger.warning("No learned metric to precompute (learnable_metric is None)")
+
+    def clear_learned_metric_cache(self) -> None:
+        """Clear the cached learned metric distance table.
+        
+        This should be called at the end of evaluation to free memory.
+        """
+        if self._cached_learned_dist_table is not None:
+            logger.info("Clearing cached learned metric distance table")
+            self._cached_learned_dist_table = None
+
+    def _learned_distance_table(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        metric_module: Optional[MahalanobisTokenMetric] = None,
+    ) -> Optional[Tensor]:
+        module = metric_module if metric_module is not None else self.learnable_metric
+        if module is None:
+            return None
+
+        return module.pairwise_distance_table(device=device, dtype=dtype)
 
     def _build_distance_table(
         self,
@@ -489,29 +1507,33 @@ class MetricInducedGibbsProbPath(ProbPath):
         *,
         metric_module: Optional[MahalanobisTokenMetric] = None,
         cache_result: bool = True,
+        use_cache: bool = False,
     ) -> Tensor:
+        if self.learnable_lut is not None:
+            if use_cache and self._cached_lut_dist_table is not None:
+                table = self._cached_lut_dist_table
+                if table.device != device or table.dtype != dtype:
+                    table = table.to(device=device, dtype=dtype)
+            else:
+                table = self._build_lut_distance_table(device=device, dtype=dtype)
+            return table
+
         base = self._get_base_distance_table(device=device, dtype=dtype)
 
-        module = metric_module if metric_module is not None else self.learnable_metric
-        learned_table = None
         lam = float(self.metric_interp_lambda)
-        if module is not None and lam > 0.0:
-            learned_table = module.pairwise_distance_table(device=device, dtype=dtype)
-            base_scale = self._base_dist_offdiag_scale
-            if base_scale is not None and base_scale > 0.0:
-                try:
-                    learned_scale = _offdiag_mad_float(learned_table)
-                except ValueError:
-                    learned_scale = None
-                if learned_scale is not None and learned_scale > 0.0:
-                    scale_value = base_scale / max(learned_scale, 1e-12)
-                    if math.isfinite(scale_value) and scale_value > 0.0:
-                        scale_tensor = torch.as_tensor(
-                            scale_value,
-                            device=learned_table.device,
-                            dtype=learned_table.dtype,
-                        )
-                        learned_table = learned_table * scale_tensor
+        learned_table = None
+        if lam > 0.0:
+            # Try to use cached table first (eval optimization)
+            if use_cache and self._cached_learned_dist_table is not None:
+                learned_table = self._cached_learned_dist_table
+                # Ensure device/dtype match
+                if learned_table.device != device or learned_table.dtype != dtype:
+                    learned_table = learned_table.to(device=device, dtype=dtype)
+            else:
+                # Recompute (training or cache miss)
+                learned_table = self._learned_distance_table(
+                    device=device, dtype=dtype, metric_module=metric_module
+                )
 
         if learned_table is None or lam <= 0.0:
             dist = base
@@ -520,8 +1542,11 @@ class MetricInducedGibbsProbPath(ProbPath):
         else:
             dist = (1.0 - lam) * base + lam * learned_table
 
-        if cache_result and metric_module is None:
-            self._cached_dist_table = dist
+        # NOTE: We do NOT cache the learned metric distance table during training
+        # because the metric parameters are constantly changing. Caching would
+        # use stale distances. Only cache the baseline Lp table (done in _get_base_distance_table).
+        # if cache_result and metric_module is None:
+        #     self._cached_dist_table = dist
         return dist
 
     def distances_from_tokens(self, token_indices: Tensor) -> Tensor:
@@ -535,7 +1560,18 @@ class MetricInducedGibbsProbPath(ProbPath):
         assert token_indices.dtype in (torch.int32, torch.int64)
         device = token_indices.device
         dtype = self.embedding.weight.dtype
-        dist_table = self._build_distance_table(device=device, dtype=dtype)
+        
+        # LUT path: [C, K, K] distance table requires channel-aware indexing
+        if self.learnable_lut is not None:
+            dist_table = self._build_distance_table(
+                device=device, dtype=dtype, use_cache=True
+            )
+            return self._lut_rows(dist_table, token_indices)
+        
+        # Standard path: [K, K] distance table
+        dist_table = self._build_distance_table(
+            device=device, dtype=dtype, use_cache=True
+        )
         # Gather rows for each token index
         K = self.vocab_size
         B, S = token_indices.shape[0], token_indices.view(token_indices.shape[0], -1).shape[1]
@@ -572,9 +1608,13 @@ class MetricInducedGibbsProbPath(ProbPath):
             dtype=dtype,
             metric_module=metric_module,
             cache_result=metric_module is None,
+            use_cache=True,  # Always try cache (no-op during training)
         )
         flat_indices = x1_tokens.view(-1)
-        d = dist_table.index_select(0, flat_indices).view(x1_tokens.shape + (self.vocab_size,))
+        if self.learnable_lut is not None:
+            d = self._lut_rows(dist_table, x1_tokens)
+        else:
+            d = dist_table.index_select(0, flat_indices).view(x1_tokens.shape + (self.vocab_size,))
         if beta_values is not None:
             beta_t = beta_values
         elif beta_schedule is not None:
@@ -582,7 +1622,10 @@ class MetricInducedGibbsProbPath(ProbPath):
         else:
             beta_t, _ = self.beta(t)
         beta_t = beta_t.view(B, 1, 1)
-        logits = -beta_t * d
+        logits = -beta_t * d  # [B, S, K]
+        # Numerically stable log-sum-exp softmax (no clamp, fully backward compatible)
+        max_logits = logits.max(dim=-1, keepdim=True).values  # [B, S, 1]
+        logits = logits - max_logits
         return torch.softmax(logits, dim=-1)
 
     def pair_distance_tokens(self, x_tokens: Tensor, x1_tokens: Tensor) -> Tensor:
@@ -597,7 +1640,13 @@ class MetricInducedGibbsProbPath(ProbPath):
         assert x_tokens.shape == x1_tokens.shape
         device = x_tokens.device
         dtype = self.embedding.weight.dtype
-        dist_table = self._build_distance_table(device=device, dtype=dtype)
+        dist_table = self._build_distance_table(
+            device=device, dtype=dtype, use_cache=True
+        )
+        if self.learnable_lut is not None:
+            dist = self._lut_pair_distance(dist_table, x_tokens, x1_tokens)
+            return dist
+
         flat = x_tokens.view(-1)             # [N]
         flat1 = x1_tokens.view(-1)           # [N]
         rows = dist_table.index_select(0, flat)  # [N,K]

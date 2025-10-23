@@ -10,12 +10,13 @@ Modified from https://github.com/openai/guided-diffusion/blob/main/guided_diffus
 import math
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.modules.utils import _pair
 from models.nn import (
     avg_pool_nd,
     checkpoint,
@@ -25,6 +26,121 @@ from models.nn import (
     timestep_embedding,
     zero_module,
 )
+
+
+def _rms_per_out(weight: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Return per-output RMS for linear/conv weights."""
+
+    if weight.ndim >= 4:
+        reduce_dims = tuple(range(1, weight.ndim))
+    elif weight.ndim == 3:
+        reduce_dims = (1, 2)
+    else:
+        reduce_dims = (1,)
+    rms = torch.sqrt(weight.float().pow(2).mean(dim=reduce_dims, keepdim=True) + eps)
+    return rms.to(dtype=weight.dtype)
+
+
+class WNOnUseConv2d(nn.Conv2d):
+    """Conv2d that normalizes weights per forward pass."""
+
+    @classmethod
+    def from_conv(
+        cls,
+        conv: nn.Conv2d,
+        *,
+        reinit_if_zero: bool = False,
+        std: float = 1e-3,
+    ) -> "WNOnUseConv2d":
+        padding: Tuple[int, int] | str
+        if isinstance(conv.padding, str):
+            padding = conv.padding
+        else:
+            padding = _pair(conv.padding)
+
+        new_module = cls(
+            in_channels=conv.in_channels,
+            out_channels=conv.out_channels,
+            kernel_size=_pair(conv.kernel_size),
+            stride=_pair(conv.stride),
+            padding=padding,
+            dilation=_pair(conv.dilation),
+            groups=conv.groups,
+            bias=conv.bias is not None,
+        )
+        new_module.load_state_dict(conv.state_dict(), strict=False)
+
+        if reinit_if_zero:
+            with torch.no_grad():
+                weight = new_module.weight
+                max_abs = weight.abs().max()
+                if max_abs.isnan() or max_abs.isinf() or max_abs <= 0:
+                    nn.init.normal_(weight, mean=0.0, std=std)
+                if new_module.bias is not None:
+                    bias_max = new_module.bias.abs().max()
+                    if bias_max.isnan() or bias_max.isinf() or bias_max <= 0:
+                        nn.init.constant_(new_module.bias, 0.0)
+
+        return new_module
+
+    def force_weight_renorm(self, eps: float = 1e-8) -> None:
+        with torch.no_grad():
+            weight = self.weight
+            rms = _rms_per_out(weight, eps)
+            fan_in = weight[0].numel()
+            scale = 1.0 / math.sqrt(fan_in)
+            weight.data.copy_((weight / rms) * scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        w = self.weight
+        rms = _rms_per_out(w)
+        fan_in = w[0].numel()
+        scale = 1.0 / math.sqrt(fan_in)
+        w = (w / rms) * scale
+        return F.conv2d(
+            x,
+            w,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+
+
+class WNOnUseLinear(nn.Linear):
+    """Linear that normalizes weights per forward pass."""
+
+    def force_weight_renorm(self, eps: float = 1e-8) -> None:
+        with torch.no_grad():
+            weight = self.weight
+            rms = _rms_per_out(weight, eps)
+            fan_in = weight[0].numel()
+            scale = 1.0 / math.sqrt(fan_in)
+            weight.data.copy_((weight / rms) * scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        w = self.weight
+        rms = _rms_per_out(w)
+        fan_in = w[0].numel()
+        scale = 1.0 / math.sqrt(fan_in)
+        w = (w / rms) * scale
+        return F.linear(x, w, self.bias)
+
+
+def force_weight_norm(modules: Iterable[nn.Module], eps: float = 1e-8) -> None:
+    """Project selected module weights to unit RMS per output channel."""
+
+    with torch.no_grad():
+        for module in modules:
+            if hasattr(module, "force_weight_renorm"):
+                module.force_weight_renorm(eps=eps)  # type: ignore[arg-type]
+                continue
+            weight = getattr(module, "weight", None)
+            if weight is None:
+                continue
+            rms = _rms_per_out(weight, eps)
+            weight.data.div_(rms)
 
 
 class ConstantEmbedding(nn.Module):
@@ -127,7 +243,7 @@ class Upsample(nn.Module):
         if self.use_conv:
             x = self.conv(x)
         return x
-
+    
 
 class Downsample(nn.Module):
     """
@@ -299,6 +415,7 @@ class AttentionBlock(nn.Module):
         num_head_channels=-1,
         use_checkpoint=False,
         use_new_attention_order=False,
+        use_cosine_attention: bool = False,
     ):
         super().__init__()
         self.channels = channels
@@ -314,10 +431,14 @@ class AttentionBlock(nn.Module):
         self.qkv = conv_nd(1, channels, channels * 3, 1)
         if use_new_attention_order:
             # split qkv before split heads
-            self.attention = QKVAttention(self.num_heads)
+            self.attention = QKVAttention(
+                self.num_heads, use_cosine_attention=use_cosine_attention
+            )
         else:
             # split heads before split qkv
-            self.attention = QKVAttentionLegacy(self.num_heads)
+            self.attention = QKVAttentionLegacy(
+                self.num_heads, use_cosine_attention=use_cosine_attention
+            )
 
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
@@ -363,9 +484,11 @@ class QKVAttentionLegacy(nn.Module):
     A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping
     """
 
-    def __init__(self, n_heads):
+    def __init__(self, n_heads, use_cosine_attention: bool = False, eps: float = 1e-4):
         super().__init__()
         self.n_heads = n_heads
+        self.use_cosine_attention = use_cosine_attention
+        self.eps = eps
 
     def forward(self, qkv):
         """
@@ -377,11 +500,23 @@ class QKVAttentionLegacy(nn.Module):
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = torch.einsum(
-            "bct,bcs->bts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
-        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+
+        if self.use_cosine_attention:
+            q_float = q.float()
+            k_float = k.float()
+            q_hat = q_float / (q_float.norm(dim=1, keepdim=True) + self.eps)
+            k_hat = k_float / (k_float.norm(dim=1, keepdim=True) + self.eps)
+            logits = torch.einsum("bct,bcs->bts", q_hat, k_hat)
+            logits = logits * math.sqrt(ch)
+            weight = torch.softmax(logits, dim=-1).to(dtype=v.dtype)
+        else:
+            scale = 1 / math.sqrt(math.sqrt(ch))
+            weight = torch.einsum(
+                "bct,bcs->bts", q * scale, k * scale
+            )  # More stable with f16 than dividing afterwards
+
+        if not self.use_cosine_attention:
+            weight = torch.softmax(weight.float(), dim=-1).type(v.dtype)
         a = torch.einsum("bts,bcs->bct", weight, v)
         return a.reshape(bs, -1, length)
 
@@ -395,9 +530,11 @@ class QKVAttention(nn.Module):
     A module which performs QKV attention and splits in a different order.
     """
 
-    def __init__(self, n_heads):
+    def __init__(self, n_heads, use_cosine_attention: bool = False, eps: float = 1e-4):
         super().__init__()
         self.n_heads = n_heads
+        self.use_cosine_attention = use_cosine_attention
+        self.eps = eps
 
     def forward(self, qkv):
         """
@@ -409,16 +546,23 @@ class QKVAttention(nn.Module):
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.chunk(3, dim=1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = torch.einsum(
-            "bct,bcs->bts",
-            (q * scale).view(bs * self.n_heads, ch, length),
-            (k * scale).view(bs * self.n_heads, ch, length),
-        )  # More stable with f16 than dividing afterwards
-        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = torch.einsum(
-            "bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length)
-        )
+        q = q.reshape(bs * self.n_heads, ch, length)
+        k = k.reshape(bs * self.n_heads, ch, length)
+        v = v.reshape(bs * self.n_heads, ch, length)
+
+        if self.use_cosine_attention:
+            q_float = q.float()
+            k_float = k.float()
+            q_hat = q_float / (q_float.norm(dim=1, keepdim=True) + self.eps)
+            k_hat = k_float / (k_float.norm(dim=1, keepdim=True) + self.eps)
+            logits = torch.einsum("bct,bcs->bts", q_hat, k_hat)
+            logits = logits * math.sqrt(ch)
+            weight = torch.softmax(logits, dim=-1).to(dtype=v.dtype)
+        else:
+            scale = 1 / math.sqrt(math.sqrt(ch))
+            weight = torch.einsum("bct,bcs->bts", q * scale, k * scale)
+            weight = torch.softmax(weight.float(), dim=-1).type(v.dtype)
+        a = torch.einsum("bts,bcs->bct", weight, v)
         return a.reshape(bs, -1, length)
 
     @staticmethod
@@ -477,6 +621,8 @@ class UNetModel(nn.Module):
     with_fourier_features: bool = False
     ignore_time: bool = False
     input_projection: bool = True
+    use_cosine_attention: bool = False
+    use_output_head_weight_norm: bool = False
 
     image_size: int = -1  # not used...
     _target_: str = "lib.models.gd_unet.UNetModel"
@@ -546,6 +692,7 @@ class UNetModel(nn.Module):
                             num_heads=self.num_heads,
                             num_head_channels=self.num_head_channels,
                             use_new_attention_order=self.use_new_attention_order,
+                            use_cosine_attention=self.use_cosine_attention,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -593,6 +740,7 @@ class UNetModel(nn.Module):
                 num_heads=self.num_heads,
                 num_head_channels=self.num_head_channels,
                 use_new_attention_order=self.use_new_attention_order,
+                use_cosine_attention=self.use_cosine_attention,
             ),
             ResBlock(
                 ch,
@@ -631,6 +779,7 @@ class UNetModel(nn.Module):
                             num_heads=self.num_heads_upsample,
                             num_head_channels=self.num_head_channels,
                             use_new_attention_order=self.use_new_attention_order,
+                            use_cosine_attention=self.use_cosine_attention,
                         )
                     )
                 if level and i == self.num_res_blocks:
@@ -656,11 +805,30 @@ class UNetModel(nn.Module):
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
 
-        self.out = nn.Sequential(
-            normalization(ch),
-            nn.SiLU(),
-            zero_module(conv_nd(self.dims, input_ch, self.out_channels, 3, padding=1)),
-        )
+        self.weight_norm_targets: list[nn.Module] = []
+
+        head_conv = conv_nd(self.dims, input_ch, self.out_channels, 3, padding=1)
+        if self.use_output_head_weight_norm:
+            if not isinstance(head_conv, nn.Conv2d):
+                raise TypeError("Output head weight norm currently supports Conv2d heads.")
+            wn_head = WNOnUseConv2d.from_conv(
+                head_conv,
+                reinit_if_zero=True,
+                std=1e-3,
+            )
+            wn_head.to(head_conv.weight.device, dtype=head_conv.weight.dtype)
+            self.out = nn.Sequential(
+                normalization(ch),
+                nn.SiLU(),
+                wn_head,
+            )
+            self.weight_norm_targets.append(wn_head)
+        else:
+            self.out = nn.Sequential(
+                normalization(ch),
+                nn.SiLU(),
+                zero_module(head_conv),
+            )
 
     def forward(self, x, timesteps, extra):
         """

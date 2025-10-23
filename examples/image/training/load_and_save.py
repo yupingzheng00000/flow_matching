@@ -83,7 +83,54 @@ def load_model(
             for name, module in extra_modules.items():
                 state_dict = checkpoint["extra_modules"].get(name)
                 if state_dict is not None:
-                    module.load_state_dict(state_dict)
+                    # Handle legacy checkpoint format for MahalanobisTokenMetric
+                    from flow_matching.path.mixture import MahalanobisTokenMetric
+                    from flow_matching.path.metric_ema import LearnableMetricEMA
+                    
+                    if isinstance(module, MahalanobisTokenMetric):
+                        # Check if this is a legacy format (has 'codes' but not 'codes_raw')
+                        if "codes" in state_dict and "codes_raw" not in state_dict:
+                            print(f"Converting legacy metric format for '{name}'...")
+                            # Use the property setter to trigger automatic conversion
+                            module.codes = state_dict["codes"]
+                            if "_lower_params" in state_dict:
+                                module._lower_params.data.copy_(state_dict["_lower_params"])
+                            if "_extra_state" in state_dict:
+                                module.set_extra_state(state_dict["_extra_state"])
+                            print(f"  ✓ Converted: codes → codes_raw + log_scale")
+                        else:
+                            # New format, load normally
+                            module.load_state_dict(state_dict)
+                    elif isinstance(module, LearnableMetricEMA):
+                        # Handle LearnableMetricEMA with legacy teacher metric
+                        # Check if teacher has legacy format
+                        if "teacher.codes" in state_dict and "teacher.codes_raw" not in state_dict:
+                            print(f"Converting legacy EMA teacher metric format for '{name}'...")
+                            # Extract teacher state
+                            teacher_state = {
+                                k.replace("teacher.", ""): v 
+                                for k, v in state_dict.items() 
+                                if k.startswith("teacher.")
+                            }
+                            # Convert teacher via property setter
+                            if isinstance(module.teacher, MahalanobisTokenMetric):
+                                module.teacher.codes = teacher_state["codes"]
+                                if "_lower_params" in teacher_state:
+                                    module.teacher._lower_params.data.copy_(teacher_state["_lower_params"])
+                                if "_extra_state" in teacher_state:
+                                    module.teacher.set_extra_state(teacher_state["_extra_state"])
+                            # Load non-teacher parts
+                            for k, v in state_dict.items():
+                                if not k.startswith("teacher."):
+                                    # Load buffers like num_updates
+                                    if k in dict(module.named_buffers()):
+                                        getattr(module, k).copy_(v)
+                            print(f"  ✓ Converted EMA teacher: codes → codes_raw + log_scale")
+                        else:
+                            # New format, load normally
+                            module.load_state_dict(state_dict)
+                    else:
+                        module.load_state_dict(state_dict)
         checkpoint_args = checkpoint.get("args")
         if checkpoint_args is not None:
             for attr in (
@@ -99,9 +146,23 @@ def load_model(
             and "epoch" in checkpoint
             and not (hasattr(args, "eval") and args.eval)
         ):
-            optimizer.load_state_dict(checkpoint["optimizer"])
+            # Handle freeze schedule mode: skip optimizer loading if param groups mismatch
+            freeze_schedule = getattr(args, "mi_freeze_beta_schedule", False)
+            
+            if freeze_schedule:
+                # In freeze mode, param groups differ: checkpoint has schedule params, current doesn't
+                # Skip optimizer state loading, but keep lr_schedule and epoch
+                print(f"Freeze mode: Skipping optimizer state loading (param group mismatch)")
+                print(f"  Checkpoint was trained with schedule params, now excluded from optimizer")
+                print(f"  UNet will start with fresh optimizer state (momentum reset)")
+            else:
+                # Normal mode: load optimizer state
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                print("Loaded optimizer state")
+            
+            # Always load lr_schedule and epoch
             lr_schedule.load_state_dict(checkpoint["lr_schedule"])
             args.start_epoch = checkpoint["epoch"] + 1
             if "scaler" in checkpoint:
                 loss_scaler.load_state_dict(checkpoint["scaler"])
-            print("With optim & sched!")
+            print(f"Resumed from epoch {checkpoint['epoch']}, continuing to epoch {args.start_epoch}")

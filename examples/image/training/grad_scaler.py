@@ -6,7 +6,7 @@
 import torch
 
 from torch import Tensor
-from typing import Any
+from typing import Any, Callable, Optional
 
 
 def _create_grad_scaler(enabled: bool):
@@ -55,6 +55,7 @@ class NativeScalerWithGradNormCount:
         parameters=None,
         create_graph=False,
         update_grad=True,
+        pre_step_fn: Optional[Callable[[], None]] = None,
     ):
         if self._enabled:
             self._scaler.scale(loss).backward(create_graph=create_graph)
@@ -70,6 +71,8 @@ class NativeScalerWithGradNormCount:
                 if self._enabled:
                     self._scaler.unscale_(optimizer)
                 norm = get_grad_norm_(parameters)
+            if pre_step_fn is not None:
+                pre_step_fn()
             optimizer.step() if not self._enabled else self._scaler.step(optimizer)
             if self._enabled:
                 self._scaler.update()

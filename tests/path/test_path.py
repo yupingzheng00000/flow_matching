@@ -22,6 +22,7 @@ from flow_matching.path import (
 )
 from flow_matching.path.scheduler import CondOTScheduler
 from flow_matching.utils.manifolds import FlatTorus, Sphere
+from flow_matching.path.beta_schedules import _ExpRQS1D
 
 
 class TestAffineProbPath(unittest.TestCase):
@@ -253,7 +254,8 @@ class TestMetricInducedProbPath(unittest.TestCase):
             assert path.learnable_metric is not None
             path.learnable_metric.codes.mul_(1.1)
         dist_after = path.distances_from_tokens(tokens).detach()
-        self.assertFalse(torch.allclose(dist_before, dist_after))
+        diff = (dist_after - dist_before).abs().sum()
+        self.assertGreater(diff.item(), 0.0)
 
 
 class TestScheduleUtilities(unittest.TestCase):
@@ -384,6 +386,121 @@ class TestExpMonotoneRQSchedule(unittest.TestCase):
         self.assertTrue(torch.allclose(beta, baseline, atol=1e-7, rtol=1e-5))
         self.assertTrue(torch.allclose(d_beta, baseline_deriv, atol=1e-7, rtol=1e-5))
         self.assertTrue(torch.all(d_beta > 0))
+
+    def test_sample_uniform_logbeta_round_trip_and_weight(self):
+        seed = 1234
+        torch.manual_seed(seed)
+        config = ExpMonotoneRQSConfig(
+            num_bins=4,
+            tail_bound=3.0,
+            init_c=1.2,
+            init_a=2.3,
+            t_eps=1e-5,
+            logit_eps=1e-6,
+        )
+        schedule = ExpMonotoneRQSSchedule(config=config).to(dtype=torch.float64)
+
+        batch_shape = (16,)
+        lmin, lmax = -1.5, 1.8
+        t, weight = schedule.sample_t_uniform_logbeta(batch_shape, lmin, lmax)
+
+        self.assertEqual(t.shape, torch.Size(batch_shape))
+        self.assertEqual(weight.shape, torch.Size(batch_shape))
+        self.assertTrue(torch.all(t >= config.t_eps))
+        self.assertTrue(torch.all(t <= 1.0 - config.t_eps))
+
+        beta, d_beta = schedule.beta_and_derivative(t)
+        ell_recovered = beta.log()
+
+        self.assertTrue(torch.all(ell_recovered >= lmin - 1e-6))
+        self.assertTrue(torch.all(ell_recovered <= lmax + 1e-6))
+
+        interval = max(lmax - lmin, torch.finfo(beta.dtype).eps)
+        expected_weight = interval * (beta / d_beta)
+        self.assertTrue(torch.all(expected_weight > 0))
+        self.assertTrue(
+            torch.allclose(weight, expected_weight, atol=1e-6, rtol=1e-5)
+        )
+
+        torch.manual_seed(seed)
+        expected_ell = torch.empty(
+            batch_shape, dtype=ell_recovered.dtype, device=ell_recovered.device
+        ).uniform_(lmin, lmax)
+        self.assertTrue(
+            torch.allclose(ell_recovered, expected_ell, atol=1e-6, rtol=1e-5)
+        )
+
+    def test_sample_uniform_logbeta_interval_validation(self):
+        schedule = ExpMonotoneRQSSchedule()
+        with self.assertRaises(ValueError):
+            schedule.sample_t_uniform_logbeta((4,), 1.0, 0.0)
+
+    def test_sample_uniform_logbeta_with_default_bounds(self):
+        config = ExpMonotoneRQSConfig(
+            num_bins=3,
+            tail_bound=4.0,
+            init_c=1.1,
+            init_a=2.7,
+            t_eps=1e-4,
+            logit_eps=1e-6,
+        )
+        schedule = ExpMonotoneRQSSchedule(config=config)
+        with torch.no_grad():
+            t_bounds = torch.tensor(
+                [config.t_eps, 1.0 - config.t_eps], dtype=schedule.y0.dtype
+            )
+            beta_bounds, _ = schedule.beta_and_derivative(t_bounds)
+            beta_bounds = beta_bounds.clamp_min(1e-12)
+            lmin, lmax = beta_bounds.log().tolist()
+
+        self.assertLess(lmin, lmax)
+
+        t, weight = schedule.sample_t_uniform_logbeta((8,), lmin, lmax)
+        self.assertEqual(t.shape, torch.Size([8]))
+        self.assertEqual(weight.shape, torch.Size([8]))
+        self.assertTrue(torch.all(t >= config.t_eps))
+        self.assertTrue(torch.all(t <= 1.0 - config.t_eps))
+        self.assertTrue(torch.all(weight > 0))
+
+    def test_logbeta_regularization_returns_finite_scalars(self):
+        config = ExpMonotoneRQSConfig(num_bins=6, tail_bound=3.0, init_c=1.2, init_a=2.1)
+        schedule = ExpMonotoneRQSSchedule(config=config)
+
+        base_terms = schedule.logbeta_regularization()
+        narrow_terms = schedule.logbeta_regularization(t_lo=0.2, t_hi=0.8)
+        weighted_terms = schedule.logbeta_regularization(power=1.5)
+
+        for terms in (base_terms, narrow_terms, weighted_terms):
+            for key in ("delta", "delta2", "endpoint"):
+                value = terms[key]
+                self.assertIsInstance(value, torch.Tensor)
+                self.assertEqual(value.shape, torch.Size([]))
+                self.assertTrue(torch.isfinite(value))
+        
+
+
+class TestExpRQSInverse(unittest.TestCase):
+    def test_inverse_round_trip(self):
+        torch.manual_seed(0)
+        rqs = _ExpRQS1D(num_bins=5, tail_bound=2.5).to(dtype=torch.float64)
+        with torch.no_grad():
+            rqs.theta_w.copy_(torch.randn_like(rqs.theta_w))
+            rqs.theta_h.copy_(torch.randn_like(rqs.theta_h))
+            if rqs.theta_d.numel() > 0:
+                rqs.theta_d.copy_(torch.randn_like(rqs.theta_d))
+
+        inputs = torch.linspace(-3.0, 3.0, steps=41, dtype=torch.float64)
+        outputs, derivatives = rqs(inputs)
+        recovered, recovered_derivatives = rqs.inverse(outputs)
+
+        max_error = (recovered - inputs).abs().max().item()
+        self.assertLessEqual(max_error, 5e-6)
+        self.assertTrue(torch.all(recovered_derivatives > 0.0))
+        self.assertTrue(
+            torch.allclose(
+                recovered_derivatives, derivatives, atol=1e-6, rtol=1e-5
+            )
+        )
 
 
 if __name__ == "__main__":

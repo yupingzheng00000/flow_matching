@@ -88,17 +88,24 @@ MODEL_CONFIGS = {
 
 
 def instantiate_model(
-    architechture: str, is_discrete: bool, ko: bool,use_ema: bool
-) -> Union[UNetModel, DiscreteUNetModel]:
+    architechture: str,
+    is_discrete: bool,
+    ko: bool,
+    use_ema: bool,
+    use_cosine_attention: bool = False,
+    use_head_weight_norm: bool = False,
+) -> Union[UNetModel, DiscreteUNetModel, EMA]:
     assert (
         architechture in MODEL_CONFIGS
     ), f"Model architecture {architechture} is missing its config."
 
     if is_discrete:
         if architechture + "_discrete" in MODEL_CONFIGS:
-            config = MODEL_CONFIGS[architechture + "_discrete"]
+            config = dict(MODEL_CONFIGS[architechture + "_discrete"])
         else:
-            config = MODEL_CONFIGS[architechture]
+            config = dict(MODEL_CONFIGS[architechture])
+        config["use_cosine_attention"] = use_cosine_attention
+        config["use_output_head_weight_norm"] = use_head_weight_norm
         if ko:
             model = DiscreteUNetModel(
                 vocab_size=256,
@@ -106,13 +113,21 @@ def instantiate_model(
             )
         else:
             model = DiscreteUNetModel(
-            vocab_size=257,
-            **config,
-        )
+                vocab_size=257,
+                **config,
+            )
     else:
-        model = UNetModel(**MODEL_CONFIGS[architechture])
+        config = dict(MODEL_CONFIGS[architechture])
+        config["use_cosine_attention"] = use_cosine_attention
+        config["use_output_head_weight_norm"] = use_head_weight_norm
+        model = UNetModel(**config)
+
+    weight_norm_targets = getattr(model, "weight_norm_targets", [])
 
     if use_ema:
-        return EMA(model=model)
-    else:
-        return model
+        ema_model = EMA(model=model)
+        setattr(ema_model, "weight_norm_targets", weight_norm_targets)
+        return ema_model
+
+    setattr(model, "weight_norm_targets", weight_norm_targets)
+    return model
