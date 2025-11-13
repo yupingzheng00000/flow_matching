@@ -65,6 +65,38 @@ def get_args_parser():
         help="Use the alternative time discretization during sampling proposed in the EDM paper: https://arxiv.org/abs/2206.00364.",
     )
     parser.add_argument(
+        "--t_bias_gamma",
+        default=1.5,
+        type=float,
+        help="Exponent gamma for sampling t via t = u**gamma (u~Uniform[0,1]). Set to 1.0 for uniform sampling.",
+    )
+    parser.add_argument(
+        "--t_weight_mode",
+        default="none",
+        choices=["none", "linear_t"],
+        type=str,
+        help="Optional per-sample CE weighting based on t. 'linear_t' uses w(t)=1+lambda*(1-t).",
+    )
+    parser.add_argument(
+        "--t_weight_lambda",
+        default=1.0,
+        type=float,
+        help="Lambda used by linear_t weighting (ignored when --t_weight_mode=none).",
+    )
+    parser.add_argument(
+        "--t_weight_normalize",
+        dest="t_weight_normalize",
+        action="store_true",
+        help="Normalize per-batch t weights to keep mean(loss weight)=1.",
+    )
+    parser.add_argument(
+        "--t_weight_no_normalize",
+        dest="t_weight_normalize",
+        action="store_false",
+        help="Disable per-batch normalization of t weights.",
+    )
+    parser.set_defaults(t_weight_normalize=True)
+    parser.add_argument(
         "--use_ema",
         action="store_true",
         help="When evaluating, use the model Exponential Moving Average weights.",
@@ -676,175 +708,6 @@ def get_args_parser():
         default=256,
         type=int,
         help="Number of time samples to evaluate when exporting β(t) snapshots.",
-    )
-    parser.add_argument(
-        "--mi_logbeta_min",
-        default=None,
-        type=float,
-        help=(
-            "Lower bound for uniform log-β sampling when using the exponential spline schedule. "
-            "Defaults to log β evaluated at t=mi_t_eps if unspecified."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_max",
-        default=None,
-        type=float,
-        help=(
-            "Upper bound for uniform log-β sampling when using the exponential spline schedule. "
-            "Defaults to log β evaluated at t=1-mi_t_eps if unspecified."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_reg_delta_weight",
-        default=0.0,
-        type=float,
-        help=(
-            "Weight for the first-order smoothness penalty on log β knots (∑(Δℓ/Δs)^2)."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_reg_delta2_weight",
-        default=0.0,
-        type=float,
-        help=(
-            "Weight for the second-order smoothness penalty on log β knots (∑(Δ^2ℓ/Δs^2)^2)."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_reg_power",
-        default=0.0,
-        type=float,
-        help=(
-            "Power-law exponent for reweighting log β knot penalties; positive values emphasize central knots."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_endpoint_weight",
-        default=0.0,
-        type=float,
-        help=(
-            "Weight for penalizing the spline endpoint slopes to prevent exploding dℓ/dt near t ∈ {0,1}."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_reg_anneal_steps",
-        default=0,
-        type=int,
-        help=(
-            "Number of optimizer steps to linearly anneal the log β smoothness penalties towards zero."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_trunc_t",
-        default=None,
-        type=float,
-        help=(
-            "Optional truncation applied to the sampling domain; restrict t to [mi_logbeta_trunc_t, 1-mi_logbeta_trunc_t] "
-            "when drawing log-β proposals (must be greater than mi_t_eps)."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_band_t_lo",
-        default=None,
-        type=float,
-        help=(
-            "Lower cutoff in t-space for computing the active log-β sampling range."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_band_t_hi",
-        default=None,
-        type=float,
-        help=(
-            "Upper cutoff in t-space for computing the active log-β sampling range."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_mis_alpha",
-        default=0.3,
-        type=float,
-        help=(
-            "Mixture coefficient α for MIS between uniform-t and log-β proposals. "
-            "Set to 0 to disable; recommended range is [0.1, 0.5]."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_eval_alpha",
-        default=None,
-        type=float,
-        help=(
-            "Mixture coefficient α for evaluation grid when using uniform_logbeta. "
-            "If None, uses the training value from --mi_logbeta_mis_alpha. "
-            "Set to 0 for pure log-β sampling, 0.5 for balanced 50-50 mix, "
-            "1.0 for pure uniform-t sampling."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_sampling_strategy",
-        default="uniform",
-        choices=["uniform", "log_normal_broad", "log_normal_focused"],
-        type=str,
-        help=(
-            "Sampling strategy in log-β space for uniform_logbeta grid. "
-            "'uniform': uniform distribution in log-β. "
-            "'log_normal_broad': Gaussian centered on full interval (μ=0, σ=2.5 for [-5,5]). "
-            "'log_normal_focused': Gaussian concentrated on informative region (auto-computed)."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_lognormal_mu",
-        default=None,
-        type=float,
-        help=(
-            "Mean (μ) of log-normal distribution in log-β space. "
-            "If None: auto-computed based on strategy. "
-            "  - 'broad': μ = (ℓ_max + ℓ_min) / 2 (center of full interval). "
-            "  - 'focused': μ = center of informative region in log-β. "
-            "Manual override: set explicit value (e.g., 0.0 for β=1)."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_lognormal_sigma",
-        default=None,
-        type=float,
-        help=(
-            "Standard deviation (σ) of log-normal distribution in log-β space. "
-            "If None: auto-computed based on strategy. "
-            "  - 'broad': σ = (ℓ_max - ℓ_min) / 4 (4σ covers full interval). "
-            "  - 'focused': σ = (informative_width) / 2 (1σ covers informative). "
-            "Manual override: set explicit value (e.g., 2.5 for broad coverage)."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_informative_H_min_ratio",
-        default=0.2,
-        type=float,
-        help=(
-            "Lower bound of informative region as ratio of H_max. "
-            "Informative region: H ∈ [ratio_min × H_max, ratio_max × H_max]. "
-            "Used for auto-computing focused log-normal parameters."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_informative_H_max_ratio",
-        default=0.8,
-        type=float,
-        help=(
-            "Upper bound of informative region as ratio of H_max. "
-            "Informative region: H ∈ [ratio_min × H_max, ratio_max × H_max]. "
-            "Used for auto-computing focused log-normal parameters."
-        ),
-    )
-    parser.add_argument(
-        "--mi_logbeta_use_is",
-        action="store_true",
-        help=(
-            "Enable importance sampling (IS) for log-β proposals. "
-            "When disabled (default), samples are drawn from log-β distribution "
-            "without reweighting (logbeta_weights = None). "
-            "When enabled, applies IS weights: w(β) = 1/q(β)."
-        ),
     )
     parser.add_argument(
         "--mi_infer_grid",

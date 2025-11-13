@@ -1,14 +1,13 @@
-﻿"""
-Comprehensive LUT Analysis: Quantile Hypothesis Testing
+﻿"""Comprehensive LUT Analysis: Quantile Hypothesis Testing
 
 Implements two key diagnostic probes:
 
 A. Quantile Equalization Hypothesis
    - Compare learned E_c(v) against three monotone baselines:
      T1: Equalize-to-uniform (2*F_c(v) - 1)
-     T2: Equalize-to-normal (probit transform: Φ^(-1)(F_c(v)))
+     T2: Equalize-to-normal (probit transform: Phi^{-1}(F_c(v)))
      T3: Isotonic regression (unconstrained monotone fit)
-   - Report R², RMSE, MAE, Spearman/Kendall correlations
+   - Report R^2, RMSE, MAE, Spearman/Kendall correlations
 
 C. Pushforward Distribution Tests
    - Sample x_1 tokens, map through y = E_c(x_1)
@@ -19,8 +18,8 @@ Handles both scalar (D=1) and multi-dimensional (D>1) embeddings.
 For D>1, uses L2 norm or PC1 projection for visualization.
 
 Usage:
-    python analyze_lut_quantile_hypothesis.py --checkpoint path/to/checkpoint.pth \\
-           --data_histogram path/to/cifar10_histogram.pt \\
+    python analyze_lut_quantile_hypothesis.py --checkpoint path/to/checkpoint.pth \
+           --data_histogram path/to/cifar10_histogram.pt \
            --output_dir ./lut_analysis_output
 """
 
@@ -62,6 +61,64 @@ from lut_quantile_analysis import (  # noqa: E402
 # Utility Functions
 # ============================================================================
 
+def _infer_embed_range(args_obj) -> str:
+    candidate = None
+    if args_obj is not None:
+        candidate = getattr(args_obj, "mi_embed_range", getattr(args_obj, "embed_range", None))
+    if candidate == "01":
+        return "unit"
+    return "pm1"
+
+
+def _instantiate_lut_from_state(state_dict: dict, embed_range: str) -> Tuple[torch.Tensor, dict]:
+    """Instantiate LearnableLUT from a (possibly legacy) state dict."""
+    converted: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if key.startswith("param."):
+            converted["_geometry." + key[len("param."):]] = value
+        else:
+            converted[key] = value
+    state_dict = converted
+
+    if "weight" in state_dict:
+        num_channels, vocab_size, emb_dim = state_dict["weight"].shape
+        param_mode = "none"
+    elif "_geometry.basis_raw" in state_dict:
+        basis = state_dict["_geometry.basis_raw"]
+        num_channels, emb_dim = basis.shape[0], basis.shape[1]
+        delta = state_dict["_geometry.delta_raw"]
+        vocab_size = delta.shape[1] + 1
+        param_mode = "arc2d"
+    elif "_geometry.direction_raw" in state_dict:
+        direction = state_dict["_geometry.direction_raw"]
+        num_channels, emb_dim = direction.shape[0], direction.shape[1]
+        delta = state_dict["_geometry.delta_raw"]
+        vocab_size = delta.shape[1] + 1
+        param_mode = "line2d"
+    else:
+        raise ValueError("Unable to infer LUT configuration from state dictionary.")
+
+    lut = LearnableLUT(
+        num_channels=num_channels,
+        vocab_size=vocab_size,
+        emb_dim=emb_dim,
+        embed_range=embed_range,
+        param_mode=param_mode,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    lut.load_state_dict(state_dict, strict=False)
+    lut.eval()
+    weight = lut().detach()
+    metadata = {
+        "num_channels": lut.num_channels,
+        "vocab_size": lut.vocab_size,
+        "emb_dim": lut.emb_dim,
+        "param_mode": lut.param_mode,
+    }
+    return weight, metadata
+
+
 def load_lut_from_checkpoint(checkpoint_path: str) -> Tuple[torch.Tensor, dict]:
     """Load LUT weights from checkpoint.
     
@@ -70,40 +127,46 @@ def load_lut_from_checkpoint(checkpoint_path: str) -> Tuple[torch.Tensor, dict]:
         metadata: Dict with num_channels, vocab_size, emb_dim
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    
-    # Try extra_modules first (newer format)
-    lut_weight = None
+    embed_range = _infer_embed_range(ckpt.get("args"))
+
+    path_state = ckpt.get("path", {})
+    if path_state:
+        lut_state = {
+            key[len("learnable_lut."):]: value
+            for key, value in path_state.items()
+            if key.startswith("learnable_lut.")
+        }
+        if lut_state:
+            print("  ✓ Found LUT state in checkpoint['path']")
+            weight, metadata = _instantiate_lut_from_state(lut_state, embed_range)
+            metadata["checkpoint_path"] = checkpoint_path
+            return weight, metadata
+
     if "extra_modules" in ckpt and "metric_learnable_lut" in ckpt["extra_modules"]:
-        lut_dict = ckpt["extra_modules"]["metric_learnable_lut"]
-        if "weight" in lut_dict:
-            lut_weight = lut_dict["weight"]
-            print("  ✓ Found LUT in extra_modules['metric_learnable_lut']")
-    
-    # Fallback: search in ema_model (older format)
-    if lut_weight is None and "ema_model" in ckpt:
-        for key in ckpt["ema_model"].keys():
+        print("  ✓ Found LUT state in checkpoint['extra_modules']['metric_learnable_lut']")
+        weight, metadata = _instantiate_lut_from_state(ckpt["extra_modules"]["metric_learnable_lut"], embed_range)
+        metadata["checkpoint_path"] = checkpoint_path
+        return weight, metadata
+
+    lut_weight = None
+    if "ema_model" in ckpt:
+        for key, value in ckpt["ema_model"].items():
             if "learnable_lut.weight" in key:
-                lut_weight = ckpt["ema_model"][key]
+                lut_weight = value
                 print(f"  ✓ Found LUT in ema_model['{key}']")
                 break
-    
     if lut_weight is None:
-        raise ValueError("No learnable_lut.weight found in checkpoint (checked extra_modules and ema_model)")
-    
-    # Ensure [C, V, D] shape
-    
-    # Infer dimensions
+        raise ValueError("No learnable LUT state found in checkpoint.")
     if lut_weight.ndim == 2:
-        lut_weight = lut_weight.unsqueeze(-1)  # [C, V, 1]
-    
+        lut_weight = lut_weight.unsqueeze(-1)
     C, V, D = lut_weight.shape
     metadata = {
         "num_channels": C,
         "vocab_size": V,
         "emb_dim": D,
+        "param_mode": "none",
         "checkpoint_path": checkpoint_path,
     }
-    
     print(f"✓ Loaded LUT: shape={list(lut_weight.shape)}, channels={C}, vocab={V}, emb_dim={D}")
     return lut_weight, metadata
 
@@ -252,12 +315,12 @@ def compute_baseline_metrics(
         name: Baseline name (for printing)
     
     Returns:
-        metrics: Dict with R², RMSE, MAE, Spearman ρ, Kendall τ
+        metrics: Dict with R^2, RMSE, MAE, Spearman ρ, Kendall τ
     """
     E_np = E.numpy()
     T_np = T.numpy()
     
-    # R² (coefficient of determination)
+    # R^2 (coefficient of determination)
     ss_res = np.sum((E_np - T_np) ** 2)
     ss_tot = np.sum((E_np - E_np.mean()) ** 2)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -272,7 +335,7 @@ def compute_baseline_metrics(
     
     return {
         "name": name,
-        "R²": r2,
+        "R^2": r2,
         "RMSE": rmse,
         "MAE": mae,
         "Spearman_ρ": spearman_rho,
@@ -550,7 +613,7 @@ def _plot_baseline_comparison_basic(results_A: Dict, output_path: str, channel_i
     metrics_T1 = results_A.metrics["T1_uniform"]
     ax.set_xlabel('T1: Uniform')
     ax.set_ylabel('E (Learned)')
-    ax.set_title(f'E vs T1 (R²={metrics_T1["R²"]:.4f})')
+    ax.set_title(f'E vs T1 (R^2={metrics_T1["R^2"]:.4f})')
     ax.grid(True, alpha=0.3)
     
     # Bottom-right: Scatter E vs T2
@@ -560,7 +623,7 @@ def _plot_baseline_comparison_basic(results_A: Dict, output_path: str, channel_i
     metrics_T2 = results_A.metrics["T2_probit"]
     ax.set_xlabel('T2: Probit')
     ax.set_ylabel('E (Learned)')
-    ax.set_title(f'E vs T2 (R²={metrics_T2["R²"]:.4f})')
+    ax.set_title(f'E vs T2 (R^2={metrics_T2["R^2"]:.4f})')
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -598,7 +661,7 @@ def plot_pushforward_analysis(results_C: Dict, output_path: str, channel_idx: in
     # QQ plot (normal)
     ax = axes[0, 2]
     stats.probplot(x, dist="norm", plot=ax)
-    ax.set_title(f'Original QQ (Normal)\nR²={results_C["original_normal"]["QQ_R2"]:.4f}')
+    ax.set_title(f'Original QQ (Normal)\nR^2={results_C["original_normal"]["QQ_R2"]:.4f}')
     ax.grid(True, alpha=0.3)
     
     # Bottom row: Pushforward distribution
@@ -627,7 +690,7 @@ def plot_pushforward_analysis(results_C: Dict, output_path: str, channel_idx: in
     # QQ plot (normal)
     ax = axes[1, 2]
     stats.probplot(y, dist="norm", plot=ax)
-    ax.set_title(f'Pushforward QQ (Normal)\nR²={results_C["pushforward_normal"]["QQ_R2"]:.4f}')
+    ax.set_title(f'Pushforward QQ (Normal)\nR^2={results_C["pushforward_normal"]["QQ_R2"]:.4f}')
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -647,20 +710,20 @@ def print_summary_report(results_A: BaselineResults, results_C: Dict, channel_id
     print("-" * 80)
     for metrics in results_A.metrics.values():
         print(f"\n{metrics['name']}:")
-        print(f"  R² = {metrics['R2']:.6f}")
+        print(f"  R^2 = {metrics['R2']:.6f}")
         print(f"  RMSE = {metrics['RMSE']:.6f}")
         print(f"  MAE = {metrics['MAE']:.6f}")
         print(f"  Spearman ρ = {metrics['SpearmanR']:.6f}")
         print(f"  Kendall τ = {metrics['KendallTau']:.6f}")
 
     best_key, best_metrics = max(results_A.metrics.items(), key=lambda item: item[1]['R2'])
-    print(f"\n✓ Best fit: {best_metrics['name']} (R²={best_metrics['R2']:.6f})")
+    print(f"\n✓ Best fit: {best_metrics['name']} (R^2={best_metrics['R2']:.6f})")
     if best_metrics['R2'] >= 0.98:
-        print("  → STRONG evidence for quantile-like behavior (R² ≥ 0.98)")
+        print("  → STRONG evidence for quantile-like behavior (R^2 ≥ 0.98)")
     elif best_metrics['R2'] >= 0.95:
-        print("  → MODERATE evidence for quantile-like behavior (R² ≥ 0.95)")
+        print("  → MODERATE evidence for quantile-like behavior (R^2 ≥ 0.95)")
     else:
-        print("  → WEAK evidence for quantile-like behavior (R² < 0.95)")
+        print("  → WEAK evidence for quantile-like behavior (R^2 < 0.95)")
 
     # Probe C: Pushforward tests
     print("\n" + "-" * 80)
@@ -674,7 +737,7 @@ def print_summary_report(results_A: BaselineResults, results_C: Dict, channel_id
     print("\nPushforward Distribution (y=E(x₁)):")
     print(f"  Uniformity: KS={results_C['pushforward_uniform']['KS_stat']:.4f}, p={results_C['pushforward_uniform']['KS_pval']:.4e}")
     print(f"  Normality: Shapiro W={results_C['pushforward_normal']['Shapiro_stat']:.4f}, p={results_C['pushforward_normal']['Shapiro_pval']:.4e}")
-    print(f"  QQ (Normal) R²={results_C['pushforward_normal']['QQ_R2']:.4f}")
+    print(f"  QQ (Normal) R^2={results_C['pushforward_normal']['QQ_R2']:.4f}")
 
     orig_ks = results_C['original_uniform']['KS_stat']
     push_ks = results_C['pushforward_uniform']['KS_stat']

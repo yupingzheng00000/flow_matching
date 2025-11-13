@@ -562,29 +562,6 @@ def main(args):
                 raise ValueError(f"Unsupported β schedule type: {schedule_type}")
             beta_schedule.to(device=device)
 
-            if isinstance(beta_schedule, ExpMonotoneRQSSchedule):
-                logbeta_min = getattr(args, "mi_logbeta_min", None)
-                logbeta_max = getattr(args, "mi_logbeta_max", None)
-                if logbeta_min is None or logbeta_max is None:
-                    with torch.no_grad():
-                        t_bounds = torch.tensor(
-                            [
-                                float(beta_schedule.config.t_eps),
-                                float(1.0 - beta_schedule.config.t_eps),
-                            ],
-                            device=device,
-                            dtype=beta_schedule.y0.dtype,
-                        )
-                        beta_vals, _ = beta_schedule.beta_and_derivative(t_bounds)
-                        beta_vals = beta_vals.clamp_min(1e-12)
-                        defaults = beta_vals.log().tolist()
-                    if logbeta_min is None:
-                        logbeta_min = float(defaults[0])
-                    if logbeta_max is None:
-                        logbeta_max = float(defaults[1])
-                args.mi_logbeta_min = float(logbeta_min)
-                args.mi_logbeta_max = float(logbeta_max)
-
         gumbel_tau_default = float(getattr(args, "mi_gumbel_tau", 1.0))
         tau_start = getattr(args, "mi_gumbel_tau_start", None)
         tau_end = getattr(args, "mi_gumbel_tau_end", None)
@@ -858,8 +835,6 @@ def main(args):
             extra_modules["metric_beta_schedule"] = metric_path.beta_schedule
         if metric_path.learnable_metric is not None:
             extra_modules["metric_learnable_metric"] = metric_path.learnable_metric
-        if metric_path.learnable_lut is not None:
-            extra_modules["metric_learnable_lut"] = metric_path.learnable_lut
         if beta_schedule_ema is not None:
             extra_modules["metric_beta_schedule_ema"] = beta_schedule_ema
         if metric_ema is not None:
@@ -894,6 +869,7 @@ def main(args):
         optimizer=optimizer,
         loss_scaler=loss_scaler,
         lr_schedule=lr_schedule,
+        path=metric_path,
         extra_modules=extra_modules,
     )
     if (
@@ -1059,6 +1035,7 @@ def main(args):
                     lr_schedule=lr_schedule,
                     loss_scaler=loss_scaler,
                     epoch=epoch,
+                    path=metric_path,
                     extra_modules=extra_modules,
                 )
                 # Optionally create display-epoch symlink for convenience in plotting
@@ -1162,7 +1139,6 @@ if __name__ == "__main__":
     if args.resume:
         setattr(args, "_gumbel_update_step", 0)
         setattr(args, "_metric_interp_update_step", 0)
-        setattr(args, "_mi_logbeta_reg_step", 0)
         setattr(args, "_annealing_counters_reset", True)  # Flag to prevent override
         print(
             "=" * 80 + "\n"

@@ -181,15 +181,7 @@ def _build_metric_infer_time_grid(
     device: torch.device,
 ) -> tuple[torch.Tensor, str]:
     grid_type = str(getattr(args, "mi_infer_grid", "uniform_t"))
-    
-    # Get evaluation alpha: if not specified, fall back to training alpha
-    eval_alpha_cfg = getattr(args, "mi_logbeta_eval_alpha", None)
-    if eval_alpha_cfg is None:
-        eval_alpha = float(getattr(args, "mi_logbeta_mis_alpha", 0.0))
-    else:
-        eval_alpha = float(eval_alpha_cfg)
-    eval_alpha = min(max(eval_alpha, 0.0), 1.0)  # Clamp to [0, 1]
-    
+
     steps_cfg = getattr(args, "mi_infer_steps", None)
     if steps_cfg is None:
         steps = int(getattr(args, "discrete_fm_steps", 1024))
@@ -201,202 +193,34 @@ def _build_metric_infer_time_grid(
     if grid_type == "uniform_logbeta":
         schedule = getattr(path, "beta_schedule", None)
         if isinstance(schedule, ExpMonotoneRQSSchedule):
-            ell_min = getattr(args, "mi_logbeta_min", None)
-            ell_max = getattr(args, "mi_logbeta_max", None)
-            band_lo_cfg = getattr(args, "mi_logbeta_band_t_lo", None)
-            band_hi_cfg = getattr(args, "mi_logbeta_band_t_hi", None)
-            cfg_t_eps = float(schedule.config.t_eps)
-            default_lo = cfg_t_eps
-            default_hi = 1.0 - cfg_t_eps
-            band_lo = max(
-                default_lo,
-                float(band_lo_cfg) if band_lo_cfg is not None else default_lo,
-            )
-            band_hi = min(
-                default_hi,
-                float(band_hi_cfg) if band_hi_cfg is not None else default_hi,
-            )
-            if band_hi <= band_lo:
-                band_hi = min(default_hi, band_lo + 1e-6)
             with torch.no_grad():
                 t_bounds = torch.tensor(
-                    [band_lo, band_hi],
+                    [
+                        float(schedule.config.t_eps),
+                        float(1.0 - schedule.config.t_eps),
+                    ],
                     device=schedule.y0.device,
                     dtype=schedule.y0.dtype,
                 )
                 ell_bounds = schedule.ell_from_t(t_bounds)
-                derived_min = float(torch.min(ell_bounds).item())
-                derived_max = float(torch.max(ell_bounds).item())
-            ell_min = (
-                derived_min if ell_min is None else max(float(ell_min), derived_min)
+                ell_min = float(torch.min(ell_bounds).item())
+                ell_max = float(torch.max(ell_bounds).item())
+
+            ell_grid = torch.linspace(
+                ell_min,
+                ell_max,
+                steps=num_points,
+                device=schedule.y0.device,
+                dtype=schedule.y0.dtype,
             )
-            ell_max = (
-                derived_max if ell_max is None else min(float(ell_max), derived_max)
-            )
-            if not math.isfinite(ell_min) or not math.isfinite(ell_max):
-                raise ValueError("mi_logbeta_min/max must be finite when using uniform_logbeta grid")
-            if ell_max <= ell_min:
-                raise ValueError("mi_logbeta_max must exceed mi_logbeta_min for uniform_logbeta grid")
-            
-            # Get sampling strategy
-            sampling_strategy = str(getattr(args, "mi_logbeta_sampling_strategy", "uniform"))
-            
-            # Compute mu and sigma based on strategy
-            def compute_lognormal_params():
-                """Compute mu and sigma for log-normal sampling"""
-                mu_cfg = getattr(args, "mi_logbeta_lognormal_mu", None)
-                sigma_cfg = getattr(args, "mi_logbeta_lognormal_sigma", None)
-                
-                if sampling_strategy == "log_normal_broad":
-                    # Broad: center on full interval
-                    mu_default = (ell_min + ell_max) / 2
-                    sigma_default = (ell_max - ell_min) / 4
-                    mu = mu_default if mu_cfg is None else float(mu_cfg)
-                    sigma = sigma_default if sigma_cfg is None else float(sigma_cfg)
-                    return mu, sigma
-                    
-                elif sampling_strategy == "log_normal_focused":
-                    # Focused: center on informative region
-                    # First, compute informative region in beta space
-                    vocab_size = getattr(path, "vocab_size", 256)  # From metric geometry
-                    H_max = math.log(vocab_size)
-                    H_min_ratio = float(getattr(args, "mi_logbeta_informative_H_min_ratio", 0.01))
-                    H_max_ratio = float(getattr(args, "mi_logbeta_informative_H_max_ratio", 0.99))
-                    H_min_threshold = H_min_ratio * H_max
-                    H_max_threshold = H_max_ratio * H_max
-                    
-                    # Use sigmoid model to find corresponding beta values
-                    # H(beta) = H_max / (1 + exp(-beta/beta_transition + shift))
-                    # Solve for beta: beta = beta_transition * (shift - log(H_max/H - 1))
-                    beta_transition = 1.0
-                    shift = 3.0
-                    
-                    beta_info_min = beta_transition * (shift - math.log(H_max / H_min_threshold - 1))
-                    beta_info_max = beta_transition * (shift - math.log(H_max / H_max_threshold - 1))
-                    
-                    # Clamp beta to positive range (avoid log of negative/zero)
-                    beta_info_min = max(beta_info_min, 0.01)  # Minimum β = 0.01
-                    beta_info_max = max(beta_info_max, 0.02)  # Ensure β_max > β_min
-                    
-                    # Ensure β_max > β_min
-                    if beta_info_max <= beta_info_min:
-                        beta_info_max = beta_info_min * 2.0
-                    
-                    # Convert to log-beta
-                    ell_info_min = math.log(beta_info_min)
-                    ell_info_max = math.log(beta_info_max)
-                    
-                    # Mu: center of informative region
-                    mu_default = (ell_info_min + ell_info_max) / 2
-                    # Sigma: 1-sigma covers informative region
-                    sigma_default = (ell_info_max - ell_info_min) / 2
-                    
-                    mu = mu_default if mu_cfg is None else float(mu_cfg)
-                    sigma = sigma_default if sigma_cfg is None else float(sigma_cfg)
-                    
-                    logger.info(
-                        f"Focused log-normal auto-computed: "
-                        f"H_informative=[{H_min_threshold:.2f}, {H_max_threshold:.2f}] nats, "
-                        f"beta_informative=[{beta_info_min:.2f}, {beta_info_max:.2f}], "
-                        f"log_beta_informative=[{ell_info_min:.3f}, {ell_info_max:.3f}], "
-                        f"mu={mu:.4f}, sigma={sigma:.4f}"
-                    )
-                    return mu, sigma
-                    
-                else:
-                    # Default values if needed
-                    mu = 0.0 if mu_cfg is None else float(mu_cfg)
-                    sigma = 2.5 if sigma_cfg is None else float(sigma_cfg)
-                    return mu, sigma
-            
-            # Implement mixed sampling if eval_alpha > 0
-            if eval_alpha > 0:
-                # Number of samples from each component
-                n_uniform = int(eval_alpha * num_points)
-                n_logbeta = num_points - n_uniform
-                
-                # Generate uniform-t component
-                t_uniform = torch.linspace(
-                    0.0,
-                    1.0,
-                    steps=n_uniform,
-                    device=schedule.y0.device,
-                    dtype=schedule.y0.dtype,
-                )
-                
-                # Generate log-β component (depends on sampling strategy)
-                if sampling_strategy in ["log_normal_broad", "log_normal_focused"]:
-                    mu, sigma = compute_lognormal_params()
-                    
-                    # Sample from N(mu, sigma^2) and clip to [ell_min, ell_max]
-                    ell_samples = torch.randn(
-                        n_logbeta,
-                        device=schedule.y0.device,
-                        dtype=schedule.y0.dtype,
-                    ) * sigma + mu
-                    ell_grid_logbeta = torch.clamp(ell_samples, ell_min, ell_max)
-                else:
-                    # Uniform sampling in log-β space
-                    ell_grid_logbeta = torch.linspace(
-                        ell_min,
-                        ell_max,
-                        steps=n_logbeta,
-                        device=schedule.y0.device,
-                        dtype=schedule.y0.dtype,
-                    )
-                
-                t_logbeta, _ = schedule.t_from_ell(ell_grid_logbeta)
-                t_logbeta = t_logbeta.clamp(schedule.config.t_eps, 1.0 - schedule.config.t_eps)
-                
-                # Combine and sort
-                t_vals = torch.cat([t_uniform, t_logbeta])
-                t_vals = torch.sort(t_vals)[0]
-                
-                # Create descriptive label
-                if sampling_strategy == "log_normal_broad":
-                    strategy_suffix = "_broad"
-                elif sampling_strategy == "log_normal_focused":
-                    strategy_suffix = "_focused"
-                else:
-                    strategy_suffix = ""
-                grid_label = f"mixed_alpha{eval_alpha:.2f}{strategy_suffix}"
-                return t_vals.to(device=device, dtype=torch.float32), grid_label
-            else:
-                # Pure log-β sampling (alpha=0)
-                if sampling_strategy in ["log_normal_broad", "log_normal_focused"]:
-                    mu, sigma = compute_lognormal_params()
-                    
-                    # Sample from N(mu, sigma^2) and clip to [ell_min, ell_max]
-                    ell_samples = torch.randn(
-                        num_points,
-                        device=schedule.y0.device,
-                        dtype=schedule.y0.dtype,
-                    ) * sigma + mu
-                    ell_grid = torch.clamp(ell_samples, ell_min, ell_max)
-                    
-                    if sampling_strategy == "log_normal_focused":
-                        grid_label = "focused_logbeta"
-                    else:
-                        grid_label = "broad_logbeta"
-                else:
-                    # Uniform sampling in log-β space
-                    ell_grid = torch.linspace(
-                        ell_min,
-                        ell_max,
-                        steps=num_points,
-                        device=schedule.y0.device,
-                        dtype=schedule.y0.dtype,
-                    )
-                    grid_label = grid_type
-                
-                t_vals, _ = schedule.t_from_ell(ell_grid)
-                t_vals = t_vals.clamp(schedule.config.t_eps, 1.0 - schedule.config.t_eps)
-                t_vals = torch.sort(t_vals)[0]
-                return t_vals.to(device=device, dtype=torch.float32), grid_label
-        else:
-            logger.warning(
-                "mi_infer_grid=uniform_logbeta requested but β schedule is not ExpMonotoneRQSSchedule; falling back to uniform_t."
-            )
+            t_vals, _ = schedule.t_from_ell(ell_grid)
+            t_vals = t_vals.clamp(schedule.config.t_eps, 1.0 - schedule.config.t_eps)
+            t_vals = torch.sort(t_vals)[0]
+            return t_vals.to(device=device, dtype=torch.float32), grid_type
+
+        logger.warning(
+            "mi_infer_grid=uniform_logbeta requested but β schedule is not ExpMonotoneRQSSchedule; falling back to uniform_t."
+        )
 
     t_vals = torch.linspace(0.0, 1.0, steps=num_points, device=device, dtype=torch.float32)
     return t_vals, "uniform_t"

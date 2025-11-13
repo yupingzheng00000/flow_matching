@@ -24,6 +24,8 @@ def save_model(
     optimizer,
     lr_schedule,
     loss_scaler,
+    *,
+    path: Optional[Module] = None,
     extra_modules: Optional[Dict[str, Module]] = None,
 ):
     output_dir = Path(args.output_dir)
@@ -45,8 +47,11 @@ def save_model(
                 "epoch": epoch,
                 "scaler": loss_scaler.state_dict(),
                 "args": args,
-                "extra_modules": extra_state,
             }
+            if extra_state:
+                to_save["extra_modules"] = extra_state
+            if path is not None:
+                to_save["path"] = path.state_dict()
 
             save_on_master(to_save, checkpoint_path)
     else:
@@ -64,6 +69,8 @@ def load_model(
     optimizer,
     loss_scaler,
     lr_schedule,
+    *,
+    path: Optional[Module] = None,
     extra_modules: Optional[Dict[str, Module]] = None,
 ):
     if args.resume:
@@ -79,6 +86,23 @@ def load_model(
                 checkpoint = torch.load(args.resume, map_location="cpu")
         model_without_ddp.load_state_dict(checkpoint["model"])
         print("Resume checkpoint %s" % args.resume)
+        if path is not None:
+            path_state = checkpoint.get("path")
+            if path_state is not None:
+                path.load_state_dict(path_state)
+            else:
+                legacy_state = checkpoint.get("extra_modules", {}).get("metric_learnable_lut") if "extra_modules" in checkpoint else None
+                if legacy_state is not None and hasattr(path, "learnable_lut") and getattr(path, "learnable_lut", None) is not None:
+                    lut_module = path.learnable_lut
+                    converted_state = {
+                        (key.replace("param.", "_geometry.") if key.startswith("param.") else key): value
+                        for key, value in legacy_state.items()
+                    }
+                    try:
+                        lut_module.load_state_dict(converted_state, strict=False)
+                        print("Loaded legacy learnable_lut state from checkpoint['extra_modules'].")
+                    except Exception as exc:
+                        print(f"Warning: failed to load legacy learnable_lut state ({exc}).")
         if extra_modules and "extra_modules" in checkpoint:
             for name, module in extra_modules.items():
                 state_dict = checkpoint["extra_modules"].get(name)

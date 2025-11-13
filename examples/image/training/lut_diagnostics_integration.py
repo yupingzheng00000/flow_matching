@@ -80,6 +80,14 @@ def _estimate_histogram_from_probe(probe_batch: Tensor, vocab_size: int) -> Tens
     return torch.stack(histograms, dim=0)
 
 
+def _get_lut_tensor(lut: nn.Module) -> Tensor:
+    """Return the underlying LUT tensor, falling back to forward() for parametric modes."""
+    weight_param = getattr(lut, "weight", None)
+    if isinstance(weight_param, torch.Tensor):
+        return weight_param
+    return lut()
+
+
 def create_probe_batch(
     dataset,
     num_samples: int = 128,
@@ -131,7 +139,7 @@ def _save_detailed_quantile_plots(
     if path.learnable_lut is None:
         return
 
-    lut_weight = path.learnable_lut.weight.detach().cpu()
+    lut_weight = _get_lut_tensor(path.learnable_lut).detach().cpu()
     vocab_size = path.learnable_lut.vocab_size
     hist = _estimate_histogram_from_probe(probe_batch, vocab_size)
 
@@ -193,7 +201,7 @@ def log_lut_diagnostics_epoch(
     metric_name = getattr(path, "metric_name", "lp")
 
     # Get current LUT weights
-    lut_weights_raw = path.learnable_lut.weight.detach()
+    lut_weights_raw = _get_lut_tensor(path.learnable_lut).detach()
     lut_weights = _scalarize_lut_embeddings(lut_weights_raw, metric=metric_name, scalar_mode=scalar_mode)
     
     # Extract gradient and LR (if optimizer available)
@@ -205,14 +213,16 @@ def log_lut_diagnostics_epoch(
             if param_group.get("name") == "learnable_lut":
                 lr = param_group["lr"]
                 # Get gradient from parameter
-                if path.learnable_lut.weight.grad is not None:
+                weight_param = getattr(path.learnable_lut, "weight", None)
+                if isinstance(weight_param, torch.Tensor) and weight_param.grad is not None:
                     grad = _scalarize_lut_embeddings(
-                        path.learnable_lut.weight.grad.detach(), metric=metric_name, scalar_mode=scalar_mode
+                        weight_param.grad.detach(), metric=metric_name, scalar_mode=scalar_mode
                     )
                 break
-    if grad is None and path.learnable_lut.weight.grad is not None:
+    weight_param = getattr(path.learnable_lut, "weight", None)
+    if grad is None and isinstance(weight_param, torch.Tensor) and weight_param.grad is not None:
         grad = _scalarize_lut_embeddings(
-            path.learnable_lut.weight.grad.detach(), metric=metric_name, scalar_mode=scalar_mode
+            weight_param.grad.detach(), metric=metric_name, scalar_mode=scalar_mode
         )
     
     # Beta function for path quality metrics
@@ -291,7 +301,11 @@ def save_lut_snapshot(
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     
     # Save current LUT
-    lut_weights = path.learnable_lut.weight.detach().cpu()
+    weight_param = getattr(path.learnable_lut, "weight", None)
+    if isinstance(weight_param, torch.Tensor):
+        lut_weights = weight_param.detach().cpu()
+    else:
+        lut_weights = path.learnable_lut().detach().cpu()
     torch.save({
         "epoch": epoch,
         "lut_weights": lut_weights,
@@ -302,7 +316,7 @@ def save_lut_snapshot(
     
     # Save init/baseline (once)
     if save_init:
-        init_weights = path.learnable_lut._linear_init().cpu()
+        init_weights = path.learnable_lut.baseline_weight().cpu()
         torch.save({
             "epoch": -1,
             "lut_weights": init_weights,
@@ -345,7 +359,7 @@ def setup_lut_diagnostics(
     )
     
     # Register baseline (linear init)
-    baseline_lut = path.learnable_lut._linear_init().to(device)
+    baseline_lut = path.learnable_lut.baseline_weight().to(device)
     diagnostics.register_baseline(baseline_lut)
     
     # Create fixed probe batch

@@ -55,17 +55,55 @@ def _linear_lut_baseline(
     return base
 
 
-class LearnableScalarLUT(nn.Module):
-    """Per-channel learnable embedding lookup table.
+def _line2d_baseline(
+    *,
+    num_channels: int,
+    vocab_size: int,
+    embed_dim: int,
+    embed_range: str,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> Tensor:
+    """Baseline used to warm start 1D monotone line parameterizations."""
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    linspace_kwargs = {"dtype": dtype}
+    if device is not None:
+        linspace_kwargs["device"] = device
+    if embed_range == "pm1":
+        linear = torch.linspace(-1.0, 1.0, steps=vocab_size, **linspace_kwargs)
+    else:
+        linear = torch.linspace(0.0, 1.0, steps=vocab_size, **linspace_kwargs)
+    base = torch.zeros(num_channels, vocab_size, embed_dim, dtype=dtype, device=device)
+    base[:, :, 0] = linear
+    return base
 
-    This module stores C independent embedding lookup tables, each with vocab_size
-    entries of dimension emb_dim. It is designed for the metric-induced probability
-    path where the distance is defined by Lp norm between embeddings.
-    
-    Shape: weight [num_channels, vocab_size, emb_dim]
-    - When emb_dim=1: behaves as scalar LUT (backward compatible)
-    - When emb_dim>1: uses vector embeddings with Lp distance
-    """
+
+def _arc2d_baseline(
+    *,
+    num_channels: int,
+    vocab_size: int,
+    embed_dim: int,
+    radius: float,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> Tensor:
+    """Baseline used to warm start arc parameterizations."""
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    linspace_kwargs = {"dtype": dtype}
+    if device is not None:
+        linspace_kwargs["device"] = device
+    base = torch.zeros(num_channels, vocab_size, embed_dim, dtype=dtype, device=device)
+    theta = torch.linspace(0.0, math.pi, steps=vocab_size, **linspace_kwargs)
+    base[:, :, 0] = torch.cos(theta) * radius
+    if embed_dim > 1:
+        base[:, :, 1] = torch.sin(theta) * radius
+    return base
+
+
+class LearnableLUT(nn.Module):
+    """Unified learnable LUT supporting free, line, and arc parameterizations."""
 
     def __init__(
         self,
@@ -74,223 +112,278 @@ class LearnableScalarLUT(nn.Module):
         vocab_size: int,
         emb_dim: int = 1,
         embed_range: str,
+        param_mode: str = "none",
+        monotone_mode: str = "softplus",
+        arc_radius: float = 1.0,
         device: Optional[torch.device],
         dtype: torch.dtype,
-        lp_order: float = 1.0,
+        init_method: str = "linear",
+        init_noise_scale: float = 0.01,
         renormalize_to_init_norm: bool = False,
         renorm_eps: float = 1e-12,
         bounded_residual_scale: bool = False,
         scale_baseline: float = 1.0,
         scale_epsilon: float = 0.25,
-        init_method: str = "linear",
-        init_noise_scale: float = 0.01,
     ) -> None:
         super().__init__()
         if num_channels <= 0:
-          raise ValueError("num_channels must be positive")
+            raise ValueError("num_channels must be positive")
         if vocab_size <= 0:
-          raise ValueError("vocab_size must be positive")
+            raise ValueError("vocab_size must be positive")
         if emb_dim <= 0:
-          raise ValueError("emb_dim must be positive")
+            raise ValueError("emb_dim must be positive")
         if embed_range not in {"pm1", "unit"}:
-          raise ValueError("embed_range must be 'pm1' or 'unit'")
+            raise ValueError("embed_range must be 'pm1' or 'unit'")
+
+        mode_normalized = (param_mode or "none").lower()
+        if mode_normalized in {"none", "free"}:
+            resolved_mode = "none"
+        elif mode_normalized in {"line", "line2d"}:
+            resolved_mode = "line2d"
+        elif mode_normalized in {"arc", "arc2d"}:
+            resolved_mode = "arc2d"
+        else:
+            raise ValueError(f"Unknown param_mode '{param_mode}'")
+
+        if resolved_mode == "arc2d" and emb_dim < 2:
+            raise ValueError("param_mode='arc2d' requires emb_dim >= 2")
+
+        if monotone_mode != "softplus" and resolved_mode != "none":
+            raise ValueError(f"Unsupported monotone_mode '{monotone_mode}' for param_mode '{resolved_mode}'")
 
         self.num_channels = int(num_channels)
         self.vocab_size = int(vocab_size)
         self.emb_dim = int(emb_dim)
         self.embed_range = embed_range
-        self.lp_order = float(lp_order)
-
-        # Set initialization parameters before calling _init_weight
-        self.init_method = str(init_method)
-        self.init_noise_scale = float(init_noise_scale)
-        if self.init_method == "small_noise_qr" and self.emb_dim > self.vocab_size:
-            raise ValueError(
-                "small_noise_qr initialization requires emb_dim <= vocab_size "
-                f"(got emb_dim={self.emb_dim}, vocab_size={self.vocab_size})"
-            )
-
-        weight = self._init_weight()
-        if device is not None:
-            weight = weight.to(device=device)
-        weight = weight.to(dtype=dtype)
-        self.weight = nn.Parameter(weight)
-        
-        # Compute base norm (without noise) PER CHANNEL for renormalization target
-        # Shape: [num_channels] - each channel has its own target norm
-        base_weight = self._linear_init_base()
-        if device is not None:
-            base_weight = base_weight.to(device=device)
-        base_weight = base_weight.to(dtype=dtype)
-        # Compute norm per channel: norm over dims (vocab_size, emb_dim)
-        base_norm_per_channel = torch.linalg.vector_norm(base_weight, dim=(1, 2))  # [num_channels]
-        self.register_buffer("_base_fro_norm_per_channel", base_norm_per_channel, persistent=False)
-        
+        self.param_mode = resolved_mode
+        self.monotone_mode = monotone_mode
+        self.arc_radius = float(arc_radius)
         self.renormalize_to_init_norm = bool(renormalize_to_init_norm)
         self.renorm_eps = float(renorm_eps)
-        
-        # Bounded residual scale parameterization
         self.bounded_residual_scale = bool(bounded_residual_scale)
-        self.scale_baseline = float(scale_baseline)  # s_0
-        self.scale_epsilon = float(scale_epsilon)    # ε
-        
+        self.scale_baseline = float(scale_baseline)
+        self.scale_epsilon = float(scale_epsilon)
+        self.init_method = str(init_method)
+        self.init_noise_scale = float(init_noise_scale)
+
+        if self.param_mode != "none" and self.init_method == "small_noise_qr":
+            raise ValueError("small_noise_qr initialization is only supported when param_mode='none'")
+
+        self.register_buffer("_base_fro_norm_per_channel", torch.empty(self.num_channels), persistent=False)
         if self.bounded_residual_scale:
-            # Learnable scale parameter c per channel: [num_channels]
-            # Initialized to 0 (tanh(0) = 0, so s = s_0 initially)
-            self.scale_c = nn.Parameter(torch.zeros(num_channels, dtype=dtype))
+            self.scale_c = nn.Parameter(torch.zeros(self.num_channels))
         else:
-            self.scale_c = None
+            self.register_parameter("scale_c", None)
 
-    def _init_weight(self) -> Tensor:
-        """Initialize LUT weights using the selected initialization method."""
+        self._geometry: Optional[nn.Module] = None
+        if self.param_mode == "none":
+            weight = self._init_weight_free(device=device, dtype=dtype)
+            self.weight = nn.Parameter(weight)
+        else:
+            self.register_parameter("weight", None)
+            if self.param_mode == "line2d":
+                self._geometry = _Line2DLUTParam(
+                    num_channels=self.num_channels,
+                    vocab_size=self.vocab_size,
+                    embed_dim=self.emb_dim,
+                    monotone_mode=self.monotone_mode,
+                )
+            else:
+                self._geometry = _Arc2DLUTParam(
+                    num_channels=self.num_channels,
+                    vocab_size=self.vocab_size,
+                    embed_dim=self.emb_dim,
+                    monotone_mode=self.monotone_mode,
+                    radius=self.arc_radius,
+                )
+            assert self._geometry is not None
+            baseline = self._mode_baseline(dtype=torch.get_default_dtype(), device=None)
+            geometry_param = next(self._geometry.parameters())
+            self._geometry.initialize_from_weight(baseline.to(dtype=geometry_param.dtype, device=geometry_param.device))
+
+        if device is not None or dtype is not None:
+            self.to(device=device, dtype=dtype)
+
+        self._refresh_base_norm()
+        if self.bounded_residual_scale and self.scale_c is not None:
+            self.scale_c.zero_()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _mode_baseline(self, *, dtype: torch.dtype, device: Optional[torch.device]) -> Tensor:
+        if self.param_mode == "none" or self.param_mode == "line2d":
+            if self.param_mode == "none":
+                return _linear_lut_baseline(
+                    num_channels=self.num_channels,
+                    vocab_size=self.vocab_size,
+                    emb_dim=self.emb_dim,
+                    embed_range=self.embed_range,
+                    dtype=dtype,
+                    device=device,
+                )
+            return _line2d_baseline(
+                num_channels=self.num_channels,
+                vocab_size=self.vocab_size,
+                embed_dim=self.emb_dim,
+                embed_range=self.embed_range,
+                dtype=dtype,
+                device=device,
+            )
+        return _arc2d_baseline(
+            num_channels=self.num_channels,
+            vocab_size=self.vocab_size,
+            embed_dim=self.emb_dim,
+            radius=self.arc_radius,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _init_weight_free(self, *, device: Optional[torch.device], dtype: torch.dtype) -> Tensor:
         if self.init_method == "linear":
-            return self._linear_init()
-        elif self.init_method == "small_noise_qr":
-            return self._small_noise_qr_init()
-        else:
-            raise ValueError(f"Unknown init_method: {self.init_method}")
+            return self._linear_init_free(device=device, dtype=dtype)
+        if self.init_method == "small_noise_qr":
+            return self._small_noise_qr_init_free(device=device, dtype=dtype)
+        raise ValueError(f"Unknown init_method '{self.init_method}' for LearnableLUT")
 
-    def _linear_init(self) -> Tensor:
-        """Initialize LUT with linearly spaced values along each dimension.
-
-        Returns:
-            Tensor of shape [num_channels, vocab_size, emb_dim]
-        """
+    def _linear_init_free(self, *, device: Optional[torch.device], dtype: torch.dtype) -> Tensor:
         weight = _linear_lut_baseline(
             num_channels=self.num_channels,
             vocab_size=self.vocab_size,
             emb_dim=self.emb_dim,
             embed_range=self.embed_range,
+            dtype=dtype,
+            device=device,
         )
         noise = torch.randn_like(weight) * 1e-3
-        return weight + noise
+        return noise
 
-    def _linear_init_base(self) -> Tensor:
-        """Baseline (noise-free) linear LUT initialization."""
-        return _linear_lut_baseline(
-            num_channels=self.num_channels,
-            vocab_size=self.vocab_size,
-            emb_dim=self.emb_dim,
-            embed_range=self.embed_range,
-        )
+    def _small_noise_qr_init_free(self, *, device: Optional[torch.device], dtype: torch.dtype) -> Tensor:
+        if self.emb_dim > self.vocab_size:
+            raise ValueError(
+                "small_noise_qr initialization requires emb_dim <= vocab_size "
+                f"(got emb_dim={self.emb_dim}, vocab_size={self.vocab_size})"
+            )
 
-    def _small_noise_qr_init(self) -> Tensor:
-        """Initialize LUT with small noise QR decomposition for orthogonal warm start.
-        
-        This method provides an orthogonal initialization that balances:
-        - Orthogonality: QR decomposition ensures dimension-wise independence
-        - Warm start: Small noise prevents exact orthogonality for gradient flow
-        - Stability: Maintains consistent norms across channels and dimensions
-        
-        Returns:
-            Tensor of shape [num_channels, vocab_size, emb_dim]
-        """
-        # Step 1: Compute baseline unit vector (linear spacing normalized)
         if self.embed_range == "pm1":
-            base_values = torch.linspace(-1.0, 1.0, steps=self.vocab_size)
+            base_values = torch.linspace(-1.0, 1.0, steps=self.vocab_size, device=device, dtype=dtype)
         else:
-            base_values = torch.linspace(0.0, 1.0, steps=self.vocab_size)
-        
-        # Normalize to unit vector for each dimension
+            base_values = torch.linspace(0.0, 1.0, steps=self.vocab_size, device=device, dtype=dtype)
         base_unit = base_values / torch.linalg.vector_norm(base_values, ord=2)
-        
-        # Step 2: Build matrix A with small noise for QR decomposition
-        # A will be [vocab_size, emb_dim] - we want orthogonal columns
-        A = torch.zeros(self.vocab_size, self.emb_dim)
-        
-        # First column: baseline unit vector
+
+        A = torch.zeros(self.vocab_size, self.emb_dim, device=device, dtype=dtype)
         A[:, 0] = base_unit
-        
-        # Remaining columns: add small noise to break symmetry
         if self.emb_dim > 1:
-            # Generate small orthogonal noise
             noise_scale = self.init_noise_scale
-            for d in range(1, self.emb_dim):
-                # Start with small random perturbation of the baseline
-                noise = torch.randn(self.vocab_size) * noise_scale
-                A[:, d] = base_unit + noise
-        
-        # Step 3: Apply QR decomposition for orthogonality
+            for d_index in range(1, self.emb_dim):
+                noise = torch.randn(self.vocab_size, device=device, dtype=dtype) * noise_scale
+                A[:, d_index] = base_unit + noise
+
         Q, _ = torch.linalg.qr(A)
-        
-        # Step 4: Scale to target norm (same as linear init for consistency)
-        # Target norm should match the linear initialization norm
         target_norm = torch.linalg.vector_norm(base_values, ord=2)
-        current_norm = torch.linalg.vector_norm(Q, dim=0)  # norm per column
+        current_norm = torch.linalg.vector_norm(Q, dim=0)
         scale_factors = target_norm / (current_norm + 1e-8)
-        Q_scaled = Q * scale_factors.unsqueeze(0)  # broadcast to [vocab_size, emb_dim]
-        
-        # Step 5: Replicate across channels (with small channel-wise noise)
-        weight = torch.zeros(self.num_channels, self.vocab_size, self.emb_dim)
-        for c in range(self.num_channels):
-            if c == 0:
-                # First channel: use the QR result directly
-                weight[c] = Q_scaled
+        Q_scaled = Q * scale_factors.unsqueeze(0)
+
+        weight = torch.zeros(self.num_channels, self.vocab_size, self.emb_dim, device=device, dtype=dtype)
+        for channel in range(self.num_channels):
+            if channel == 0:
+                weight[channel] = Q_scaled
             else:
-                # Other channels: add small channel-specific noise
-                channel_noise = torch.randn_like(Q_scaled) * (noise_scale * 0.1)
-                weight[c] = Q_scaled + channel_noise
-        
+                channel_noise = torch.randn_like(Q_scaled) * (self.init_noise_scale * 0.1)
+                weight[channel] = Q_scaled + channel_noise
         return weight
+
+    def _infer_buffer_dtype_device(self) -> tuple[torch.dtype, torch.device]:
+        if self.param_mode == "none":
+            sample = self.weight
+        else:
+            assert self._geometry is not None
+            sample = next(self._geometry.parameters())
+        return sample.dtype, sample.device
+
+    def _refresh_base_norm(self) -> None:
+        dtype, device = self._infer_buffer_dtype_device()
+        base_weight = self._mode_baseline(dtype=dtype, device=device)
+        base_norm = torch.linalg.vector_norm(base_weight, dim=(1, 2))
+        self._base_fro_norm_per_channel.data.copy_(base_norm)
+        if self.bounded_residual_scale and self.scale_c is not None:
+            if self.scale_c.device != device or self.scale_c.dtype != dtype:
+                self.scale_c.data = self.scale_c.data.to(device=device, dtype=dtype)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def forward(self) -> Tensor:
+        if self.param_mode == "none":
+            weight = self.weight
+        else:
+            assert self._geometry is not None
+            weight = self._geometry()
+
+        if self.bounded_residual_scale and self.scale_c is not None:
+            scale = self.scale_baseline * (1.0 + self.scale_epsilon * torch.tanh(self.scale_c))
+            weight = weight * scale.view(-1, 1, 1)
+
+        if not self.renormalize_to_init_norm:
+            return weight
+
+        target = self._base_fro_norm_per_channel.to(device=weight.device, dtype=weight.dtype)
+        current = torch.linalg.vector_norm(weight, dim=(1, 2))
+        scale = target / (current + self.renorm_eps)
+        return weight * scale.view(-1, 1, 1)
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
-        init_weight = self._init_weight().to(device=self.weight.device, dtype=self.weight.dtype)
-        self.weight.copy_(init_weight)
-        
-        # Recompute base norm per channel (without noise)
-        base_weight = self._linear_init_base().to(device=self.weight.device, dtype=self.weight.dtype)
-        base_norm_per_channel = torch.linalg.vector_norm(base_weight, dim=(1, 2))  # [num_channels]
-        self._base_fro_norm_per_channel.copy_(base_norm_per_channel)
-        
-        # Reset scale parameter c to 0 if using bounded residual
+        if self.param_mode == "none":
+            weight = self._init_weight_free(device=self.weight.device, dtype=self.weight.dtype)
+            self.weight.copy_(weight)
+        else:
+            assert self._geometry is not None
+            geometry_param = next(self._geometry.parameters())
+            baseline = self._mode_baseline(dtype=geometry_param.dtype, device=geometry_param.device)
+            self._geometry.initialize_from_weight(baseline)
+
         if self.bounded_residual_scale and self.scale_c is not None:
             self.scale_c.zero_()
+        self._refresh_base_norm()
 
-    def forward(self) -> Tensor:
-        """Return LUT weights, optionally renormalized to base norm PER CHANNEL.
-        
-        When renormalize_to_init_norm=True:
-            - Renormalizes EACH channel independently to match its base (no-noise) norm
-            - Each channel maintains its own geometry (single-channel norm ≈ 9.27)
-            - Preserves gradients (scaling is differentiable)
-            - Keeps noise injection benefits while maintaining consistent geometry
-        
-        When bounded_residual_scale=True:
-            - Uses bounded residual parameterization: s = s_0 * (1 + ε * tanh(c))
-            - c is learnable per channel, L2 penalty keeps it near 0
-            - s_0 is baseline scale, ε controls maximum deviation
-            - Trust region approach prevents extreme scale changes
-        
-        Returns:
-            Tensor of shape [num_channels, vocab_size, emb_dim]
-        """
-        if self.bounded_residual_scale and self.scale_c is not None:
-            # Bounded residual scale: s = s_0 * (1 + ε * tanh(c))
-            # c is per-channel learnable parameter initialized to 0
-            scale = self.scale_baseline * (1.0 + self.scale_epsilon * torch.tanh(self.scale_c))
-            # Apply per-channel scaling: scale.view(C, 1, 1) * weight[C, V, D]
-            return self.weight * scale.view(-1, 1, 1)
-        
-        if not self.renormalize_to_init_norm:
-            return self.weight
-        
-        # Renormalize each channel independently to its base norm
-        # target: [num_channels] - target norm for each channel
-        # current: [num_channels] - current norm for each channel
-        target = self._base_fro_norm_per_channel.to(device=self.weight.device, dtype=self.weight.dtype)
-        current = torch.linalg.vector_norm(self.weight, dim=(1, 2))  # [num_channels]
-        scale = target / (current + self.renorm_eps)  # [num_channels]
-        
-        # Apply per-channel scaling: scale.view(C, 1, 1) * weight[C, V, D]
-        # Broadcasting: [C, 1, 1] * [C, V, D] -> [C, V, D]
-        return self.weight * scale.view(-1, 1, 1)
+    def initialize_from_weight(self, weight: Tensor) -> None:
+        if weight.shape != (self.num_channels, self.vocab_size, self.emb_dim):
+            raise ValueError(
+                f"weight must have shape ({self.num_channels}, {self.vocab_size}, {self.emb_dim}) "
+                f"(got {tuple(weight.shape)})"
+            )
+        if self.param_mode == "none":
+            if not torch.is_floating_point(weight):
+                raise TypeError("weight tensor must be floating point")
+            with torch.no_grad():
+                self.weight.copy_(weight.to(device=self.weight.device, dtype=self.weight.dtype))
+        else:
+            assert self._geometry is not None
+            geometry_param = next(self._geometry.parameters())
+            self._geometry.initialize_from_weight(weight.to(device=geometry_param.device, dtype=geometry_param.dtype))
+        self._refresh_base_norm()
+
+    def baseline_weight(
+        self,
+        *,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> Tensor:
+        """Return the deterministic baseline LUT used for renormalization."""
+        target_dtype, target_device = self._infer_buffer_dtype_device()
+        if dtype is None:
+            dtype = target_dtype
+        if device is None:
+            device = target_device
+        return self._mode_baseline(dtype=dtype, device=device)
 
     def extra_repr(self) -> str:
         return (
-            f"num_channels={self.num_channels}, vocab_size={self.vocab_size}, "
-            f"emb_dim={self.emb_dim}, embed_range='{self.embed_range}', "
-            f"lp_order={self.lp_order}, bounded_residual_scale={self.bounded_residual_scale}, "
+            f"num_channels={self.num_channels}, vocab_size={self.vocab_size}, emb_dim={self.emb_dim}, "
+            f"embed_range='{self.embed_range}', param_mode='{self.param_mode}', "
+            f"bounded_residual_scale={self.bounded_residual_scale}, renormalize_to_init_norm={self.renormalize_to_init_norm}, "
             f"init_method='{self.init_method}', init_noise_scale={self.init_noise_scale}"
         )
 
@@ -506,150 +599,6 @@ class _Arc2DLUTParam(nn.Module):
             self.delta_raw.data[c] = _inv_softplus_tensor(target)
 
 
-class LearnableParametricLUT(nn.Module):
-    """Parametric LUT with geometric constraints (line/arc)."""
-
-    def __init__(
-        self,
-        *,
-        num_channels: int,
-        vocab_size: int,
-        embed_dim: int,
-        param_mode: str = "line2d",
-        monotone_mode: str = "softplus",
-        embed_range: str = "pm1",
-        device: Optional[torch.device],
-        dtype: torch.dtype,
-        arc_radius: float = 1.0,
-        renormalize_to_init_norm: bool = False,
-        renorm_eps: float = 1e-12,
-        bounded_residual_scale: bool = False,
-        scale_baseline: float = 1.0,
-        scale_epsilon: float = 0.25,
-    ) -> None:
-        super().__init__()
-        if embed_range not in {"pm1", "unit"}:
-            raise ValueError("embed_range must be 'pm1' or 'unit'")
-        self.param_mode = param_mode
-        self.embed_range = embed_range
-        self.num_channels = int(num_channels)
-        self.vocab_size = int(vocab_size)
-        self.emb_dim = int(embed_dim)
-        self.renormalize_to_init_norm = bool(renormalize_to_init_norm)
-        self.renorm_eps = float(renorm_eps)
-        self.bounded_residual_scale = bool(bounded_residual_scale)
-        self.scale_baseline = float(scale_baseline)
-        self.scale_epsilon = float(scale_epsilon)
-
-        if param_mode == "line2d":
-            self.param = _Line2DLUTParam(
-                num_channels=num_channels,
-                vocab_size=vocab_size,
-                embed_dim=embed_dim,
-                monotone_mode=monotone_mode,
-            )
-        elif param_mode == "arc2d":
-            self.param = _Arc2DLUTParam(
-                num_channels=num_channels,
-                vocab_size=vocab_size,
-                embed_dim=embed_dim,
-                monotone_mode=monotone_mode,
-                radius=arc_radius,
-            )
-        else:
-            raise ValueError(f"Unknown param_mode '{param_mode}'")
-
-        baseline_dtype = torch.get_default_dtype()
-        base_weight = (
-            self._default_arc_baseline(
-                num_channels,
-                vocab_size,
-                embed_dim,
-                dtype=baseline_dtype,
-                device=None,
-                radius=arc_radius,
-            )
-            if self.param_mode == "arc2d"
-            else self._default_baseline(
-                num_channels,
-                vocab_size,
-                embed_dim,
-                embed_range,
-                dtype=baseline_dtype,
-                device=None,
-            )
-        )
-        self.initialize_from_weight(base_weight)
-        base_norm = torch.linalg.vector_norm(base_weight, dim=(1, 2))
-        self.register_buffer("_base_fro_norm_per_channel", base_norm, persistent=False)
-
-        if self.bounded_residual_scale:
-            self.scale_c = nn.Parameter(torch.zeros(self.num_channels))
-        else:
-            self.scale_c = None
-
-        if device is not None or dtype is not None:
-            self.to(device=device, dtype=dtype)
-
-    def forward(self) -> Tensor:
-        weight = self.param()
-        if self.bounded_residual_scale and self.scale_c is not None:
-            scale = self.scale_baseline * (1.0 + self.scale_epsilon * torch.tanh(self.scale_c))
-            weight = weight * scale.view(-1, 1, 1)
-        if not self.renormalize_to_init_norm:
-            return weight
-        target = self._base_fro_norm_per_channel.to(device=weight.device, dtype=weight.dtype)
-        current = torch.linalg.vector_norm(weight, dim=(1, 2))
-        scale = target / (current + self.renorm_eps)
-        return weight * scale.view(-1, 1, 1)
-
-    def initialize_from_weight(self, weight: Tensor) -> None:
-        self.param.initialize_from_weight(weight)
-
-    @property
-    def weight(self) -> Tensor:
-        return self.forward()
-
-    @staticmethod
-    def _default_baseline(
-        num_channels: int,
-        vocab_size: int,
-        embed_dim: int,
-        embed_range: str,
-        *,
-        dtype: torch.dtype,
-        device: Optional[torch.device],
-    ) -> Tensor:
-        return _linear_lut_baseline(
-            num_channels=num_channels,
-            vocab_size=vocab_size,
-            emb_dim=embed_dim,
-            embed_range=embed_range,
-            dtype=dtype,
-            device=device,
-        )
-
-    @staticmethod
-    def _default_arc_baseline(
-        num_channels: int,
-        vocab_size: int,
-        embed_dim: int,
-        *,
-        dtype: torch.dtype,
-        device: Optional[torch.device],
-        radius: float = 1.0,
-    ) -> Tensor:
-        if dtype is None:
-            dtype = torch.get_default_dtype()
-        linspace_kwargs = {"dtype": dtype}
-        if device is not None:
-            linspace_kwargs["device"] = device
-        base = torch.zeros(num_channels, vocab_size, embed_dim, dtype=dtype, device=device)
-        theta = torch.linspace(0.0, math.pi, steps=vocab_size, **linspace_kwargs)
-        base[:, :, 0] = torch.cos(theta) * radius
-        if embed_dim > 1:
-            base[:, :, 1] = torch.sin(theta) * radius
-        return base
 class MahalanobisTokenMetric(nn.Module):
     """Learnable PSD metric with unit-Frobenius retraction constraint.
     
@@ -1047,10 +996,19 @@ class MetricInducedGibbsProbPath(ProbPath):
         self._use_normalized_distance = bool(use_normalized_distance)
         # Optional cosine metric scale (applied to 1-cos distance)
         self._lut_cosine_scale: float = float(lut_cosine_scale)
-        lut_param_mode = lut_param_mode or None
-        if lut_param_mode is not None and lut_param_mode.lower() in {"none", "free"}:
-            lut_param_mode = None
-        self._lut_param_mode = lut_param_mode
+        if lut_param_mode is None:
+            resolved_param_mode = "none"
+        else:
+            mode_lower = lut_param_mode.lower()
+            if mode_lower in {"none", "free"}:
+                resolved_param_mode = "none"
+            elif mode_lower in {"line", "line2d"}:
+                resolved_param_mode = "line2d"
+            elif mode_lower in {"arc", "arc2d"}:
+                resolved_param_mode = "arc2d"
+            else:
+                raise ValueError(f"Unknown LUT param_mode '{lut_param_mode}'")
+        self._lut_param_mode = resolved_param_mode
         self._lut_monotone_mode = str(lut_monotone_mode)
         self._lut_arc_radius = float(lut_arc_radius)
 
@@ -1067,42 +1025,28 @@ class MetricInducedGibbsProbPath(ProbPath):
                     self._lut_cosine_scale,
                 )
             num_channels = 1 if self._lut_share_across_channels else self._lut_num_channels
-            if self._lut_param_mode is not None:
-                lut_module = LearnableParametricLUT(
-                    num_channels=num_channels,
-                    vocab_size=vocab_size,
-                    embed_dim=int(lut_emb_dim),
-                    param_mode=self._lut_param_mode,
-                    monotone_mode=self._lut_monotone_mode,
-                    embed_range="pm1" if embed_range == "pm1" else "unit",
-                    device=device,
-                    dtype=dtype,
-                    arc_radius=self._lut_arc_radius,
-                    renormalize_to_init_norm=self._lut_renorm_to_init_norm,
-                    bounded_residual_scale=self._lut_bounded_residual_scale,
-                    scale_baseline=self._lut_scale_baseline,
-                    scale_epsilon=self._lut_scale_epsilon,
-                )
-            else:
-                lut_module = LearnableScalarLUT(
-                    num_channels=num_channels,
-                    vocab_size=vocab_size,
-                    emb_dim=int(lut_emb_dim),
-                    embed_range="pm1" if embed_range == "pm1" else "unit",
-                    device=device,
-                    dtype=dtype,
-                    lp_order=float(lp_order),
-                    renormalize_to_init_norm=self._lut_renorm_to_init_norm,
-                    bounded_residual_scale=self._lut_bounded_residual_scale,
-                    scale_baseline=self._lut_scale_baseline,
-                    scale_epsilon=self._lut_scale_epsilon,
-                    init_method=self._lut_init_method,
-                    init_noise_scale=self._lut_init_noise_scale,
-                )
-            if device is not None:
-                lut_module = lut_module.to(device=device, dtype=dtype)
-            else:
-                lut_module = lut_module.to(dtype=dtype)
+            lut_param_mode = self._lut_param_mode
+            if metric == "cosine" and lut_param_mode != "none":
+                logger.warning("Cosine metric requires param_mode='none'; overriding to free LUT.")
+                lut_param_mode = "none"
+            self._lut_param_mode = lut_param_mode
+            lut_module = LearnableLUT(
+                num_channels=num_channels,
+                vocab_size=vocab_size,
+                emb_dim=int(lut_emb_dim),
+                embed_range="pm1" if embed_range == "pm1" else "unit",
+                param_mode=lut_param_mode,
+                monotone_mode=self._lut_monotone_mode,
+                arc_radius=self._lut_arc_radius,
+                device=device,
+                dtype=dtype,
+                init_method=self._lut_init_method,
+                init_noise_scale=self._lut_init_noise_scale,
+                renormalize_to_init_norm=self._lut_renorm_to_init_norm,
+                bounded_residual_scale=self._lut_bounded_residual_scale,
+                scale_baseline=self._lut_scale_baseline,
+                scale_epsilon=self._lut_scale_epsilon,
+            )
             self.learnable_lut = lut_module
 
         if learnable_metric_dim > 0:

@@ -4,11 +4,12 @@
 # This source code is licensed under the CC-by-NC license found in the
 # LICENSE file in the root directory of this source tree.
 import argparse
+import contextlib
 import gc
 import logging
 import math
 from collections import deque, defaultdict
-from typing import Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -93,103 +94,490 @@ def _ks_uniform_metric(values: torch.Tensor) -> float:
 
 
 def _compute_lut_regularizer_and_metrics(
-    path: ProbPath,
+    path,
     device: torch.device,
     reg_align: float,
     reg_step: float,
     reg_curv: float,
     compute_metrics: bool,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compute regularization penalty and diagnostic metrics for learnable LUTs.
+
+    For emb_dim=1 (scalar embeddings):
+        - Uses original scalar-based constraints (monotonicity, smoothness, curvature)
+
+    For emb_dim>1 (vector embeddings):
+        - Direction continuity: penalizes step vectors that reverse direction (zig-zag)
+        - Step length smoothness: penalizes abrupt changes in step magnitudes
+        - Norm monotonicity: ensures pixel values map to increasing distances from origin
+
+    Args:
+        path: ProbPath containing learnable_lut attribute
+        device: Device for computation
+        reg_align: Weight for monotonicity/direction continuity constraint
+        reg_step: Weight for step smoothness constraint
+        reg_curv: Weight for curvature/norm monotonicity constraint
+        compute_metrics: Whether to compute diagnostic metrics
+
+    Returns:
+        (penalty, metrics): Total regularization loss and diagnostic dict
+    """
     lut = getattr(path, "learnable_lut", None)
     if lut is None:
         return torch.tensor(0.0, device=device), {}
-    weight = lut.weight if hasattr(lut, "weight") else lut()
+
+    # Extract LUT weight tensor [C, V, D] where:
+    # C = num_channels, V = vocab_size, D = emb_dim
+    weight: Optional[torch.Tensor] = None
+    if callable(lut):
+        weight = lut()
+    if weight is None and hasattr(lut, "weight"):
+        weight = lut.weight
     if weight is None:
         return torch.tensor(0.0, device=device), {}
+
     weight = weight.to(device=device)
     if weight.size(1) < 2:
         return torch.tensor(0.0, device=device), {}
+
     dtype = weight.dtype
-    normed = F.normalize(weight, dim=-1, eps=1e-12)
+    emb_dim = weight.size(-1)
 
-    align_term = (1.0 - (normed[:, :-1, :] * normed[:, 1:, :]).sum(dim=-1)).mean()
+    # ========================================================================
+    # Branch 1: emb_dim == 1 (Scalar embeddings)
+    # Preserve original behavior for backward compatibility
+    # ========================================================================
+    if emb_dim == 1:
+        # Scalar values: [C, V]
+        if hasattr(lut, "scalar_trajectories"):
+            values = lut.scalar_trajectories(weight)
+        else:
+            values = weight.squeeze(-1)
+        values = values.to(device=device)
 
-    diff = normed[:, 1:, :] - normed[:, :-1, :]
-    if diff.size(1) >= 2:
-        diff_prev = diff[:, :-1, :]
-        diff_next = diff[:, 1:, :]
-        denom = diff_prev.norm(dim=-1) * diff_next.norm(dim=-1) + 1e-12
-        cos_steps = (diff_prev * diff_next).sum(dim=-1) / denom
-        step_term = torch.clamp(-cos_steps, min=0.0).mean()
+        # Monotonicity: penalize negative slopes
+        first_diff = values[:, 1:] - values[:, :-1]  # [C, V-1]
+        align_term = torch.clamp(-first_diff, min=0.0).mean()
+
+        # Step smoothness: penalize direction reversals in (1, Δ) tangent space
+        if first_diff.size(1) >= 2:
+            tangent = torch.stack([
+                torch.ones_like(first_diff),
+                first_diff,
+            ], dim=-1)  # [C, V-1, 2]
+            tangent_norm = F.normalize(tangent, dim=-1, eps=1e-12)
+            tangent_prev = tangent_norm[:, :-1, :]
+            tangent_next = tangent_norm[:, 1:, :]
+            cos_steps = (tangent_prev * tangent_next).sum(dim=-1)
+            step_term = torch.clamp(-cos_steps, min=0.0).mean()
+        else:
+            cos_steps = torch.empty(0, device=device, dtype=dtype)
+            step_term = weight.new_tensor(0.0)
+
+        # Curvature: second-order finite difference
+        if values.size(1) >= 3:
+            curvature_mag = torch.abs(
+                values[:, 2:] - 2 * values[:, 1:-1] + values[:, :-2]
+            )
+            curvature_term = curvature_mag.mean()
+        else:
+            curvature_mag = torch.empty(0, device=device, dtype=dtype)
+            curvature_term = weight.new_tensor(0.0)
+
+        penalty = (
+            reg_align * align_term
+            + reg_step * step_term
+            + reg_curv * curvature_term
+        )
+
+        # Metrics for scalar case
+        metrics: Dict[str, float] = {}
+        if compute_metrics:
+            if cos_steps.numel() > 0:
+                clamped_cos = torch.clamp(cos_steps, -1.0 + 1e-6, 1.0 - 1e-6)
+                angles = torch.acos(clamped_cos)
+                angles_flat = angles.reshape(-1)
+                angle_p50 = float(
+                    torch.quantile(angles_flat, 0.5).detach().cpu() * (180.0 / math.pi)
+                )
+                angle_p90 = float(
+                    torch.quantile(angles_flat, 0.9).detach().cpu() * (180.0 / math.pi)
+                )
+                cos_flat = cos_steps.detach().reshape(-1).float()
+                direction_mean = float(cos_flat.mean().cpu())
+                direction_std = float(cos_flat.std(unbiased=False).cpu())
+                direction_p10 = float(torch.quantile(cos_flat, 0.1).cpu())
+                direction_p90 = float(torch.quantile(cos_flat, 0.9).cpu())
+                flip_rate = float((cos_flat < 0).float().mean().cpu())
+            else:
+                angle_p50 = 0.0
+                angle_p90 = 0.0
+                direction_mean = 0.0
+                direction_std = 0.0
+                direction_p10 = 0.0
+                direction_p90 = 0.0
+                flip_rate = 0.0
+
+            ks = _ks_uniform_metric(values.detach().reshape(-1))
+            metrics = {
+                "lut_align": float(align_term.detach().cpu()),
+                "lut_step": float(step_term.detach().cpu()),
+                "lut_curvature": float(curvature_term.detach().cpu()),
+                "lut_flip_rate": flip_rate,
+                "lut_angle_p50_deg": angle_p50,
+                "lut_angle_p90_deg": angle_p90,
+                "lut_ks_uniform": ks,
+                "lut_step_cos_mean": direction_mean,
+                "lut_step_cos_std": direction_std,
+                "lut_step_cos_p10": direction_p10,
+                "lut_step_cos_p90": direction_p90,
+            }
+
+        return penalty, metrics
+
+    # ========================================================================
+    # Branch 2: emb_dim > 1 (Vector embeddings)
+    # Use euclidean vector geometry constraints
+    # ========================================================================
+
+    # Compute step vectors: [C, V-1, D]
+    steps = weight[:, 1:, :] - weight[:, :-1, :]
+
+    # --- Constraint 1: Direction continuity (prevent zig-zag) ---
+    # Use mild scale normalization: normalize by average step length to avoid
+    # the "tiny step + reversal = no penalty" loophole, while still preserving
+    # magnitude information (unlike full cosine normalization).
+    if steps.size(1) >= 2:
+        step_prev = steps[:, :-1, :]  # [C, V-2, D]
+        step_next = steps[:, 1:, :]   # [C, V-2, D]
+
+        # Raw dot product (unnormalized)
+        dot_product = (step_prev * step_next).sum(dim=-1)  # [C, V-2]
+
+        # Mild normalization: scale by average step magnitude
+        # This balances between:
+        # - Unnormalized (large steps dominate, tiny steps ignored)
+        # - Fully normalized cosine (completely ignores magnitude)
+        avg_len = 0.5 * (step_prev.norm(dim=-1) + step_next.norm(dim=-1)) + 1e-8
+        scaled_dot = dot_product / avg_len  # [C, V-2]
+
+        # Penalize negative scaled dot (direction reversal)
+        direction_penalty = F.relu(-scaled_dot).mean()
     else:
-        cos_steps = torch.empty(0, device=device, dtype=dtype)
-        step_term = weight.new_tensor(0.0)
+        scaled_dot = torch.empty(0, device=device, dtype=dtype)
+        direction_penalty = weight.new_tensor(0.0)
 
-    if weight.size(1) >= 3:
-        curvature_mag = (normed[:, 2:, :] - 2 * normed[:, 1:-1, :] + normed[:, :-2, :]).norm(dim=-1)
-        curvature_term = curvature_mag.mean()
+    # --- Constraint 2: Step length smoothness ---
+    # Penalize abrupt changes in step magnitudes
+    step_lengths = torch.norm(steps, dim=-1)  # [C, V-1]
+    if step_lengths.size(1) >= 2:
+        length_diff = step_lengths[:, 1:] - step_lengths[:, :-1]  # [C, V-2]
+        length_smoothness_penalty = length_diff.abs().mean()
     else:
-        curvature_mag = torch.empty(0, device=device, dtype=dtype)
-        curvature_term = weight.new_tensor(0.0)
+        length_smoothness_penalty = weight.new_tensor(0.0)
 
+    # --- Constraint 3: Norm monotonicity (pixel order preservation) ---
+    # Only apply for euclidean/Lp metrics where radius has geometric meaning.
+    # For cosine metric, radius is arbitrary (only direction matters).
+    metric_name = getattr(path, "metric", "euclidean")
+    if isinstance(metric_name, str) and metric_name.lower() in ["euclidean", "lp"]:
+        # Ensure embeddings move away from origin as pixel value increases
+        norms = torch.norm(weight, dim=-1)  # [C, V]
+        norm_diff = norms[:, 1:] - norms[:, :-1]  # [C, V-1]
+        norm_monotone_penalty = F.relu(-norm_diff).mean()
+    else:
+        # For cosine or other metrics, skip norm constraint
+        norms = torch.empty(0, device=device, dtype=dtype)
+        norm_monotone_penalty = weight.new_tensor(0.0)
+
+    # Total penalty: map hyperparameters to new constraints
+    # reg_align -> direction continuity (most important for preventing zig-zag)
+    # reg_step -> step length smoothness
+    # reg_curv -> norm monotonicity (preserves pixel value ordering)
     penalty = (
-        reg_align * align_term
-        + reg_step * step_term
-        + reg_curv * curvature_term
+        reg_align * direction_penalty
+        + reg_step * length_smoothness_penalty
+        + reg_curv * norm_monotone_penalty
     )
 
-    metrics: dict[str, float] = {}
+    # Diagnostic metrics
+    metrics: Dict[str, float] = {}
     if compute_metrics:
-        angles_cos = torch.clamp(
-            (normed[:, :-1, :] * normed[:, 1:, :]).sum(dim=-1),
-            -1.0 + 1e-6,
-            1.0 - 1e-6,
-        )
-        angles = torch.acos(angles_cos)
-        if angles.numel() > 0:
-            angles_flat = angles.reshape(-1)
-            angle_p50 = float(
-                torch.quantile(angles_flat, 0.5).detach().cpu() * (180.0 / math.pi)
-            )
-            angle_p90 = float(
-                torch.quantile(angles_flat, 0.9).detach().cpu() * (180.0 / math.pi)
-            )
+        # Direction statistics
+        if scaled_dot.numel() > 0:
+            # Normalize to get cosine for interpretable angles
+            step_prev_norm = F.normalize(steps[:, :-1, :], dim=-1, eps=1e-12)
+            step_next_norm = F.normalize(steps[:, 1:, :], dim=-1, eps=1e-12)
+            cos_angle = (step_prev_norm * step_next_norm).sum(dim=-1)  # [C, V-2]
+            cos_flat = cos_angle.detach().reshape(-1).float()
+
+            # Compute angle statistics
+            clamped_cos = cos_flat.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            angles_rad = torch.acos(clamped_cos)
+            angles_deg = angles_rad * (180.0 / math.pi)
+
+            flip_rate = float((cos_flat < 0).float().mean().cpu())
+            cos_mean = float(cos_flat.mean().cpu())
+            cos_std = float(cos_flat.std(unbiased=False).cpu())
+            cos_p10 = float(torch.quantile(cos_flat, 0.1).cpu())
+            cos_p90 = float(torch.quantile(cos_flat, 0.9).cpu())
+            angle_p50 = float(torch.quantile(angles_deg, 0.5).cpu())
+            angle_p90 = float(torch.quantile(angles_deg, 0.9).cpu())
+
+            # Scaled dot statistics (exposes "tiny step + reversal" issues)
+            scaled_dot_flat = scaled_dot.detach().reshape(-1).float()
+            scaled_dot_p10 = float(torch.quantile(scaled_dot_flat, 0.1).cpu())
+            scaled_dot_mean = float(scaled_dot_flat.mean().cpu())
         else:
-            angle_p50 = angle_p90 = 0.0
-        flip_rate = (
-            float((cos_steps < 0).float().mean().detach().cpu())
-            if cos_steps.numel() > 0
-            else 0.0
-        )
-        if cos_steps.numel() > 0:
-            cos_flat = cos_steps.detach().reshape(-1).float()
-            direction_mean = float(cos_flat.mean().cpu())
-            direction_std = float(cos_flat.std(unbiased=False).cpu())
-            direction_p10 = float(torch.quantile(cos_flat, 0.1).cpu())
-            direction_p90 = float(torch.quantile(cos_flat, 0.9).cpu())
+            flip_rate = 0.0
+            cos_mean = 0.0
+            cos_std = 0.0
+            cos_p10 = 0.0
+            cos_p90 = 0.0
+            angle_p50 = 0.0
+            angle_p90 = 0.0
+            scaled_dot_p10 = 0.0
+            scaled_dot_mean = 0.0
+
+        # Step length statistics
+        step_len_mean = float(step_lengths.mean().detach().cpu())
+        step_len_std = float(step_lengths.std(unbiased=False).detach().cpu())
+        step_len_min = float(step_lengths.min().detach().cpu())
+        step_len_max = float(step_lengths.max().detach().cpu())
+
+        # Step length stretch ratio (exposes uneven step distribution)
+        # Ratio relative to mean: values >> 1 indicate "long jump" outliers
+        if step_len_mean > 1e-8:
+            stretch_ratio = step_lengths / (step_lengths.mean(dim=1, keepdim=True) + 1e-8)
+            stretch_p90 = float(torch.quantile(stretch_ratio.detach().reshape(-1), 0.9).cpu())
         else:
-            direction_mean = 0.0
-            direction_std = 0.0
-            direction_p10 = 0.0
-            direction_p90 = 0.0
-        proj_vector = torch.ones(normed.shape[-1], device=device, dtype=normed.dtype)
-        proj_vector = proj_vector / (proj_vector.norm() + 1e-12)
-        proj_vals = torch.matmul(weight, proj_vector)
-        ks = _ks_uniform_metric(proj_vals.reshape(-1))
+            stretch_p90 = 0.0
+
+        # Norm statistics (only if norm constraint is active)
+        if norms.numel() > 0:
+            norm_mean = float(norms.mean().detach().cpu())
+            norm_std = float(norms.std(unbiased=False).detach().cpu())
+            norm_min = float(norms.min().detach().cpu())
+            norm_max = float(norms.max().detach().cpu())
+        else:
+            norm_mean = 0.0
+            norm_std = 0.0
+            norm_min = 0.0
+            norm_max = 0.0
+
         metrics = {
-            "lut_align": float(align_term.detach().cpu()),
-            "lut_step": float(step_term.detach().cpu()),
-            "lut_curvature": float(curvature_term.detach().cpu()),
-            "lut_flip_rate": flip_rate,
-            "lut_angle_p50_deg": angle_p50,
-            "lut_angle_p90_deg": angle_p90,
-            "lut_ks_uniform": ks,
-            "lut_step_cos_mean": direction_mean,
-            "lut_step_cos_std": direction_std,
-            "lut_step_cos_p10": direction_p10,
-            "lut_step_cos_p90": direction_p90,
+            # Penalty components
+            "lut_direction_penalty": float(direction_penalty.detach().cpu()),
+            "lut_length_smooth_penalty": float(length_smoothness_penalty.detach().cpu()),
+            "lut_norm_monotone_penalty": float(norm_monotone_penalty.detach().cpu()),
+
+            # Direction/angle statistics
+            "lut_step_flip_rate": flip_rate,
+            "lut_step_cos_mean": cos_mean,
+            "lut_step_cos_std": cos_std,
+            "lut_step_cos_p10": cos_p10,
+            "lut_step_cos_p90": cos_p90,
+            "lut_step_angle_p50_deg": angle_p50,
+            "lut_step_angle_p90_deg": angle_p90,
+
+            # Scaled dot statistics (mild normalization exposes tiny-step issues)
+            "lut_scaled_dot_p10": scaled_dot_p10,
+            "lut_scaled_dot_mean": scaled_dot_mean,
+
+            # Step length statistics
+            "lut_step_length_mean": step_len_mean,
+            "lut_step_length_std": step_len_std,
+            "lut_step_length_min": step_len_min,
+            "lut_step_length_max": step_len_max,
+            "lut_step_stretch_p90": stretch_p90,  # Exposes uneven step distribution
+
+            # Norm statistics
+            "lut_norm_mean": norm_mean,
+            "lut_norm_std": norm_std,
+            "lut_norm_min": norm_min,
+            "lut_norm_max": norm_max,
         }
+
     return penalty, metrics
+
+
+def _extract_embedding_matrix_for_diagnostics(
+    path: ProbPath,
+) -> Optional[torch.Tensor]:
+    """Return a 2-D embedding matrix [N, D] for collapse diagnostics."""
+
+    metric_module = getattr(path, "learnable_metric", None)
+    if metric_module is not None:
+        try:
+            matrix = metric_module.transformed_codes()
+        except Exception:
+            matrix = getattr(metric_module, "codes", None)
+        if matrix is not None:
+            return matrix.detach().to(device="cpu", dtype=torch.float32)
+
+    lut_module = getattr(path, "learnable_lut", None)
+    if lut_module is not None:
+        weight: Optional[torch.Tensor] = None
+        try:
+            with torch.no_grad():
+                if callable(lut_module):
+                    weight = lut_module()
+                elif hasattr(lut_module, "weight"):
+                    weight = lut_module.weight
+        except Exception:
+            weight = None
+        if weight is not None:
+            weight = weight.detach().to(device="cpu", dtype=torch.float32)
+            flat = weight.reshape(-1, weight.shape[-1])
+            return flat
+
+    return None
+
+
+def _compute_embedding_collapse_metrics(
+    matrix: torch.Tensor,
+    *,
+    abs_eps: float = 1e-6,
+    rel_eps: float = 1e-3,
+    smallest_k: int = 4,
+) -> Dict[str, float]:
+    """Compute variance- and singular-value-based collapse diagnostics."""
+
+    if matrix.ndim != 2 or matrix.shape[1] == 0:
+        return {}
+
+    with torch.no_grad():
+        centered = matrix - matrix.mean(dim=0, keepdim=True)
+        var_dim = centered.var(dim=0, unbiased=False)
+        if var_dim.numel() == 0:
+            return {}
+
+        stats: Dict[str, float] = {}
+        var_sorted, _ = torch.sort(var_dim)
+        var_median = float(torch.median(var_dim).item())
+        stats["train/lut/var_min"] = float(var_sorted[0].item())
+        stats["train/lut/var_p05"] = float(torch.quantile(var_dim, 0.05).item())
+        stats["train/lut/var_median"] = var_median
+
+        collapse_abs = (var_dim < abs_eps).float().mean().item()
+        rel_threshold = max(var_median * rel_eps, abs_eps)
+        collapse_rel = (var_dim < rel_threshold).float().mean().item()
+        stats["train/lut/collapse_frac_abs"] = collapse_abs
+        stats["train/lut/collapse_frac_rel"] = collapse_rel
+
+        top_k = int(min(max(smallest_k, 1), var_sorted.numel()))
+        for idx in range(top_k):
+            stats[f"train/lut/var_smallest_{idx + 1}"] = float(var_sorted[idx].item())
+
+        # Singular values from Gram matrix (size D x D)
+        gram = torch.matmul(centered.transpose(0, 1), centered)
+        eigvals = torch.linalg.eigvalsh(gram)
+        eigvals = torch.clamp(eigvals, min=0.0)
+        sigma = torch.sqrt(eigvals)
+        sigma, _ = torch.sort(sigma, descending=True)
+        if sigma.numel() > 0:
+            stats["train/lut/sigma_max"] = float(sigma[0].item())
+            stats["train/lut/sigma_min"] = float(sigma[-1].item())
+            cond = float("inf")
+            if sigma[-1] > 0:
+                cond = float((sigma[0] / sigma[-1]).item())
+            stats["train/lut/cond"] = cond
+            sigma_sq = sigma.square()
+            total_power = float(sigma_sq.sum().item())
+            if total_power > 0:
+                stable_rank = total_power / float(sigma_sq.max().item() + 1e-12)
+                probs = (sigma_sq / sigma_sq.sum()).clamp_min(1e-12)
+                ent = float((-probs * probs.log()).sum().item())
+                stats["train/lut/stable_rank"] = stable_rank
+                stats["train/lut/effective_rank"] = math.exp(ent)
+            top_sig = int(min(top_k, sigma.numel()))
+            for idx in range(top_sig):
+                stats[f"train/lut/sigma_{idx + 1}"] = float(sigma[idx].item())
+
+    return stats
+
+
+@torch.no_grad()
+def eval_cross_entropy_vs_t(
+    model: torch.nn.Module,
+    path: ProbPath,
+    data_loader: Iterable,
+    device: torch.device,
+    *,
+    num_bins: int = 10,
+    batches_per_eval: int = 1,
+    t_eps: float = 1e-4,
+    use_bf16: bool = False,
+    ko_mode: bool = False,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Evaluate CE across fixed t bins for collapse diagnostics."""
+
+    was_training = model.training
+    model.eval()
+
+    bins = torch.arange(num_bins, device=device, dtype=torch.float32)
+    centers = (bins + 0.5) / max(num_bins, 1)
+    t_centers = t_eps + centers * (1.0 - 2.0 * t_eps)
+
+    ce_sum = torch.zeros(num_bins, device=device)
+    ce_count = torch.zeros(num_bins, device=device)
+
+    dtype_ctx = (
+        torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        if use_bf16 and device.type == "cuda"
+        else contextlib.nullcontext()
+    )
+
+    data_iter = iter(data_loader)
+    processed = 0
+
+    for _ in range(max(1, batches_per_eval)):
+        try:
+            samples, labels = next(data_iter)
+        except StopIteration:
+            break
+
+        processed += 1
+        samples = samples.to(device, non_blocking=True)
+        if ko_mode:
+            samples = (samples * 255.0).to(torch.long)
+        labels = labels.to(device, non_blocking=True) if labels is not None else None
+
+        batch_size = samples.shape[0]
+        x_0 = torch.zeros_like(samples)
+
+        for idx, t_value in enumerate(t_centers):
+            t = torch.full((batch_size,), float(t_value.item()), device=device)
+            path_sample = path.sample(t=t, x_0=x_0, x_1=samples)
+            x_t_model = (
+                path_sample.x_t_soft
+                if getattr(path_sample, "x_t_soft", None) is not None
+                else path_sample.x_t
+            )
+            conditioning = {"label": labels} if labels is not None else {}
+
+            with dtype_ctx:
+                logits = model(x_t_model, t=t, extra=conditioning)
+
+            vocab_size = logits.shape[-1]
+            token_loss = torch.nn.functional.cross_entropy(
+                logits.float().reshape(-1, vocab_size),
+                samples.reshape(-1),
+                reduction="none",
+            )
+            ce_per_sample = token_loss.view(batch_size, -1).mean(dim=1)
+            ce_sum[idx] += ce_per_sample.sum()
+            ce_count[idx] += ce_per_sample.numel()
+
+    if was_training:
+        model.train()
+
+    if processed == 0 or ce_count.sum() == 0:
+        return None, None
+
+    avg_ce = ce_sum / (ce_count + 1e-8)
+    return t_centers.detach().cpu(), avg_ce.detach().cpu()
 
 
 # Compatibility autocast wrapper: prefer torch.amp.autocast('cuda', ...) if available,
@@ -231,20 +619,6 @@ def _collect_weight_norm_modules(module: nn.Module) -> list[nn.Module]:
     setattr(module, "_cached_weight_norm_targets", targets)
     setattr(module, "weight_norm_targets", targets)
     return targets
-
-
-def _importance_weighted_mean(
-    values: torch.Tensor, weights: Optional[torch.Tensor]
-) -> torch.Tensor:
-    """Return the mean of ``values`` with optional importance weights."""
-
-    if weights is None:
-        return values.mean()
-
-    weight_tensor = weights.to(device=values.device, dtype=values.dtype)
-    while weight_tensor.dim() < values.dim():
-        weight_tensor = weight_tensor.unsqueeze(-1)
-    return (values * weight_tensor).mean()
 
 
 def skewed_timestep_sample(num_samples: int, device: torch.device) -> torch.Tensor:
@@ -705,23 +1079,6 @@ def train_one_epoch(
         if metric_interp_update_step < epoch_offset_interp:
             metric_interp_update_step = epoch_offset_interp
 
-    logbeta_delta_weight = float(getattr(args, "mi_logbeta_reg_delta_weight", 0.0))
-    logbeta_delta2_weight = float(getattr(args, "mi_logbeta_reg_delta2_weight", 0.0))
-    logbeta_endpoint_weight = float(getattr(args, "mi_logbeta_endpoint_weight", 0.0))
-    logbeta_reg_power = float(getattr(args, "mi_logbeta_reg_power", 0.0))
-    logbeta_reg_steps = int(getattr(args, "mi_logbeta_reg_anneal_steps", 0) or 0)
-    logbeta_reg_update_step = int(getattr(args, "_mi_logbeta_reg_step", 0))
-
-    def _logbeta_annealed_weight(base: float) -> float:
-        if base <= 0.0:
-            return 0.0
-        if logbeta_reg_steps <= 0:
-            return base
-        progress = min(
-            max(logbeta_reg_update_step / float(logbeta_reg_steps), 0.0), 1.0
-        )
-        return base * (1.0 - progress)
-
     for data_iter_step, (samples, labels) in enumerate(data_loader):
         if data_iter_step % accum_iter == 0:
             optimizer.zero_grad(set_to_none=True)
@@ -749,243 +1106,23 @@ def train_one_epoch(
         if getattr(args, "ko_metric_induced", False):
             # KO: 256-way classification; no mask token
             samples = (samples * 255.0).to(torch.long)
-            logbeta_weights: Optional[torch.Tensor] = None
-            mis_uniform_frac: Optional[float] = None
-            schedule = getattr(path, "beta_schedule", None)
-            schedule_is_exp = isinstance(schedule, ExpMonotoneRQSSchedule)
-            lmin_cfg = getattr(args, "mi_logbeta_min", None)
-            lmax_cfg = getattr(args, "mi_logbeta_max", None)
-            band_lo_cfg = getattr(args, "mi_logbeta_band_t_lo", None)
-            band_hi_cfg = getattr(args, "mi_logbeta_band_t_hi", None)
-            trunc_t_cfg = getattr(args, "mi_logbeta_trunc_t", None)
-
-            lmin_val = float(lmin_cfg) if lmin_cfg is not None else None
-            lmax_val = float(lmax_cfg) if lmax_cfg is not None else None
-            band_lo: Optional[float] = None
-            band_hi: Optional[float] = None
-
-            if schedule_is_exp:
-                cfg_t_eps = float(schedule.config.t_eps)
-                default_lo = cfg_t_eps
-                default_hi = 1.0 - cfg_t_eps
-                band_lo = max(
-                    default_lo,
-                    float(band_lo_cfg) if band_lo_cfg is not None else default_lo,
-                )
-                band_hi = min(
-                    default_hi,
-                    float(band_hi_cfg) if band_hi_cfg is not None else default_hi,
-                )
-                if band_hi <= band_lo:
-                    if not getattr(args, "_mi_logbeta_band_warned", False):
-                        logger.warning(
-                            "Adjusted log-β t-band to maintain ordering (received %.4f, %.4f)",
-                            float(band_lo),
-                            float(band_hi),
-                        )
-                        setattr(args, "_mi_logbeta_band_warned", True)
-                    band_hi = min(default_hi, band_lo + 1e-6)
-
-            uniform_lo = 0.0
-            uniform_hi = 1.0
-            if band_lo is not None and band_hi is not None:
-                uniform_lo = band_lo
-                uniform_hi = band_hi
-
-            trunc_t: Optional[float] = None
-            if trunc_t_cfg is not None:
-                trunc_t = float(trunc_t_cfg)
-                min_trunc = max(
-                    0.0,
-                    float(schedule.config.t_eps) if schedule_is_exp else float(getattr(args, "mi_t_eps", 0.0)),
-                )
-                if trunc_t <= min_trunc:
-                    if not getattr(args, "_mi_logbeta_trunc_warned", False):
-                        logger.warning(
-                            "mi_logbeta_trunc_t=%.4f must exceed %.4f; ignoring truncation.",
-                            trunc_t,
-                            min_trunc,
-                        )
-                        setattr(args, "_mi_logbeta_trunc_warned", True)
-                    trunc_t = None
-                elif trunc_t >= 0.5:
-                    if not getattr(args, "_mi_logbeta_trunc_clip_warned", False):
-                        logger.warning(
-                            "mi_logbeta_trunc_t=%.4f is too close to 0.5; clipping to 0.499.",
-                            trunc_t,
-                        )
-                        setattr(args, "_mi_logbeta_trunc_clip_warned", True)
-                    trunc_t = 0.499
-            if trunc_t is not None:
-                uniform_lo = max(uniform_lo, trunc_t)
-                uniform_hi = min(uniform_hi, 1.0 - trunc_t)
-
-            if uniform_hi <= uniform_lo:
-                if not getattr(args, "_mi_logbeta_uniform_warned", False):
-                    logger.warning(
-                        "Falling back to full [0,1] uniform support because bounds collapsed (%.4f, %.4f).",
-                        uniform_lo,
-                        uniform_hi,
-                    )
-                    setattr(args, "_mi_logbeta_uniform_warned", True)
-                uniform_lo = 0.0
-                uniform_hi = 1.0
-
-            if (uniform_lo > 0.0 or uniform_hi < 1.0) and not getattr(
-                args, "_mi_logbeta_uniform_announced", False
-            ):
-                logger.info(
-                    "MIS uniform support set to [%.4f, %.4f]",
-                    uniform_lo,
-                    uniform_hi,
-                )
-                setattr(args, "_mi_logbeta_uniform_announced", True)
-
-            if schedule_is_exp and band_lo is not None and band_hi is not None:
-                effective_band_lo = max(band_lo, uniform_lo)
-                effective_band_hi = min(band_hi, uniform_hi)
-                if effective_band_hi <= effective_band_lo:
-                    if not getattr(args, "_mi_logbeta_effective_band_warned", False):
-                        logger.warning(
-                            "Uniform truncation [%.4f, %.4f] conflicts with log-β band [%.4f, %.4f];"
-                            " keeping schedule band for log-β proposals.",
-                            uniform_lo,
-                            uniform_hi,
-                            band_lo,
-                            band_hi,
-                        )
-                        setattr(args, "_mi_logbeta_effective_band_warned", True)
-                    effective_band_lo = band_lo
-                    effective_band_hi = band_hi
-                else:
-                    band_lo = effective_band_lo
-                    band_hi = effective_band_hi
-
-                with torch.no_grad():
-                    t_bounds = torch.tensor(
-                        [band_lo, band_hi],
-                        dtype=schedule.y0.dtype,
-                        device=schedule.y0.device,
-                    )
-                    ell_bounds = schedule.ell_from_t(t_bounds)
-                derived_lmin = float(torch.min(ell_bounds).item())
-                derived_lmax = float(torch.max(ell_bounds).item())
-                if lmin_val is None:
-                    lmin_val = derived_lmin
-                else:
-                    lmin_val = max(lmin_val, derived_lmin)
-                if lmax_val is None:
-                    lmax_val = derived_lmax
-                else:
-                    lmax_val = min(lmax_val, derived_lmax)
-
-            use_logbeta_sampling = (
-                schedule_is_exp
-                and hasattr(schedule, "sample_t_uniform_logbeta")
-                and lmin_val is not None
-                and lmax_val is not None
-            )
-            if use_logbeta_sampling:
-                assert lmin_val is not None and lmax_val is not None
-                if lmax_val <= lmin_val:
-                    if not getattr(args, "_mi_logbeta_interval_warned", False):
-                        logger.warning(
-                            "Ignoring log-β sampling interval with l_min >= l_max (%.4f, %.4f)",
-                            lmin_val,
-                            lmax_val,
-                        )
-                        setattr(args, "_mi_logbeta_interval_warned", True)
-                    use_logbeta_sampling = False
-
-            mix_alpha_raw = float(getattr(args, "mi_logbeta_mis_alpha", 0.0))
-            mix_alpha = float(min(max(mix_alpha_raw, 0.0), 1.0))
-            use_is = bool(getattr(args, "mi_logbeta_use_is", False))
 
             batch_size = samples.shape[0]
-            uniform_span = max(uniform_hi - uniform_lo, 1e-6)
-            t_uniform = uniform_lo + torch.rand(batch_size, device=device) * uniform_span
-
-            if use_logbeta_sampling:
-                assert lmin_val is not None and lmax_val is not None
-                t_logbeta, _ = schedule.sample_t_uniform_logbeta(
-                    batch_shape=(batch_size,),
-                    lmin=float(lmin_val),
-                    lmax=float(lmax_val),
-                )
-                t_logbeta = t_logbeta.to(device=device)
-                selector = torch.rand(batch_size, device=device) < mix_alpha
-                t = torch.where(selector, t_uniform, t_logbeta)
-
-                if not getattr(args, "_mi_logbeta_sampling_announced", False):
-                    logger.info(
-                        "Using uniform log-β sampling with interval [%.4f, %.4f]",
-                        float(lmin_val),
-                        float(lmax_val),
-                    )
-                    setattr(args, "_mi_logbeta_sampling_announced", True)
-                if 0.0 < mix_alpha < 1.0 and not getattr(args, "_mi_logbeta_mis_announced", False):
-                    logger.info(
-                        "Using MIS with α=%.3f (uniform-t) and %.3f (log-β proposal)",
-                        mix_alpha,
-                        1.0 - mix_alpha,
-                    )
-                    setattr(args, "_mi_logbeta_mis_announced", True)
-                if not use_is and not getattr(args, "_mi_logbeta_no_is_announced", False):
-                    logger.info(
-                        "Importance sampling DISABLED: using direct log-β sampling without reweighting"
-                    )
-                    setattr(args, "_mi_logbeta_no_is_announced", True)
-
-                # Only compute IS weights when explicitly enabled
-                if use_is:
-                    interval = max(float(lmax_val) - float(lmin_val), 1e-6)
-                    t_for_schedule = t.to(device=t_logbeta.device, dtype=t_logbeta.dtype)
-                    beta_vals, beta_deriv = schedule.beta_and_derivative(t_for_schedule)
-                    beta_vals = beta_vals.clamp_min(1e-12)
-                    q_logbeta = (beta_deriv / beta_vals).clamp_min(1e-12) / interval
-                    q_logbeta = q_logbeta.to(device=device, dtype=torch.float32)
-                    one_over_span = torch.tensor(
-                        1.0 / uniform_span,
-                        device=device,
-                        dtype=q_logbeta.dtype,
-                    )
-                    q_uniform = torch.zeros_like(q_logbeta)
-                    within_uniform = (t >= uniform_lo) & (t <= uniform_hi)
-                    q_uniform = torch.where(within_uniform, one_over_span, q_uniform)
-                    q_mix = mix_alpha * q_uniform + (1.0 - mix_alpha) * q_logbeta
-                    logbeta_weights = (1.0 / q_mix.clamp_min(1e-12)).to(device=device)
-                    mis_uniform_frac = float(selector.float().mean().detach().cpu().item())
-                else:
-                    # IS disabled: no reweighting
-                    logbeta_weights = None
-                    mis_uniform_frac = float(selector.float().mean().detach().cpu().item()) if mix_alpha > 0.0 else None
+            gamma = max(float(getattr(args, "t_bias_gamma", 1.5)), 1e-6)
+            u = torch.rand(batch_size, device=device)
+            t_raw = u.pow(gamma)
+            if schedule_is_exp:
+                schedule_t_eps = float(schedule.config.t_eps)
             else:
-                t = t_uniform
-
-            logbeta_reg_penalty: Optional[torch.Tensor] = None
-            logbeta_reg_terms: Optional[dict[str, torch.Tensor]] = None
-            if schedule_is_exp and isinstance(schedule, ExpMonotoneRQSSchedule):
-                reg_terms = schedule.logbeta_regularization(
-                    t_lo=band_lo,
-                    t_hi=band_hi,
-                    power=logbeta_reg_power,
-                )
-                logbeta_reg_terms = reg_terms
-                penalty_components: Optional[torch.Tensor] = None
-                delta_weight_curr = _logbeta_annealed_weight(logbeta_delta_weight)
-                delta2_weight_curr = _logbeta_annealed_weight(logbeta_delta2_weight)
-                endpoint_weight_curr = _logbeta_annealed_weight(logbeta_endpoint_weight)
-                if delta_weight_curr > 0.0:
-                    penalty = reg_terms["delta"] * delta_weight_curr
-                    penalty_components = penalty if penalty_components is None else penalty_components + penalty
-                if delta2_weight_curr > 0.0:
-                    penalty = reg_terms["delta2"] * delta2_weight_curr
-                    penalty_components = penalty if penalty_components is None else penalty_components + penalty
-                if endpoint_weight_curr > 0.0:
-                    penalty = reg_terms["endpoint"] * endpoint_weight_curr
-                    penalty_components = penalty if penalty_components is None else penalty_components + penalty
-                if penalty_components is not None:
-                    logbeta_reg_penalty = penalty_components
+                schedule_t_eps = float(getattr(args, "mi_t_eps", 1e-4))
+            schedule_t_eps = min(max(schedule_t_eps, 0.0), 0.499)
+            t = schedule_t_eps + (1.0 - 2.0 * schedule_t_eps) * t_raw
+            t = t.clamp(schedule_t_eps, 1.0 - schedule_t_eps)
+            t_mean_value = float(t.mean().detach().item())
+            if t.numel() > 1:
+                t_std_value = float(t.std(unbiased=False).detach().item())
+            else:
+                t_std_value = 0.0
 
             # Provide dummy x_0 for signature compatibility (not used by metric-induced path)
             x_0 = torch.zeros_like(samples)
@@ -1002,9 +1139,28 @@ def train_one_epoch(
             vocab_size = logits.shape[-1]
             logits_flat = logits.float().reshape(-1, vocab_size)
             targets_flat = samples.reshape(-1)
-            token_loss = torch.nn.functional.cross_entropy(
+            ce_token = torch.nn.functional.cross_entropy(
                 logits_flat, targets_flat, reduction="none"
             )
+            ce_per_sample = ce_token.view(samples.shape[0], -1).mean(dim=1)
+            ce_unweighted = ce_per_sample.mean()
+            ce_weighted = ce_unweighted
+            t_weight_mode = str(getattr(args, "t_weight_mode", "none")).lower()
+            lambda_t = float(getattr(args, "t_weight_lambda", 1.0))
+            reported_lambda = lambda_t if t_weight_mode == "linear_t" else 0.0
+            t_weight_mean = 1.0
+            t_weight_std = 0.0
+            if t_weight_mode == "linear_t" and ce_per_sample.numel() > 0:
+                weights = 1.0 + lambda_t * (1.0 - t)
+                if getattr(args, "t_weight_normalize", True):
+                    weights = weights / weights.mean().clamp_min(1e-8)
+                ce_weighted = (weights * ce_per_sample).mean()
+                t_weight_mean = float(weights.mean().detach().item())
+                if weights.numel() > 1:
+                    t_weight_std = float(weights.std(unbiased=False).detach().item())
+            loss = ce_weighted
+            ce_unweighted_scalar = float(ce_unweighted.detach().item())
+            ce_weighted_scalar = float(ce_weighted.detach().item())
             with torch.no_grad():
                 x1_flat = samples.view(samples.shape[0], -1)
                 path_probs = path.get_prob_distribution_from_tokens(x1_flat, t)
@@ -1019,12 +1175,6 @@ def train_one_epoch(
                     step_entropy_mean = float(entropy_cpu.mean().item())
                     step_entropy_median = float(torch.quantile(entropy_cpu, 0.5).item())
                     step_entropy_p90 = float(torch.quantile(entropy_cpu, 0.9).item())
-            per_sample_loss = token_loss.view(samples.shape[0], -1).mean(dim=1)
-            uw_loss = per_sample_loss.mean().item()
-            loss = _importance_weighted_mean(per_sample_loss, logbeta_weights)
-
-            if logbeta_reg_penalty is not None:
-                loss = loss + logbeta_reg_penalty
             geometry_penalty_value: Optional[torch.Tensor] = None
             if geometry_enabled:
                 penalty, geom_metrics = _compute_lut_regularizer_and_metrics(
@@ -1112,7 +1262,7 @@ def train_one_epoch(
                 if apply_mask is not None:
                     # Zero out KL where mask is false
                     kl_tensor = torch.where(apply_mask.view(-1, 1), kl_tensor, torch.zeros_like(kl_tensor))
-                lut_kl_value = _importance_weighted_mean(kl_tensor, logbeta_weights)
+                lut_kl_value = kl_tensor.mean()
                 loss = loss + lut_kl_weight * lut_kl_value
 
             # Bounded residual scale penalty (L2 on scale parameter c)
@@ -1152,9 +1302,7 @@ def train_one_epoch(
                     teacher_probs
                     * (torch.log(teacher_probs) - torch.log(student_probs))
                 ).sum(dim=-1)
-                schedule_kl_value = _importance_weighted_mean(
-                    kl_tensor, logbeta_weights
-                )
+                schedule_kl_value = kl_tensor.mean()
                 schedule_kl_penalty = kl_controller.compute_penalty(schedule_kl_value)
                 loss = loss + schedule_kl_penalty
                 kl_metric.update(schedule_kl_value.detach())
@@ -1203,94 +1351,6 @@ def train_one_epoch(
                                 )
                                 setattr(args, "_geodesic_energy_announced", True)
 
-            wandb_logger = _resolve_wandb_module(args)
-            if wandb_logger is not None:
-                weighted_entropy = _importance_weighted_mean(target_entropy, logbeta_weights)
-                wandb_log_data = {
-                    "diag/target_entropy_mean": float(weighted_entropy.detach().cpu().item()),
-                }
-                if logbeta_weights is not None:
-                    w = logbeta_weights.detach()
-                    ess_num = (w.sum() ** 2) / (w.square().sum() + 1e-12)
-                    wandb_log_data["diag/ess_frac"] = float((ess_num / (w.numel() + 1e-12)).item())
-                    wandb_log_data["diag/weight_mean"] = float(w.mean().item())
-                    wandb_log_data["diag/weight_std"] = float(w.std().item())
-                    wandb_log_data["diag/weight_max"] = float(w.max().item())
-                    wandb_log_data["diag/weight_min"] = float(w.min().item())
-                else:
-                    # IS disabled: ESS = 1.0 (all samples have equal weight)
-                    wandb_log_data["diag/ess_frac"] = 1.0
-                if mis_uniform_frac is not None:
-                    wandb_log_data["diag/mis_uniform_frac"] = mis_uniform_frac
-                if logbeta_reg_penalty is not None:
-                    wandb_log_data["loss/logbeta_reg_penalty"] = float(
-                        logbeta_reg_penalty.detach().cpu().item()
-                    )
-                    if logbeta_reg_terms is not None:
-                        wandb_log_data.update(
-                            {
-                                "loss/logbeta_reg_delta": float(
-                                    logbeta_reg_terms["delta"].detach().cpu().item()
-                                ),
-                                "loss/logbeta_reg_delta2": float(
-                                    logbeta_reg_terms["delta2"].detach().cpu().item()
-                                ),
-                                "loss/logbeta_reg_endpoint": float(
-                                    logbeta_reg_terms["endpoint"].detach().cpu().item()
-                                ),
-                            }
-                        )
-                if geometry_penalty_value is not None:
-                    wandb_log_data["loss/lut_geometry_penalty"] = float(
-                        geometry_penalty_value.cpu().item()
-                    )
-                if geom_metrics_step:
-                    for key, value in geom_metrics_step.items():
-                        wandb_log_data[key.replace("lut_", "lut/")] = float(value)
-                
-                # Log geodesic energy regularization
-                if geodesic_energy_val is not None:
-                    wandb_log_data["train/geodesic_energy"] = float(
-                        geodesic_energy_val.cpu().item()
-                    )
-                if geodesic_penalty is not None:
-                    wandb_log_data["train/geodesic_penalty"] = float(
-                        geodesic_penalty.cpu().item()
-                    )
-
-                # Log bounded residual scale parameters and penalty
-                if (
-                    hasattr(path, "learnable_lut")
-                    and path.learnable_lut is not None
-                    and hasattr(path.learnable_lut, "scale_c")
-                    and path.learnable_lut.scale_c is not None
-                ):
-                    scale_c = path.learnable_lut.scale_c.detach().cpu()
-                    # Log each channel's scale_c value
-                    for ch_idx in range(scale_c.numel()):
-                        wandb_log_data[f"lut/scale_c_ch{ch_idx}"] = float(scale_c[ch_idx].item())
-                    # Log scale_c statistics
-                    wandb_log_data["lut/scale_c_mean"] = float(scale_c.mean().item())
-                    wandb_log_data["lut/scale_c_std"] = float(scale_c.std().item())
-                    wandb_log_data["lut/scale_c_min"] = float(scale_c.min().item())
-                    wandb_log_data["lut/scale_c_max"] = float(scale_c.max().item())
-                
-                # Log scale penalty if it exists
-                if scale_penalty is not None:
-                    wandb_log_data["loss/scale_penalty"] = float(
-                        scale_penalty.detach().cpu().item()
-                    )
-
-                # Log entropy vs t chart (reduced frequency to save space)
-                if data_iter_step % (PRINT_FREQUENCY * 20) == 0:  # Reduced from 10x to 20x
-                    t_cpu = t.detach().float().cpu()
-                    entropy_cpu = target_entropy.detach().float().cpu()
-                    
-                    # Log simple statistics (always)
-                    wandb_log_data["diag/entropy_mean"] = float(entropy_cpu.mean().item())
-                    wandb_log_data["diag/entropy_std"] = float(entropy_cpu.std().item())
-                    wandb_log_data["diag/t_mean"] = float(t_cpu.mean().item())
-                wandb_logger.log(wandb_log_data)
         elif args.discrete_flow_matching:
             samples = (samples * 255.0).to(torch.long)
             t = torch.rand(samples.shape[0]).to(device)
@@ -1432,8 +1492,6 @@ def train_one_epoch(
             and path.learnable_metric is not None
         ):
             metric_ema.update(path.learnable_metric)
-        if apply_update and not grad_step_skipped:
-            logbeta_reg_update_step += 1
         if apply_update:
             if use_path_trust_region:
                 if grad_step_skipped:
@@ -1542,7 +1600,7 @@ def train_one_epoch(
                 try:
                     global_step = epoch * _dl_len + data_iter_step if _dl_len is not None else None
 
-                    metric_diagnostics = {}
+                    metric_diagnostics: Dict[str, float] = {}
                     if hasattr(path, "learnable_metric") and path.learnable_metric is not None:
                         with torch.no_grad():
                             Z = path.learnable_metric.transformed_codes(
@@ -1570,41 +1628,33 @@ def train_one_epoch(
                                     else metric_grad_norm_value
                                 )
 
-                    lut_diagnostics = {}
+                    lut_diagnostics: Dict[str, float] = {}
                     if hasattr(path, "learnable_lut") and path.learnable_lut is not None:
                         with torch.no_grad():
                             lut_weight = path.learnable_lut()
-                            lut_diagnostics["lut/weight_mean"] = float(lut_weight.mean().cpu())
-                            lut_diagnostics["lut/weight_std"] = float(lut_weight.std().cpu())
-                            lut_diagnostics["lut/weight_min"] = float(lut_weight.min().cpu())
-                            lut_diagnostics["lut/weight_max"] = float(lut_weight.max().cpu())
-                            lut_diagnostics["lut/weight_abs_max"] = float(lut_weight.abs().max().cpu())
-                            for ch_idx in range(lut_weight.shape[0]):
-                                lut_diagnostics[f"lut/ch{ch_idx}_std"] = float(lut_weight[ch_idx].std().cpu())
                             lut_flat = lut_weight.view(lut_weight.shape[0], -1)
                             channel_fro = torch.linalg.vector_norm(lut_flat, ord=2, dim=1)
-                            lut_diagnostics["lut/fro_norm_mean"] = float(channel_fro.mean().cpu())
-                            for ch_idx, fro_val in enumerate(channel_fro):
-                                lut_diagnostics[f"lut/ch{ch_idx}_fro_norm"] = float(fro_val.cpu())
-                            base_norm = getattr(path.learnable_lut, "_base_fro_norm_per_channel", None)
-                            if base_norm is not None:
-                                base_norm = base_norm.to(device=lut_weight.device, dtype=lut_weight.dtype)
-                                ratio = channel_fro / base_norm.clamp_min(1e-12)
-                                lut_diagnostics["lut/fro_ratio_mean"] = float(ratio.mean().cpu())
-                                for ch_idx, ratio_val in enumerate(ratio):
-                                    lut_diagnostics[f"lut/ch{ch_idx}_fro_ratio"] = float(ratio_val.cpu())
+                            lut_diagnostics["train/lut/fro_norm_mean"] = float(channel_fro.mean().cpu())
                         if hasattr(path.learnable_lut, "scale_c") and path.learnable_lut.scale_c is not None:
                             scale_c_cpu = path.learnable_lut.scale_c.detach().cpu()
-                            lut_diagnostics["lut/scale_c_mean"] = float(scale_c_cpu.mean().item())
-                            lut_diagnostics["lut/scale_c_std"] = float(scale_c_cpu.std().item())
+                            lut_diagnostics["train/lut/scale_c_mean"] = float(scale_c_cpu.mean().item())
                         if lut_grad_norm_value is not None:
-                            lut_diagnostics["lut/grad_norm"] = float(
+                            lut_diagnostics["train/lut/grad_norm"] = float(
                                 lut_grad_norm_value.detach().cpu().item()
                                 if isinstance(lut_grad_norm_value, torch.Tensor)
                                 else float(lut_grad_norm_value)
                             )
-                        if lut_param_delta is not None:
-                            lut_diagnostics["lut/param_delta"] = float(lut_param_delta)
+
+                    collapse_metrics: Dict[str, float] = {}
+                    log_structural_metrics = (
+                        isinstance(path, MetricInducedGibbsProbPath)
+                        and epoch % 5 == 0
+                        and data_iter_step == 0
+                    )
+                    if log_structural_metrics:
+                        embedding_matrix = _extract_embedding_matrix_for_diagnostics(path)
+                        if embedding_matrix is not None:
+                            collapse_metrics = _compute_embedding_collapse_metrics(embedding_matrix)
 
                     wandb_payload = {
                         "train/step_loss": float(batch_loss.compute().detach().cpu()),
@@ -1612,8 +1662,18 @@ def train_one_epoch(
                         "train/lr": float(lr),
                         "epoch": int(epoch),
                     }
-                    if logbeta_weights is not None and "uw_loss" in locals():
-                        wandb_payload["train/uw_loss"] = float(uw_loss)
+                    wandb_payload.update(
+                        {
+                            "train/t_bias_gamma": float(gamma),
+                            "train/t_mean": float(t_mean_value),
+                            "train/t_std": float(t_std_value),
+                            "train/t_weight_lambda": float(reported_lambda),
+                            "train/t_weight_mean": float(t_weight_mean),
+                            "train/t_weight_std": float(t_weight_std),
+                            "train/ce_unweighted": float(ce_unweighted_scalar),
+                            "train/ce_weighted": float(ce_weighted_scalar),
+                        }
+                    )
                     if step_scale_ratio is not None and step_effective_neighbor is not None:
                         wandb_payload.update(
                             {
@@ -1621,8 +1681,6 @@ def train_one_epoch(
                                 "train/cosine_effective_neighbor": float(step_effective_neighbor),
                             }
                         )
-                    wandb_payload.update(metric_diagnostics)
-                    wandb_payload.update(lut_diagnostics)
                     if grad_norm is not None and not grad_step_skipped:
                         wandb_payload["train/model_grad_norm"] = float(
                             grad_norm.cpu() if isinstance(grad_norm, torch.Tensor) else grad_norm
@@ -1642,24 +1700,19 @@ def train_one_epoch(
                         wandb_payload["train/gumbel_tau_progress"] = float(tau_progress)
                     if step_entropy_mean is not None:
                         wandb_payload["train/entropy_mean"] = float(step_entropy_mean)
-                    if step_entropy_median is not None:
+                    log_entropy_percentiles = (
+                        epoch % 5 == 0 and data_iter_step == 0
+                    )
+                    if log_entropy_percentiles and step_entropy_median is not None:
                         wandb_payload["train/entropy_median"] = float(step_entropy_median)
-                    if step_entropy_p90 is not None:
+                    if log_entropy_percentiles and step_entropy_p90 is not None:
                         wandb_payload["train/entropy_p90"] = float(step_entropy_p90)
+                    if log_entropy_percentiles and target_entropy.numel() > 0:
+                        wandb_payload["train/entropy_std"] = float(
+                            target_entropy.detach().to(device="cpu").std().item()
+                        )
                     if metric_interp_active and current_metric_interp is not None:
                         wandb_payload["train/metric_interp_lambda"] = float(current_metric_interp)
-                    if logbeta_reg_penalty is not None:
-                        wandb_payload["train/logbeta_reg_penalty"] = float(logbeta_reg_penalty.detach().cpu())
-                        if logbeta_reg_terms is not None:
-                            wandb_payload.update(
-                                {
-                                    "train/logbeta_reg_delta": float(logbeta_reg_terms["delta"].detach().cpu()),
-                                    "train/logbeta_reg_delta2": float(logbeta_reg_terms["delta2"].detach().cpu()),
-                                    "train/logbeta_reg_endpoint": float(
-                                        logbeta_reg_terms["endpoint"].detach().cpu()
-                                    ),
-                                }
-                            )
                     if geometry_penalty_value is not None:
                         wandb_payload["loss/lut_geometry_penalty"] = float(
                             geometry_penalty_value.cpu().item()
@@ -1671,12 +1724,18 @@ def train_one_epoch(
                         wandb_payload["train/geodesic_energy"] = float(geodesic_energy_val.cpu().item())
                     if geodesic_penalty is not None:
                         wandb_payload["train/geodesic_penalty"] = float(geodesic_penalty.cpu().item())
+                    if scale_penalty is not None:
+                        wandb_payload["loss/scale_penalty"] = float(
+                            scale_penalty.detach().cpu().item()
+                        )
+                    wandb_payload.update(metric_diagnostics)
+                    wandb_payload.update(lut_diagnostics)
+                    wandb_payload.update(collapse_metrics)
 
                     wandb_logger.log(wandb_payload, step=global_step)
                 except Exception as exc:
                     logger.warning(f"WandB logging failed at step {data_iter_step}: {exc}")
 
-    setattr(args, "_mi_logbeta_reg_step", logbeta_reg_update_step)
     lr_schedule.step()
     stats = {"loss": float(epoch_loss.compute().detach().cpu())}
     if geometry_penalty_updated:
@@ -1706,6 +1765,40 @@ def train_one_epoch(
                     stats[f"{key.replace('lut_', 'lut/')}_last"] = float(value)
         except Exception:
             logger.exception("Failed to aggregate LUT geometry metrics")
+
+    if (
+        getattr(args, "wandb", False)
+        and distributed_mode.is_main_process()
+        and epoch % 5 == 0
+        and isinstance(path, MetricInducedGibbsProbPath)
+        and getattr(args, "ko_metric_induced", False)
+    ):
+        schedule = getattr(path, "beta_schedule", None)
+        ce_t_eps = float(getattr(args, "mi_t_eps", 1e-4))
+        if isinstance(schedule, ExpMonotoneRQSSchedule):
+            ce_t_eps = float(schedule.config.t_eps)
+        t_vals, ce_vals = eval_cross_entropy_vs_t(
+            model=model,
+            path=path,
+            data_loader=data_loader,
+            device=device,
+            num_bins=10,
+            batches_per_eval=1,
+            t_eps=ce_t_eps,
+            use_bf16=bool(getattr(args, "bf16", False)),
+            ko_mode=bool(getattr(args, "ko_metric_induced", False)),
+        )
+        if t_vals is not None and ce_vals is not None:
+            wandb_logger = _resolve_wandb_module(args)
+            if wandb_logger is not None:
+                ce_payload = {
+                    f"train/ce_tbin_{idx}": float(val)
+                    for idx, val in enumerate(ce_vals.tolist())
+                }
+                ce_payload["train/ce_t_mean"] = float(ce_vals.mean().item())
+                ce_payload["train/ce_t_min"] = float(ce_vals.min().item())
+                ce_payload["train/ce_t_max"] = float(ce_vals.max().item())
+                wandb_logger.log(ce_payload, step=epoch)
     if entropy_samples:
         try:
             entropy_epoch_tensor = torch.cat(entropy_samples)
