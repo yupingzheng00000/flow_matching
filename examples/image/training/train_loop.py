@@ -1,4 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+﻿# Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
 # This source code is licensed under the CC-by-NC license found in the
@@ -998,9 +998,10 @@ def train_one_epoch(
     use_path_trust_region = use_path_ema and kl_controller is not None
     
     if kl_controller is not None and not use_path_ema:
-        logger.warning(
-            "KL controller was provided without an EMA teacher; disabling the controller."
-        )
+        if distributed_mode.is_main_process():
+            logger.warning(
+                "KL controller was provided without an EMA teacher; disabling the controller."
+            )
         kl_controller = None
         use_path_trust_region = False
 
@@ -1797,7 +1798,7 @@ def train_one_epoch(
             path=path,
             data_loader=data_loader,
             device=device,
-            num_bins=10,
+            num_bins=50,
             batches_per_eval=1,
             t_eps=ce_t_eps,
             use_bf16=bool(getattr(args, "bf16", False)),
@@ -1807,13 +1808,19 @@ def train_one_epoch(
         if distributed_mode.is_main_process() and t_vals is not None and ce_vals is not None:
             wandb_logger = _resolve_wandb_module(args)
             if wandb_logger is not None:
+                # Log CE vs t as a line plot
+                table = wandb_logger.Table(
+                    data=[[float(t), float(ce)] for t, ce in zip(t_vals, ce_vals)],
+                    columns=["t", "cross_entropy"]
+                )
                 ce_payload = {
-                    f"train/ce_tbin_{idx}": float(val)
-                    for idx, val in enumerate(ce_vals.tolist())
+                    "train/ce_vs_t": wandb_logger.plot.line(
+                        table, "t", "cross_entropy", title="Cross Entropy vs Time"
+                    ),
+                    "train/ce_t_mean": float(ce_vals.mean().item()),
+                    "train/ce_t_min": float(ce_vals.min().item()),
+                    "train/ce_t_max": float(ce_vals.max().item()),
                 }
-                ce_payload["train/ce_t_mean"] = float(ce_vals.mean().item())
-                ce_payload["train/ce_t_min"] = float(ce_vals.min().item())
-                ce_payload["train/ce_t_max"] = float(ce_vals.max().item())
                 wandb_logger.log(ce_payload, step=epoch)
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -1955,13 +1962,24 @@ def train_one_epoch(
     return stats
 
 
-def _log_lut_diagnostics(path: MetricInducedGibbsProbPath, epoch: int, logger: logging.Logger, args: argparse.Namespace) -> None:
-    """Visualize LUT diagnostics in a compact, baseline-referenced layout."""
+def _log_lut_diagnostics(
+    path: MetricInducedGibbsProbPath,
+    epoch: int,
+    logger: logging.Logger,
+    args: argparse.Namespace,
+) -> None:
+    """Visualize LUT diagnostics as heatmaps plus a compact text panel.
+
+    - Supports [C,V] or [C,V,D] LUT weights. For D>1, reduces to per-token
+      scalars via L2 norm across the embedding dimension for plotting.
+    - Only the main process saves/logs artifacts to avoid duplication.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
+        from pathlib import Path
     except ImportError:
         logger.warning("matplotlib not available, skipping LUT visualization")
         return
@@ -1976,127 +1994,135 @@ def _log_lut_diagnostics(path: MetricInducedGibbsProbPath, epoch: int, logger: l
             logger.info("learnable_lut() returned None; skipping diagnostics")
             return
 
-        weight = lut_weights_raw.detach().cpu()
-        if weight.dim() == 2:
-            weight = weight.unsqueeze(-1)
-        elif weight.dim() != 3:
-            logger.error(f"Unexpected LUT weight shape: {tuple(weight.shape)}")
+        lut_weights_raw = lut_weights_raw.detach().cpu()
+        shape = tuple(lut_weights_raw.shape)
+
+        if len(shape) == 2:
+            C, V = shape
+            D = 1
+            lut_vals = lut_weights_raw.numpy()
+            is_vector = False
+        elif len(shape) == 3:
+            C, V, D = shape
+            if D == 1:
+                lut_vals = lut_weights_raw.squeeze(-1).numpy()
+                is_vector = False
+            else:
+                lut_vals = torch.linalg.norm(lut_weights_raw, ord=2, dim=-1).numpy()
+                is_vector = True
+        else:
+            logger.error(f"Unexpected LUT weight shape: {shape}")
             return
 
-        C, V, D = weight.shape
         channel_names = ["R", "G", "B"] if C == 3 else [f"Ch{i}" for i in range(C)]
-        colors = ["red", "green", "blue"] if C == 3 else [f"C{i}" for i in range(C)]
 
-        # Scalar view for plotting: first component if D==1 else L2 norm
-        if D == 1:
-            curves = weight.squeeze(-1).numpy()
+        vals = lut_vals.reshape(-1)
+        vmin = float(vals.min()) if vals.size > 0 else 0.0
+        vmax = float(vals.max()) if vals.size > 0 else 0.0
+
+        if V > 1:
+            diffs = lut_vals[:, 1:] - lut_vals[:, :-1]
+            neg_frac = float((diffs < 0).mean())
         else:
-            curves = torch.linalg.norm(weight, ord=2, dim=-1).numpy()
+            diffs = None
+            neg_frac = 0.0
 
-        # Baseline reference (depends on embed_range)
-        if getattr(path, "embed_range", "pm1") == "pm1":
-            baseline = np.linspace(-1.0, 1.0, V, dtype=np.float32)
-        else:
-            baseline = np.linspace(0.0, 1.0, V, dtype=np.float32)
+        norms = [float(np.linalg.norm(lut_vals[c])) for c in range(C)]
 
-        # Metrics
-        diff = curves - baseline[None, :]
-        mean_abs = np.mean(np.abs(diff), axis=1)
-        max_abs = np.max(np.abs(diff), axis=1)
-        inv_frac = np.sum(np.diff(curves, axis=1) < 0, axis=1) / max(V - 1, 1)
-        norms = np.linalg.norm(curves, axis=1)
+        try:
+            ks_uniform = float(_ks_uniform_metric(torch.from_numpy(vals)))
+        except Exception:
+            ks_uniform = 0.0
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-        fig.suptitle(f"LUT Diagnostics (Epoch {epoch})", fontsize=15, fontweight="bold")
+    # Figure layout: 2x2 grid
+    fig = plt.figure(figsize=(14, 8))
+    gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.35)
 
-        # 1) Curves vs baseline
-        ax_curves = axes[0, 0]
-        x = np.arange(V)
-        ax_curves.plot(x, baseline, linestyle="--", color="gray", label="baseline")
-        for c, (name, color) in enumerate(zip(channel_names, colors)):
-            ax_curves.plot(x, curves[c], color=color, label=name, linewidth=1.6, alpha=0.85)
-        ax_curves.set_xlabel("Token index")
-        ax_curves.set_ylabel("Embedding value" if D == 1 else "Embedding L2 norm")
-        ax_curves.grid(True, alpha=0.2)
-        ax_curves.legend(loc="best")
+    # 1) LUT heatmap
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(lut_vals, aspect="auto")
+    ax1.set_title(
+        f"LUT values{' (L2 norm)' if is_vector else ''} - Epoch {epoch}",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax1.set_ylabel("Channel", fontsize=11)
+    ax1.set_xlabel("Token", fontsize=11)
+    ax1.set_yticks(range(C))
+    ax1.set_yticklabels(channel_names)
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
-        # 2) Error summary bars
-        ax_error = axes[0, 1]
-        width = 0.35
-        idx = np.arange(C)
-        ax_error.bar(idx - width / 2, mean_abs, width, color=colors, alpha=0.8, label="mean |Δ|")
-        ax_error.bar(idx + width / 2, max_abs, width, color=colors, alpha=0.4, label="max |Δ|")
-        ax_error.set_xticks(idx)
-        ax_error.set_xticklabels(channel_names)
-        ax_error.set_ylabel("Deviation")
-        ax_error.set_title("Deviation from baseline")
-        ax_error.grid(True, axis="y", alpha=0.2)
-        ax_error.legend()
+    # 2) First-difference heatmap (monotonicity)
+    ax2 = fig.add_subplot(gs[0, 1])
+    if diffs is not None:
+        im2 = ax2.imshow(diffs, aspect="auto", cmap="RdBu_r")
+        ax2.set_title("LUT finite differences (Δ along token)", fontsize=13, fontweight="bold")
+        ax2.set_ylabel("Channel", fontsize=11)
+        ax2.set_xlabel("Token index (Δ)", fontsize=11)
+        ax2.set_yticks(range(C))
+        ax2.set_yticklabels(channel_names)
+        fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    else:
+        ax2.set_title("LUT finite differences (V=1, skipped)", fontsize=12)
+        ax2.axis("off")
 
-        # 3) Monotonicity & correlation heatmap
-        ax_inv = axes[1, 0]
-        ax_inv.bar(channel_names, inv_frac, color=colors, alpha=0.8)
-        ax_inv.set_ylabel("Inversion fraction")
-        ax_inv.set_ylim(0.0, max(0.1, inv_frac.max() + 0.02))
-        ax_inv.set_title("Monotonicity violations")
-        ax_inv.grid(True, axis="y", alpha=0.2)
+    # 3) Per-channel norm bar
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.bar(range(C), norms)
+    ax3.set_xticks(range(C))
+    ax3.set_xticklabels(channel_names)
+    ax3.set_ylabel("L2 norm", fontsize=11)
+    ax3.set_title("Channel norms", fontsize=12, fontweight="bold")
+    ax3.grid(True, axis="y", alpha=0.3)
 
-        ax_corr = axes[1, 1]
-        if C > 1:
-            corr = np.corrcoef(curves)
-            im = ax_corr.imshow(corr, cmap="RdYlGn_r", vmin=0.9, vmax=1.0)
-            ax_corr.set_xticks(range(C))
-            ax_corr.set_yticks(range(C))
-            ax_corr.set_xticklabels(channel_names)
-            ax_corr.set_yticklabels(channel_names)
-            ax_corr.set_title("Channel correlation")
-            for i in range(C):
-                for j in range(C):
-                    ax_corr.text(j, i, f"{corr[i, j]:.3f}", ha="center", va="center", fontsize=9)
-            plt.colorbar(im, ax=ax_corr, fraction=0.046, pad=0.04)
-        else:
-            ax_corr.axis("off")
-            ax_corr.text(0.5, 0.5, "Single channel", ha="center", va="center")
+    # 4) Text panel with health summary
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.axis("off")
+    lines = []
+    lines.append(f"Shape: C={C}, V={V}, D={D}")
+    lines.append(f"Value range: [{vmin:.4f}, {vmax:.4f}]")
+    lines.append(f"Neg. Δ fraction (monotonic violations): {neg_frac:.4f}")
+    lines.append(f"KS distance to uniform (all values): {ks_uniform:.4f}")
+    lines.append("")
+    lines.append("Channel norms:")
+    for name, n in zip(channel_names, norms):
+        lines.append(f"  {name}: {n:.3f}")
+    ax4.text(
+        0.0,
+        1.0,
+        "\n".join(lines),
+        transform=ax4.transAxes,
+        va="top",
+        ha="left",
+        fontsize=10,
+        family="monospace",
+    )
 
-        # Text summary overlay (reuse top-right area if single channel)
-        summary_lines = ["Summary:"]
-        for idx_c, name in enumerate(channel_names):
-            summary_lines.append(
-                f"  {name}: |Δ|_mean={mean_abs[idx_c]:.4f}, max={max_abs[idx_c]:.4f}, inv={inv_frac[idx_c]*100:.2f}%"
-            )
-        summary_lines.append("")
-        summary_lines.append("  Norms: " + ", ".join(f"{n:.2f}" for n in norms))
-        summary_text = "\n".join(summary_lines)
-        axes[0, 1].text(
-            1.02,
-            0.5,
-            summary_text,
-            transform=axes[0, 1].transAxes,
-            fontsize=10,
-            verticalalignment="center",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-        )
+    fig.suptitle("LUT Diagnostics", fontsize=14, fontweight="bold")
 
-        plt.tight_layout(rect=(0, 0, 1, 0.96))
+    # Save & log only from the main process to avoid duplication
+    if distributed_mode.is_main_process():
+        out_root = getattr(args, "log_dir", None) or getattr(args, "output_dir", ".")
+        out_dir = Path(out_root) / "lut_diagnostics"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fname = out_dir / f"lut_epoch_{epoch:04d}.png"
+        fig.savefig(fname, dpi=150, bbox_inches="tight")
+        logger.info(f"LUT diagnostics saved to {fname}")
 
-        # Save + log
-        save_dir = getattr(args, "output_dir", "./output_dir")
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"lut_diagnostics_epoch_{epoch:04d}.png")
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        logger.info(f"LUT diagnostics visualization saved to {save_path}")
-
-        wandb_logger = _resolve_wandb_module(args)
-        if wandb_logger is not None:
+        wandb = _resolve_wandb_module(args)
+        if wandb is not None and getattr(wandb, "run", None) is not None:
             try:
-                run = getattr(wandb_logger, "run", None)
-                if run is not None:
-                    wandb_logger.log({"lut/diagnostics": wandb_logger.Image(save_path)}, step=epoch)
-                    run_name = getattr(run, "name", "unknown")
-                    logger.info(f"LUT diagnostics uploaded to wandb (run: {run_name})")
-                else:
-                    logger.info("wandb not initialized, image saved locally only")
-            except Exception as exc:
-                logger.info(f"wandb upload skipped ({type(exc).__name__}), image saved locally")
+                wandb.log(
+                    {
+                        "train/lut_diag_image": wandb.Image(str(fname)),
+                        "train/lut/neg_delta_frac": neg_frac,
+                        "train/lut/ks_uniform_snapshot": ks_uniform,
+                    },
+                    step=epoch,
+                )
+            except Exception:
+                pass
 
-        plt.close(fig)
+    # Close the figure in all processes
+    plt.close(fig)
+
