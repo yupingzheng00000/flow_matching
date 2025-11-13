@@ -510,6 +510,7 @@ def eval_cross_entropy_vs_t(
     t_eps: float = 1e-4,
     use_bf16: bool = False,
     ko_mode: bool = False,
+    diag_batch_size: Optional[int] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Evaluate CE across fixed t bins for collapse diagnostics."""
 
@@ -538,6 +539,11 @@ def eval_cross_entropy_vs_t(
             break
 
         processed += 1
+        # Optionally downsample batch for faster diagnostic
+        if diag_batch_size is not None and samples.shape[0] > diag_batch_size:
+            samples = samples[:diag_batch_size]
+            if labels is not None:
+                labels = labels[:diag_batch_size]
         samples = samples.to(device, non_blocking=True)
         if ko_mode:
             samples = (samples * 255.0).to(torch.long)
@@ -1770,14 +1776,16 @@ def train_one_epoch(
     # Optional CE-vs-t diagnostic: align start with eval_start_epoch to avoid heavy probes right after resume
     epoch_one = int(epoch) + 1
     eval_start = int(getattr(args, "eval_start_epoch", 0))
-    if (
-        getattr(args, "wandb", False)
-        and distributed_mode.is_main_process()
-        and isinstance(path, MetricInducedGibbsProbPath)
+    want_diag = (
+        isinstance(path, MetricInducedGibbsProbPath)
         and getattr(args, "ko_metric_induced", False)
         and epoch_one >= eval_start
         and (epoch_one - eval_start) % 5 == 0
-    ):
+    )
+    # All ranks enter two barriers so non-main ranks don't run ahead to DDP collectives
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if want_diag:
         schedule = getattr(path, "beta_schedule", None)
         ce_t_eps = float(getattr(args, "mi_t_eps", 1e-4))
         if isinstance(schedule, ExpMonotoneRQSSchedule):
@@ -1792,8 +1800,9 @@ def train_one_epoch(
             t_eps=ce_t_eps,
             use_bf16=bool(getattr(args, "bf16", False)),
             ko_mode=bool(getattr(args, "ko_metric_induced", False)),
+            diag_batch_size=64,
         )
-        if t_vals is not None and ce_vals is not None:
+        if distributed_mode.is_main_process() and t_vals is not None and ce_vals is not None:
             wandb_logger = _resolve_wandb_module(args)
             if wandb_logger is not None:
                 ce_payload = {
@@ -1804,6 +1813,8 @@ def train_one_epoch(
                 ce_payload["train/ce_t_min"] = float(ce_vals.min().item())
                 ce_payload["train/ce_t_max"] = float(ce_vals.max().item())
                 wandb_logger.log(ce_payload, step=epoch)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
     if entropy_samples:
         try:
             entropy_epoch_tensor = torch.cat(entropy_samples)
