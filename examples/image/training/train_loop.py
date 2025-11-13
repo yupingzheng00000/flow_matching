@@ -488,8 +488,8 @@ def _compute_lut_reconstruction_loss(
 
 def _extract_embedding_matrix_for_diagnostics(
     path: ProbPath,
-) -> Optional[torch.Tensor]:
-    """Return a 2-D embedding matrix [N, D] for collapse diagnostics."""
+) -> tuple[Optional[torch.Tensor], str]:
+    """Return a 2-D embedding matrix [N, D] plus its source label for diagnostics."""
 
     metric_module = getattr(path, "learnable_metric", None)
     if metric_module is not None:
@@ -498,7 +498,7 @@ def _extract_embedding_matrix_for_diagnostics(
         except Exception:
             matrix = getattr(metric_module, "codes", None)
         if matrix is not None:
-            return matrix.detach().to(device="cpu", dtype=torch.float32)
+            return matrix.detach().to(device="cpu", dtype=torch.float32), "metric"
 
     lut_module = getattr(path, "learnable_lut", None)
     if lut_module is not None:
@@ -514,9 +514,9 @@ def _extract_embedding_matrix_for_diagnostics(
         if weight is not None:
             weight = weight.detach().to(device="cpu", dtype=torch.float32)
             flat = weight.reshape(-1, weight.shape[-1])
-            return flat
+            return flat, "lut"
 
-    return None
+    return None, "none"
 
 
 def _compute_embedding_collapse_metrics(
@@ -1774,9 +1774,21 @@ def train_one_epoch(
                         and data_iter_step == 0
                     )
                     if log_structural_metrics:
-                        embedding_matrix = _extract_embedding_matrix_for_diagnostics(path)
+                        embedding_matrix, embedding_source = _extract_embedding_matrix_for_diagnostics(path)
                         if embedding_matrix is not None:
                             collapse_metrics = _compute_embedding_collapse_metrics(embedding_matrix)
+                            logger.info(
+                                "Collapse diag source=%s shape=%s stable_rank=%.4f effective_rank=%.4f",
+                                embedding_source,
+                                tuple(embedding_matrix.shape),
+                                collapse_metrics.get("lut/stable_rank", float("nan")),
+                                collapse_metrics.get("lut/effective_rank", float("nan")),
+                            )
+                        else:
+                            logger.info(
+                                "Collapse diag skipped: source=%s (no embedding matrix available)",
+                                embedding_source,
+                            )
 
                     wandb_payload = {
                         "train/step_loss": float(batch_loss.compute().detach().cpu()),
