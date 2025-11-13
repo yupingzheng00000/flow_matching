@@ -166,8 +166,10 @@ class LearnableLUT(nn.Module):
         self.init_method = str(init_method)
         self.init_noise_scale = float(init_noise_scale)
 
-        if self.param_mode != "none" and self.init_method == "small_noise_qr":
-            raise ValueError("small_noise_qr initialization is only supported when param_mode='none'")
+        if self.param_mode != "none" and self.init_method in {"small_noise_qr", "normal_random"}:
+            raise ValueError(
+                f"{self.init_method} initialization is only supported when param_mode='none'"
+            )
 
         self.register_buffer("_base_fro_norm_per_channel", torch.empty(self.num_channels), persistent=False)
         if self.bounded_residual_scale:
@@ -244,6 +246,8 @@ class LearnableLUT(nn.Module):
             return self._linear_init_free(device=device, dtype=dtype)
         if self.init_method == "small_noise_qr":
             return self._small_noise_qr_init_free(device=device, dtype=dtype)
+        if self.init_method == "normal_random":
+            return self._normal_random_init_free(device=device, dtype=dtype)
         raise ValueError(f"Unknown init_method '{self.init_method}' for LearnableLUT")
 
     def _linear_init_free(self, *, device: Optional[torch.device], dtype: torch.dtype) -> Tensor:
@@ -293,6 +297,14 @@ class LearnableLUT(nn.Module):
                 channel_noise = torch.randn_like(Q_scaled) * (self.init_noise_scale * 0.1)
                 weight[channel] = Q_scaled + channel_noise
         return weight
+
+    def _normal_random_init_free(self, *, device: Optional[torch.device], dtype: torch.dtype) -> Tensor:
+        """
+        Initialize LUT entries with i.i.d. N(0, 1) samples.
+        """
+        return torch.randn(
+            self.num_channels, self.vocab_size, self.emb_dim, device=device, dtype=dtype
+        )
 
     def _infer_buffer_dtype_device(self) -> tuple[torch.dtype, torch.device]:
         if self.param_mode == "none":

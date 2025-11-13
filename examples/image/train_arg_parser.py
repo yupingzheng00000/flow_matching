@@ -566,12 +566,13 @@ def get_args_parser():
     parser.add_argument(
         "--mi_lut_init_method",
         default="linear",
-        choices=["linear", "small_noise_qr"],
+        choices=["linear", "small_noise_qr", "normal_random"],
         type=str,
         help=(
             "Initialization method for learnable LUT weights. "
             "'linear': Standard linear spacing with small noise (default). "
-            "'small_noise_qr': QR decomposition with controlled noise for high-dim embeddings."
+            "'small_noise_qr': QR decomposition with controlled noise for high-dim embeddings. "
+            "'normal_random': zero-mean, unit-std Gaussian (only valid when --mi_lut_param_mode=none)."
         ),
     )
     parser.add_argument(
@@ -629,6 +630,35 @@ def get_args_parser():
         "--mi_lut_geometry_log",
         action="store_true",
         help="Enable detailed LUT geometry logging/diagnostics during training.",
+    )
+    parser.add_argument(
+        "--lut_recon_weight",
+        default=0.3,
+        type=float,
+        help=(
+            "Weight for LUT embedding reconstruction CE loss to prevent collapse. "
+            "Uses LUT's own embeddings for self-classification (no extra params). "
+            "Set to 0.0 to disable (default: 0.3)."
+        ),
+    )
+    parser.add_argument(
+        "--lut_recon_alpha",
+        default=None,
+        type=float,
+        help=(
+            "Temperature parameter (alpha) for reconstruction logits. "
+            "Controls softmax sharpness in -alpha * distance. "
+            "If None (default), dynamically follows median beta(t) from schedule."
+        ),
+    )
+    parser.add_argument(
+        "--lut_recon_sample_frac",
+        default=0.25,
+        type=float,
+        help=(
+            "Fraction of tokens to sample for reconstruction loss computation (0.0-1.0). "
+            "Lower values reduce compute cost while maintaining regularization effect (default: 0.25)."
+        ),
     )
     parser.add_argument(
         "--mi_lp",

@@ -404,6 +404,60 @@ def _compute_lut_regularizer_and_metrics(
     return penalty, metrics
 
 
+def _compute_lut_reconstruction_loss(
+    path: ProbPath,
+    targets_flat: torch.Tensor,
+    device: torch.device,
+    *,
+    sample_frac: float = 0.25,
+    alpha: Optional[float] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+
+    zero = torch.zeros((), device=device, dtype=torch.float32)
+
+    if not isinstance(path, MetricInducedGibbsProbPath):
+        return zero, {}
+
+    if path.learnable_lut is None:
+        return zero, {}
+
+    # ensure device & dtype
+    targets_flat = targets_flat.to(device=device, non_blocking=True).long()
+    N = targets_flat.shape[0]
+    if N == 0:
+        return zero, {}
+
+    N_sub = min(N, max(1, int(N * sample_frac)))
+    indices = torch.randperm(N, device=device)[:N_sub]
+    targets_sub = targets_flat[indices]
+
+    lut_weight = path.learnable_lut()
+    if lut_weight.dim() == 3:
+        E = lut_weight[0]          # [V, D]
+    else:
+        E = lut_weight             # [V, D]
+
+    z = E[targets_sub]            # [N_sub, D]
+    dist = path._pairwise_dist(z, E)  # [N_sub, V]
+
+    if alpha is None:
+        alpha = getattr(path, "lut_recon_alpha", 5.0)
+
+    logits_rec = (-alpha * dist).to(dtype=torch.float32)
+    loss_rec = F.cross_entropy(logits_rec, targets_sub, reduction="mean")
+
+    with torch.no_grad():
+        acc = (logits_rec.argmax(-1) == targets_sub).float().mean()
+
+    metrics = {
+        "train/lut_recon_loss": float(loss_rec.item()),
+        "train/lut_recon_acc": float(acc.item()),
+        "train/lut_recon_alpha": float(alpha),
+    }
+    return loss_rec, metrics
+
+
+
 def _extract_embedding_matrix_for_diagnostics(
     path: ProbPath,
 ) -> Optional[torch.Tensor]:
@@ -1169,6 +1223,24 @@ def train_one_epoch(
                 if weights.numel() > 1:
                     t_weight_std = float(weights.std(unbiased=False).detach().item())
             loss = ce_weighted
+
+            # LUT embedding reconstruction loss (prevent collapse)
+            lut_recon_weight = float(getattr(args, "lut_recon_weight", 0.0))
+            if lut_recon_weight > 0.0 and isinstance(path, MetricInducedGibbsProbPath):
+                lut_recon_alpha = getattr(args, "lut_recon_alpha", None)
+                lut_recon_sample_frac = float(getattr(args, "lut_recon_sample_frac", 0.25))
+
+                loss_rec, rec_metrics = _compute_lut_reconstruction_loss(
+                    path=path,
+                    targets_flat=targets_flat,
+                    device=device,
+                    sample_frac=lut_recon_sample_frac,
+                    alpha=lut_recon_alpha,
+                    t=t,
+                )
+                loss = loss + lut_recon_weight * loss_rec
+                stats.update(rec_metrics)
+
             ce_unweighted_scalar = float(ce_unweighted.detach().item())
             ce_weighted_scalar = float(ce_weighted.detach().item())
             with torch.no_grad():
