@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 from pathlib import Path
 from typing import Dict, Optional
+import pickle
 
 import torch
 from torch.nn import Module
@@ -14,6 +15,30 @@ from training.distributed_mode import is_main_process
 def save_on_master(*args, **kwargs):
     if is_main_process():
         torch.save(*args, **kwargs)
+
+
+def _filter_args_for_checkpoint(args) -> Dict:
+    """Return a pickle-safe dict copy of args.
+
+    - Drops transient wandb cache (modules aren't picklable)
+    - Skips any values that can't be pickled
+    """
+    safe: Dict = {}
+    try:
+        items = vars(args).items()  # type: ignore[arg-type]
+    except Exception:
+        # Fallback: already a dict
+        items = getattr(args, "items", lambda: [])()
+    for k, v in items:
+        if k.startswith("_cached_wandb"):
+            continue
+        try:
+            pickle.dumps(v)
+            safe[k] = v
+        except Exception:
+            # Skip unpicklable entries
+            continue
+    return safe
 
 
 def save_model(
@@ -46,7 +71,7 @@ def save_model(
                 "lr_schedule": lr_schedule.state_dict(),
                 "epoch": epoch,
                 "scaler": loss_scaler.state_dict(),
-                "args": args,
+                "args": _filter_args_for_checkpoint(args),
             }
             if extra_state:
                 to_save["extra_modules"] = extra_state
@@ -163,8 +188,13 @@ def load_model(
                 "_schedule_kl_window",
                 "_schedule_kl_window_sum",
             ):
-                if hasattr(checkpoint_args, attr):
-                    setattr(args, attr, getattr(checkpoint_args, attr))
+                try:
+                    if isinstance(checkpoint_args, dict) and attr in checkpoint_args:
+                        setattr(args, attr, checkpoint_args[attr])
+                    elif hasattr(checkpoint_args, attr):
+                        setattr(args, attr, getattr(checkpoint_args, attr))
+                except Exception:
+                    pass
         if (
             "optimizer" in checkpoint
             and "epoch" in checkpoint
