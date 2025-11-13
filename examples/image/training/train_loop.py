@@ -1258,22 +1258,26 @@ def train_one_epoch(
 
             # LUT embedding reconstruction loss (prevent collapse)
             lut_recon_weight = float(getattr(args, "lut_recon_weight", 0.0))
-            lut_recon_active = (
-                lut_recon_weight > 0.0 and isinstance(path, MetricInducedGibbsProbPath)
+            raw_sample_frac = float(getattr(args, "lut_recon_sample_frac", 0.25))
+            measure_only_mode = raw_sample_frac <= 0.0
+            effective_sample_frac = raw_sample_frac if raw_sample_frac > 0.0 else 0.25
+            need_lut_recon = (
+                isinstance(path, MetricInducedGibbsProbPath)
+                and (lut_recon_weight > 0.0 or measure_only_mode)
             )
-            if lut_recon_active:
+            if need_lut_recon:
                 lut_recon_alpha = getattr(args, "lut_recon_alpha", None)
-                lut_recon_sample_frac = float(getattr(args, "lut_recon_sample_frac", 0.25))
 
                 loss_rec, rec_metrics = _compute_lut_reconstruction_loss(
                     path=path,
                     targets_flat=targets_flat,
                     device=device,
-                    sample_frac=lut_recon_sample_frac,
+                    sample_frac=effective_sample_frac,
                     alpha=lut_recon_alpha,
                     t=t,
                 )
-                loss = loss + lut_recon_weight * loss_rec
+                if lut_recon_weight > 0.0 and not measure_only_mode:
+                    loss = loss + lut_recon_weight * loss_rec
                 lut_recon_loss_metric.update(loss_rec.detach())
                 lut_recon_acc_metric.update(
                     torch.tensor(rec_metrics.get("train/lut_recon_acc", 0.0), device=device)
