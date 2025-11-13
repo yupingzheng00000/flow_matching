@@ -1976,8 +1976,8 @@ def train_one_epoch(
                     "train/ce_t_min": float(ce_vals.min().item()),
                     "train/ce_t_max": float(ce_vals.max().item()),
                 }
-                logged_chart = False
                 try:
+                    module_name = getattr(wandb_logger, "__name__", "").lower()
                     if hasattr(wandb_logger, "Table") and hasattr(wandb_logger, "plot"):
                         table = wandb_logger.Table(
                             data=[[float(t), float(ce)] for t, ce in zip(t_vals, ce_vals)],
@@ -1986,28 +1986,48 @@ def train_one_epoch(
                         ce_payload["train/ce_vs_t"] = wandb_logger.plot.line(
                             table, "t", "cross_entropy", title="Cross Entropy vs Time"
                         )
-                        logged_chart = True
-                    elif getattr(wandb_logger, "__name__", "").lower() == "swanlab":
+                    elif module_name == "swanlab":
                         try:
                             from pyecharts.charts import Line  # type: ignore
                             from pyecharts import options as opts  # type: ignore
 
+                            x_values = [float(t) for t in t_vals]
+                            y_values = [float(ce) for ce in ce_vals]
+                            xy_pairs = [[x, y] for x, y in zip(x_values, y_values)]
                             line = (
                                 Line()
-                                .add_xaxis([float(t) for t in t_vals])
+                                .add_xaxis([])
                                 .add_yaxis(
                                     "cross_entropy",
-                                    [float(ce) for ce in ce_vals],
+                                    xy_pairs,
                                     is_smooth=True,
+                                    symbol_size=4,
+                                    label_opts=opts.LabelOpts(is_show=False),
                                 )
                                 .set_global_opts(
                                     title_opts=opts.TitleOpts(title="Cross Entropy vs Time"),
-                                    xaxis_opts=opts.AxisOpts(name="t"),
-                                    yaxis_opts=opts.AxisOpts(name="cross_entropy"),
+                                    xaxis_opts=opts.AxisOpts(
+                                        type_="value",
+                                        name="t",
+                                        min_=0.0,
+                                        max_=1.0,
+                                        boundary_gap=False,
+                                        axislabel_opts=opts.LabelOpts(formatter="{value:.2f}"),
+                                    ),
+                                    yaxis_opts=opts.AxisOpts(
+                                        type_="value",
+                                        name="cross_entropy",
+                                        axislabel_opts=opts.LabelOpts(formatter="{value:.2f}"),
+                                    ),
+                                    datazoom_opts=[
+                                        opts.DataZoomOpts(type_="inside"),
+                                        opts.DataZoomOpts(type_="slider"),
+                                    ],
+                                    tooltip_opts=opts.TooltipOpts(trigger="axis"),
+                                    grid_opts=opts.GridOpts(left="10%", right="8%", top="12%", bottom="15%"),
                                 )
                             )
                             ce_payload["train/ce_vs_t_chart"] = line
-                            logged_chart = True
                         except ImportError:
                             logger.warning(
                                 "pyecharts not available; skipping SwanLab CE-vs-t chart."
