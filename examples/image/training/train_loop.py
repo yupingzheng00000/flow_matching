@@ -1784,6 +1784,33 @@ def train_one_epoch(
                                 collapse_metrics.get("lut/stable_rank", float("nan")),
                                 collapse_metrics.get("lut/effective_rank", float("nan")),
                             )
+                            # Extra check: compare raw vs effective LUT representations
+                            try:
+                                lut_mod = getattr(path, "learnable_lut", None)
+                                if lut_mod is not None:
+                                    with torch.no_grad():
+                                        eff = lut_mod() if callable(lut_mod) else getattr(lut_mod, "weight", None)
+                                        raw = getattr(lut_mod, "weight", None)
+                                        if isinstance(eff, torch.Tensor) and eff.ndim >= 2:
+                                            eff_flat = eff.detach().to(device="cpu", dtype=torch.float32).reshape(-1, eff.shape[-1])
+                                            eff_m = _compute_embedding_collapse_metrics(eff_flat)
+                                            logger.info(
+                                                "LUT effective: shape=%s stable_rank=%.4f effective_rank=%.4f",
+                                                tuple(eff_flat.shape),
+                                                eff_m.get("lut/stable_rank", float("nan")),
+                                                eff_m.get("lut/effective_rank", float("nan")),
+                                            )
+                                        if isinstance(raw, torch.Tensor) and raw.ndim >= 2:
+                                            raw_flat = raw.detach().to(device="cpu", dtype=torch.float32).reshape(-1, raw.shape[-1])
+                                            raw_m = _compute_embedding_collapse_metrics(raw_flat)
+                                            logger.info(
+                                                "LUT raw param: shape=%s stable_rank=%.4f effective_rank=%.4f",
+                                                tuple(raw_flat.shape),
+                                                raw_m.get("lut/stable_rank", float("nan")),
+                                                raw_m.get("lut/effective_rank", float("nan")),
+                                            )
+                            except Exception:
+                                logger.exception("Extra LUT collapse checks failed")
                         else:
                             logger.info(
                                 "Collapse diag skipped: source=%s (no embedding matrix available)",
