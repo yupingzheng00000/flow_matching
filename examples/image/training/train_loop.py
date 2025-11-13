@@ -523,11 +523,10 @@ def eval_cross_entropy_vs_t(
     ce_sum = torch.zeros(num_bins, device=device)
     ce_count = torch.zeros(num_bins, device=device)
 
-    dtype_ctx = (
-        torch.cuda.amp.autocast(dtype=torch.bfloat16)
-        if use_bf16 and device.type == "cuda"
-        else contextlib.nullcontext()
-    )
+    if use_bf16 and device.type == "cuda":
+        dtype_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)  # type: ignore[attr-defined]
+    else:
+        dtype_ctx = contextlib.nullcontext()
 
     data_iter = iter(data_loader)
     processed = 0
@@ -1768,12 +1767,16 @@ def train_one_epoch(
         except Exception:
             logger.exception("Failed to aggregate LUT geometry metrics")
 
+    # Optional CE-vs-t diagnostic: align start with eval_start_epoch to avoid heavy probes right after resume
+    epoch_one = int(epoch) + 1
+    eval_start = int(getattr(args, "eval_start_epoch", 0))
     if (
         getattr(args, "wandb", False)
         and distributed_mode.is_main_process()
-        and epoch % 5 == 0
         and isinstance(path, MetricInducedGibbsProbPath)
         and getattr(args, "ko_metric_induced", False)
+        and epoch_one >= eval_start
+        and (epoch_one - eval_start) % 5 == 0
     ):
         schedule = getattr(path, "beta_schedule", None)
         ce_t_eps = float(getattr(args, "mi_t_eps", 1e-4))
