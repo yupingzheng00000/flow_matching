@@ -458,19 +458,19 @@ def _compute_embedding_collapse_metrics(
         stats: Dict[str, float] = {}
         var_sorted, _ = torch.sort(var_dim)
         var_median = float(torch.median(var_dim).item())
-        stats["train/lut/var_min"] = float(var_sorted[0].item())
-        stats["train/lut/var_p05"] = float(torch.quantile(var_dim, 0.05).item())
-        stats["train/lut/var_median"] = var_median
+        stats["lut/var_min"] = float(var_sorted[0].item())
+        stats["lut/var_p05"] = float(torch.quantile(var_dim, 0.05).item())
+        stats["lut/var_median"] = var_median
 
         collapse_abs = (var_dim < abs_eps).float().mean().item()
         rel_threshold = max(var_median * rel_eps, abs_eps)
         collapse_rel = (var_dim < rel_threshold).float().mean().item()
-        stats["train/lut/collapse_frac_abs"] = collapse_abs
-        stats["train/lut/collapse_frac_rel"] = collapse_rel
+        stats["lut/collapse_frac_abs"] = collapse_abs
+        stats["lut/collapse_frac_rel"] = collapse_rel
 
         top_k = int(min(max(smallest_k, 1), var_sorted.numel()))
         for idx in range(top_k):
-            stats[f"train/lut/var_smallest_{idx + 1}"] = float(var_sorted[idx].item())
+            stats[f"lut/var_smallest_{idx + 1}"] = float(var_sorted[idx].item())
 
         # Singular values from Gram matrix (size D x D)
         gram = torch.matmul(centered.transpose(0, 1), centered)
@@ -479,23 +479,23 @@ def _compute_embedding_collapse_metrics(
         sigma = torch.sqrt(eigvals)
         sigma, _ = torch.sort(sigma, descending=True)
         if sigma.numel() > 0:
-            stats["train/lut/sigma_max"] = float(sigma[0].item())
-            stats["train/lut/sigma_min"] = float(sigma[-1].item())
+            stats["lut/sigma_max"] = float(sigma[0].item())
+            stats["lut/sigma_min"] = float(sigma[-1].item())
             cond = float("inf")
             if sigma[-1] > 0:
                 cond = float((sigma[0] / sigma[-1]).item())
-            stats["train/lut/cond"] = cond
+            stats["lut/cond"] = cond
             sigma_sq = sigma.square()
             total_power = float(sigma_sq.sum().item())
             if total_power > 0:
                 stable_rank = total_power / float(sigma_sq.max().item() + 1e-12)
                 probs = (sigma_sq / sigma_sq.sum()).clamp_min(1e-12)
                 ent = float((-probs * probs.log()).sum().item())
-                stats["train/lut/stable_rank"] = stable_rank
-                stats["train/lut/effective_rank"] = math.exp(ent)
+                stats["lut/stable_rank"] = stable_rank
+                stats["lut/effective_rank"] = math.exp(ent)
             top_sig = int(min(top_k, sigma.numel()))
             for idx in range(top_sig):
-                stats[f"train/lut/sigma_{idx + 1}"] = float(sigma[idx].item())
+                stats[f"lut/sigma_{idx + 1}"] = float(sigma[idx].item())
 
     return stats
 
@@ -1644,12 +1644,12 @@ def train_one_epoch(
                             lut_weight = path.learnable_lut()
                             lut_flat = lut_weight.view(lut_weight.shape[0], -1)
                             channel_fro = torch.linalg.vector_norm(lut_flat, ord=2, dim=1)
-                            lut_diagnostics["train/lut/fro_norm_mean"] = float(channel_fro.mean().cpu())
+                            lut_diagnostics["lut/fro_norm_mean"] = float(channel_fro.mean().cpu())
                         if hasattr(path.learnable_lut, "scale_c") and path.learnable_lut.scale_c is not None:
                             scale_c_cpu = path.learnable_lut.scale_c.detach().cpu()
-                            lut_diagnostics["train/lut/scale_c_mean"] = float(scale_c_cpu.mean().item())
+                            lut_diagnostics["lut/scale_c_mean"] = float(scale_c_cpu.mean().item())
                         if lut_grad_norm_value is not None:
-                            lut_diagnostics["train/lut/grad_norm"] = float(
+                            lut_diagnostics["lut/grad_norm"] = float(
                                 lut_grad_norm_value.detach().cpu().item()
                                 if isinstance(lut_grad_norm_value, torch.Tensor)
                                 else float(lut_grad_norm_value)
@@ -1729,7 +1729,7 @@ def train_one_epoch(
                         )
                     if geom_metrics_step:
                         for key, value in geom_metrics_step.items():
-                            wandb_payload[key.replace("lut_", "train/lut_")] = value
+                            wandb_payload[key.replace("lut_", "lut_")] = value
                     if geodesic_energy_val is not None:
                         wandb_payload["train/geodesic_energy"] = float(geodesic_energy_val.cpu().item())
                     if geodesic_penalty is not None:
@@ -2114,9 +2114,9 @@ def _log_lut_diagnostics(
             try:
                 wandb.log(
                     {
-                        "train/lut_diag_image": wandb.Image(str(fname)),
-                        "train/lut/neg_delta_frac": neg_frac,
-                        "train/lut/ks_uniform_snapshot": ks_uniform,
+                        "lut_diag_image": wandb.Image(str(fname)),
+                        "lut/neg_delta_frac": neg_frac,
+                        "lut/ks_uniform_snapshot": ks_uniform,
                     },
                     step=epoch,
                 )

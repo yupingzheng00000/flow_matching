@@ -256,7 +256,7 @@ class LearnableLUT(nn.Module):
             device=device,
         )
         noise = torch.randn_like(weight) * 1e-3
-        return noise
+        return noise + weight
 
     def _small_noise_qr_init_free(self, *, device: Optional[torch.device], dtype: torch.dtype) -> Tensor:
         if self.emb_dim > self.vocab_size:
