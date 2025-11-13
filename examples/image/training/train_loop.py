@@ -2014,7 +2014,6 @@ def train_one_epoch(
                                         opts.DataZoomOpts(type_="slider"),
                                     ],
                                     tooltip_opts=opts.TooltipOpts(trigger="axis"),
-                                    grid_opts=opts.GridOpts(left="10%", right="8%", top="12%", bottom="18%"),
                                 )
                             )
                             ce_payload["train/ce_vs_t_chart"] = line
