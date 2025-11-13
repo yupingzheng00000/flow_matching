@@ -411,6 +411,7 @@ def _compute_lut_reconstruction_loss(
     *,
     sample_frac: float = 0.25,
     alpha: Optional[float] = None,
+    t: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
 
     zero = torch.zeros((), device=device, dtype=torch.float32)
@@ -427,23 +428,50 @@ def _compute_lut_reconstruction_loss(
     if N == 0:
         return zero, {}
 
-    N_sub = min(N, max(1, int(N * sample_frac)))
+    sample_frac = float(sample_frac)
+    if not math.isfinite(sample_frac):
+        sample_frac = 0.25
+    sample_frac = min(max(sample_frac, 0.0), 1.0)
+    if N == 0 or sample_frac == 0.0:
+        zero = torch.tensor(0.0, device=device)
+        alpha_val = float(alpha) if alpha is not None else 0.0
+        return zero, {
+            "train/lut_recon_loss": 0.0,
+            "train/lut_recon_acc": 0.0,
+            "train/lut_recon_alpha": alpha_val,
+        }
+
+    N_sub = max(1, min(N, int(N * sample_frac)))
     indices = torch.randperm(N, device=device)[:N_sub]
     targets_sub = targets_flat[indices]
 
     lut_weight = path.learnable_lut()
-    if lut_weight.dim() == 3:
-        E = lut_weight[0]          # [V, D]
-    else:
-        E = lut_weight             # [V, D]
+    E = lut_weight
+    if E.dim() == 1:
+        E = E.unsqueeze(0).unsqueeze(-1)
+    elif E.dim() == 2:
+        E = E.unsqueeze(0)
+    if E.dim() != 3:
+        logger.warning("Unexpected LUT weight shape %s; skipping recon loss.", tuple(E.shape))
+        zero = torch.tensor(0.0, device=device)
+        return zero, {}
 
-    z = E[targets_sub]            # [N_sub, D]
-    dist = path._pairwise_dist(z, E)  # [N_sub, V]
+    # Use first channel embeddings for reconstruction (channels share structure)
+    E0 = E[0]
+    z = E0[targets_sub]
+    dist = path._pairwise_dist(z, E0)
 
     if alpha is None:
-        alpha = getattr(path, "lut_recon_alpha", 5.0)
+        alpha_val = 5.0
+        beta_schedule = getattr(path, "beta_schedule", None)
+        if beta_schedule is not None and t is not None:
+            with torch.no_grad():
+                beta_t = beta_schedule(t)
+                alpha_val = float(beta_t.median().clamp_(1e-2, 50.0).item())
+    else:
+        alpha_val = float(alpha)
 
-    logits_rec = (-alpha * dist).to(dtype=torch.float32)
+    logits_rec = (-alpha_val * dist).to(dtype=torch.float32)
     loss_rec = F.cross_entropy(logits_rec, targets_sub, reduction="mean")
 
     with torch.no_grad():
@@ -452,7 +480,7 @@ def _compute_lut_reconstruction_loss(
     metrics = {
         "train/lut_recon_loss": float(loss_rec.item()),
         "train/lut_recon_acc": float(acc.item()),
-        "train/lut_recon_alpha": float(alpha),
+        "train/lut_recon_alpha": float(alpha_val),
     }
     return loss_rec, metrics
 
@@ -979,6 +1007,10 @@ def train_one_epoch(
     batch_loss = MeanMetric().to(device, non_blocking=True)
     epoch_loss = MeanMetric().to(device, non_blocking=True)
     entropy_metric = MeanMetric().to(device, non_blocking=True)
+    lut_recon_loss_metric = MeanMetric().to(device, non_blocking=True)
+    lut_recon_acc_metric = MeanMetric().to(device, non_blocking=True)
+    lut_recon_metrics_recorded = False
+    lut_recon_alpha_latest: Optional[float] = None
     cosine_scale_ratio_metric = MeanMetric().to(device, non_blocking=True)
     geodesic_penalty_metric = MeanMetric().to(device, non_blocking=True)
     geodesic_penalty_updated = False
@@ -1226,7 +1258,10 @@ def train_one_epoch(
 
             # LUT embedding reconstruction loss (prevent collapse)
             lut_recon_weight = float(getattr(args, "lut_recon_weight", 0.0))
-            if lut_recon_weight > 0.0 and isinstance(path, MetricInducedGibbsProbPath):
+            lut_recon_active = (
+                lut_recon_weight > 0.0 and isinstance(path, MetricInducedGibbsProbPath)
+            )
+            if lut_recon_active:
                 lut_recon_alpha = getattr(args, "lut_recon_alpha", None)
                 lut_recon_sample_frac = float(getattr(args, "lut_recon_sample_frac", 0.25))
 
@@ -1239,7 +1274,12 @@ def train_one_epoch(
                     t=t,
                 )
                 loss = loss + lut_recon_weight * loss_rec
-                stats.update(rec_metrics)
+                lut_recon_loss_metric.update(loss_rec.detach())
+                lut_recon_acc_metric.update(
+                    torch.tensor(rec_metrics.get("train/lut_recon_acc", 0.0), device=device)
+                )
+                lut_recon_alpha_latest = rec_metrics.get("train/lut_recon_alpha", None)
+                lut_recon_metrics_recorded = True
 
             ce_unweighted_scalar = float(ce_unweighted.detach().item())
             ce_weighted_scalar = float(ce_weighted.detach().item())
@@ -1834,6 +1874,18 @@ def train_one_epoch(
             )
         except Exception:
             pass
+    if lut_recon_metrics_recorded:
+        try:
+            stats["train/lut_recon_loss"] = float(
+                lut_recon_loss_metric.compute().detach().cpu().item()
+            )
+            stats["train/lut_recon_acc"] = float(
+                lut_recon_acc_metric.compute().detach().cpu().item()
+            )
+            if lut_recon_alpha_latest is not None:
+                stats["train/lut_recon_alpha"] = float(lut_recon_alpha_latest)
+        except Exception:
+            logger.exception("Failed to aggregate LUT reconstruction metrics")
     if geometry_count > 0:
         try:
             avg_metrics = {
