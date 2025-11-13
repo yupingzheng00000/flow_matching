@@ -316,6 +316,12 @@ def get_args_parser():
         help="Only run one batch of training and evaluation.",
     )
     parser.add_argument(
+        "--eval_start_epoch",
+        default=0,
+        type=int,
+        help="Earliest epoch (1-based) at which evaluation is allowed to run.",
+    )
+    parser.add_argument(
         "--discrete_flow_matching",
         action="store_true",
         help="Train discrete flow matching model.",

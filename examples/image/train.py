@@ -1037,11 +1037,16 @@ def main(args):
                 "display_epoch": display_epoch,
             }
 
-        if args.output_dir and (
-            (args.eval_frequency > 0 and (epoch + 1) % args.eval_frequency == 0)
-            or args.eval_only
-            or args.test_run
-        ):
+        eval_start = int(getattr(args, "eval_start_epoch", 0))
+        should_eval = False
+        if args.eval_frequency > 0:
+            if (epoch + 1) >= eval_start:
+                relative = (epoch + 1) - eval_start
+                if relative % args.eval_frequency == 0:
+                    should_eval = True
+        if args.eval_only or args.test_run:
+            should_eval = True
+        if args.output_dir and should_eval:
             if not args.eval_only:
                 save_model(
                     args=args,
