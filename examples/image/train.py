@@ -473,6 +473,22 @@ def main(args):
     )
     logger.info(str(sampler_train))
 
+    eval_batch_size = int(getattr(args, "eval_batch_size", None) or args.batch_size)
+    if args.distributed:
+        sampler_eval = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=False
+        )
+    else:
+        sampler_eval = torch.utils.data.SequentialSampler(dataset_train)
+    data_loader_eval = torch.utils.data.DataLoader(
+        dataset_train,
+        sampler=sampler_eval,
+        batch_size=eval_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False,
+    )
+
     beta_schedule: Optional[BetaSchedule] = None
     beta_schedule_ema: Optional[BetaScheduleEMA] = None
     metric_ema: Optional[LearnableMetricEMA] = None
@@ -1061,6 +1077,9 @@ def main(args):
                     logger.warning(f"Could not create display-epoch alias: {_e}")
             if args.distributed:
                 data_loader_train.sampler.set_epoch(0)
+                eval_sampler = getattr(data_loader_eval, "sampler", None)
+                if isinstance(eval_sampler, torch.utils.data.DistributedSampler):
+                    eval_sampler.set_epoch(0)
             if distributed_mode.is_main_process():
                 fid_samples = args.fid_samples - (num_tasks - 1) * (
                     args.fid_samples // num_tasks
@@ -1070,7 +1089,7 @@ def main(args):
             try:
                 eval_stats = eval_model(
                     model,
-                    data_loader_train,
+                    data_loader_eval,
                     device,
                     epoch=epoch,
                     fid_samples=fid_samples,

@@ -1108,6 +1108,8 @@ def train_one_epoch(
             samples = (samples * 255.0).to(torch.long)
 
             batch_size = samples.shape[0]
+            schedule = getattr(path, "beta_schedule", None)
+            schedule_is_exp = isinstance(schedule, ExpMonotoneRQSSchedule)
             gamma = max(float(getattr(args, "t_bias_gamma", 1.5)), 1e-6)
             u = torch.rand(batch_size, device=device)
             t_raw = u.pow(gamma)
