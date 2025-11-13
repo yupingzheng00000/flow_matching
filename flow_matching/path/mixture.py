@@ -1655,3 +1655,33 @@ class MetricInducedGibbsProbPath(ProbPath):
         """
         raise NotImplementedError("Use MixtureDiscreteEulerSolver only with MixtureDiscreteProbPath.")
 
+    # ------------------------------------------------------------------
+    # Checkpoint helpers
+    # ------------------------------------------------------------------
+    def state_dict(self) -> dict[str, dict]:
+        state: dict[str, dict] = {}
+        if self.learnable_lut is not None:
+            state["learnable_lut"] = self.learnable_lut.state_dict()
+        if self.learnable_metric is not None:
+            state["learnable_metric"] = self.learnable_metric.state_dict()
+
+        schedule = getattr(self, "beta_schedule", None)
+        if schedule is not None and hasattr(schedule, "state_dict"):
+            state["beta_schedule"] = schedule.state_dict()
+
+        return state
+
+    def load_state_dict(self, state: dict[str, dict]) -> None:
+        if "learnable_lut" in state and self.learnable_lut is not None:
+            self.learnable_lut.load_state_dict(state["learnable_lut"])
+        if "learnable_metric" in state and self.learnable_metric is not None:
+            self.learnable_metric.load_state_dict(state["learnable_metric"])
+
+        schedule = getattr(self, "beta_schedule", None)
+        if (
+            "beta_schedule" in state
+            and schedule is not None
+            and hasattr(schedule, "load_state_dict")
+        ):
+            schedule.load_state_dict(state["beta_schedule"])
+
