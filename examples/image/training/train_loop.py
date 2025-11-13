@@ -1971,19 +1971,49 @@ def train_one_epoch(
         if distributed_mode.is_main_process() and t_vals is not None and ce_vals is not None:
             wandb_logger = _resolve_wandb_module(args)
             if wandb_logger is not None:
-                # Log CE vs t as a line plot
-                table = wandb_logger.Table(
-                    data=[[float(t), float(ce)] for t, ce in zip(t_vals, ce_vals)],
-                    columns=["t", "cross_entropy"]
-                )
                 ce_payload = {
-                    "train/ce_vs_t": wandb_logger.plot.line(
-                        table, "t", "cross_entropy", title="Cross Entropy vs Time"
-                    ),
                     "train/ce_t_mean": float(ce_vals.mean().item()),
                     "train/ce_t_min": float(ce_vals.min().item()),
                     "train/ce_t_max": float(ce_vals.max().item()),
                 }
+                logged_chart = False
+                try:
+                    if hasattr(wandb_logger, "Table") and hasattr(wandb_logger, "plot"):
+                        table = wandb_logger.Table(
+                            data=[[float(t), float(ce)] for t, ce in zip(t_vals, ce_vals)],
+                            columns=["t", "cross_entropy"],
+                        )
+                        ce_payload["train/ce_vs_t"] = wandb_logger.plot.line(
+                            table, "t", "cross_entropy", title="Cross Entropy vs Time"
+                        )
+                        logged_chart = True
+                    elif getattr(wandb_logger, "__name__", "").lower() == "swanlab":
+                        try:
+                            from pyecharts.charts import Line  # type: ignore
+                            from pyecharts import options as opts  # type: ignore
+
+                            line = (
+                                Line()
+                                .add_xaxis([float(t) for t in t_vals])
+                                .add_yaxis(
+                                    "cross_entropy",
+                                    [float(ce) for ce in ce_vals],
+                                    is_smooth=True,
+                                )
+                                .set_global_opts(
+                                    title_opts=opts.TitleOpts(title="Cross Entropy vs Time"),
+                                    xaxis_opts=opts.AxisOpts(name="t"),
+                                    yaxis_opts=opts.AxisOpts(name="cross_entropy"),
+                                )
+                            )
+                            ce_payload["train/ce_vs_t_chart"] = line
+                            logged_chart = True
+                        except ImportError:
+                            logger.warning(
+                                "pyecharts not available; skipping SwanLab CE-vs-t chart."
+                            )
+                except Exception:
+                    logger.exception("Failed to build CE-vs-t visualization payload")
                 wandb_logger.log(ce_payload, step=epoch)
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
