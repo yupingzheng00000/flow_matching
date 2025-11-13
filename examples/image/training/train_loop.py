@@ -1945,8 +1945,7 @@ def train_one_epoch(
     want_diag = (
         isinstance(path, MetricInducedGibbsProbPath)
         and getattr(args, "ko_metric_induced", False)
-        and epoch_one >= eval_start
-        and (epoch_one - eval_start) % 5 == 0
+        and epoch_one % 1 == 0
     )
     # All ranks enter two barriers so non-main ranks don't run ahead to DDP collectives
     if dist.is_available() and dist.is_initialized():
