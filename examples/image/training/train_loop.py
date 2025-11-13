@@ -8,10 +8,12 @@ import contextlib
 import gc
 import logging
 import math
+import os
 from collections import deque, defaultdict
 from typing import Dict, Iterable, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -1954,184 +1956,136 @@ def train_one_epoch(
 
 
 def _log_lut_diagnostics(path: MetricInducedGibbsProbPath, epoch: int, logger: logging.Logger, args: argparse.Namespace) -> None:
-    """Visualize LUT diagnostics with matplotlib plots.
-    
-    Creates a comprehensive visualization showing:
-    1. LUT curves for all channels
-    2. Channel correlations and metrics
-    3. Health indicators
-    """
+    """Visualize LUT diagnostics in a compact, baseline-referenced layout."""
     try:
         import matplotlib
-        matplotlib.use('Agg')  # Non-interactive backend
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
     except ImportError:
         logger.warning("matplotlib not available, skipping LUT visualization")
         return
-    
+
+    if getattr(path, "learnable_lut", None) is None:
+        logger.info("LUT diagnostics skipped: path has no learnable_lut")
+        return
+
     with torch.no_grad():
-        # Use forward() to get renormalized weights (if enabled)
-        lut_weights_raw = path.learnable_lut().cpu()  # [C, V, D]
-        shape = lut_weights_raw.shape
-        
-        # Handle both [C, V] (legacy 1D) and [C, V, D] (new multi-dim) formats
-        if len(shape) == 2:
-            # Legacy 1D format: [C, V]
-            C, V = shape
-            D = 1
-            lut_weights = lut_weights_raw.numpy()
-            is_multidim = False
-        elif len(shape) == 3:
-            # New multi-dim format: [C, V, D]
-            C, V, D = shape
-            if D == 1:
-                # Squeeze out singleton dimension for backward compatibility
-                lut_weights = lut_weights_raw.squeeze(-1).numpy()  # [C, V]
-                is_multidim = False
-            else:
-                # Compute L2 norm per token as scalar proxy for visualization
-                lut_weights = torch.norm(lut_weights_raw, p=2, dim=-1).numpy()  # [C, V]
-                is_multidim = True
-        else:
-            logger.error(f"Unexpected LUT weight shape: {shape}")
+        lut_weights_raw = path.learnable_lut()
+        if lut_weights_raw is None:
+            logger.info("learnable_lut() returned None; skipping diagnostics")
             return
-        
-        channel_names = ['R', 'G', 'B'] if C == 3 else [f'Ch{i}' for i in range(C)]
-        colors = ['red', 'green', 'blue'] if C == 3 else [f'C{i}' for i in range(C)]
-        
-        # Create figure with subplots
-        fig = plt.figure(figsize=(16, 10))
-        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
-        
-        # 1. Main LUT curves
-        ax1 = fig.add_subplot(gs[0:2, 0:2])
+
+        weight = lut_weights_raw.detach().cpu()
+        if weight.dim() == 2:
+            weight = weight.unsqueeze(-1)
+        elif weight.dim() != 3:
+            logger.error(f"Unexpected LUT weight shape: {tuple(weight.shape)}")
+            return
+
+        C, V, D = weight.shape
+        channel_names = ["R", "G", "B"] if C == 3 else [f"Ch{i}" for i in range(C)]
+        colors = ["red", "green", "blue"] if C == 3 else [f"C{i}" for i in range(C)]
+
+        # Scalar view for plotting: first component if D==1 else L2 norm
+        if D == 1:
+            curves = weight.squeeze(-1).numpy()
+        else:
+            curves = torch.linalg.norm(weight, ord=2, dim=-1).numpy()
+
+        # Baseline reference (depends on embed_range)
+        if getattr(path, "embed_range", "pm1") == "pm1":
+            baseline = np.linspace(-1.0, 1.0, V, dtype=np.float32)
+        else:
+            baseline = np.linspace(0.0, 1.0, V, dtype=np.float32)
+
+        # Metrics
+        diff = curves - baseline[None, :]
+        mean_abs = np.mean(np.abs(diff), axis=1)
+        max_abs = np.max(np.abs(diff), axis=1)
+        inv_frac = np.sum(np.diff(curves, axis=1) < 0, axis=1) / max(V - 1, 1)
+        norms = np.linalg.norm(curves, axis=1)
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+        fig.suptitle(f"LUT Diagnostics (Epoch {epoch})", fontsize=15, fontweight="bold")
+
+        # 1) Curves vs baseline
+        ax_curves = axes[0, 0]
         x = np.arange(V)
+        ax_curves.plot(x, baseline, linestyle="--", color="gray", label="baseline")
         for c, (name, color) in enumerate(zip(channel_names, colors)):
-            ax1.plot(x, lut_weights[c], label=name, color=color, alpha=0.8, linewidth=1.5)
-        ax1.set_xlabel('Token Value', fontsize=12)
-        ylabel = 'L2 Norm of Embedding' if is_multidim else 'Embedding Value'
-        ax1.set_ylabel(ylabel, fontsize=12)
-        title_suffix = f' (D={D})' if is_multidim else ''
-        ax1.set_title(f'LUT Curves{title_suffix} - Epoch {epoch}', fontsize=14, fontweight='bold')
-        ax1.legend(loc='best')
-        ax1.grid(True, alpha=0.3)
-        
-        # 2. Channel L2 Norms
-        ax2 = fig.add_subplot(gs[0, 2])
-        norms = [np.linalg.norm(lut_weights[c]) for c in range(C)]
-        ax2.bar(channel_names, norms, color=colors, alpha=0.7)
-        ax2.set_ylabel('L2 Norm', fontsize=11)
-        ax2.set_title('Channel Norms', fontsize=12, fontweight='bold')
-        ax2.grid(True, alpha=0.3, axis='y')
-        for i, v in enumerate(norms):
-            ax2.text(i, v + 0.05, f'{v:.2f}', ha='center', va='bottom', fontsize=9)
-        
-        # 3. Spearman ρ (rank correlation)
-        ax3 = fig.add_subplot(gs[1, 2])
-        init_order = np.arange(V, dtype=np.float32)
-        rhos = []
-        for c in range(C):
-            emb = lut_weights[c]
-            rank_emb = np.argsort(np.argsort(emb)).astype(np.float32)
-            # Pearson correlation of ranks = Spearman
-            rho = np.corrcoef(rank_emb, init_order)[0, 1]
-            rhos.append(rho)
-        ax3.bar(channel_names, rhos, color=colors, alpha=0.7)
-        ax3.set_ylabel('Spearman ρ', fontsize=11)
-        ax3.set_title('Rank Preservation', fontsize=12, fontweight='bold')
-        ax3.axhline(y=1.0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
-        ax3.set_ylim([min(rhos) - 0.01, 1.01])
-        ax3.grid(True, alpha=0.3, axis='y')
-        for i, v in enumerate(rhos):
-            ax3.text(i, v - 0.005, f'{v:.4f}', ha='center', va='top', fontsize=9)
-        
-        # 4. Inversions (monotonicity)
-        ax4 = fig.add_subplot(gs[2, 0])
-        inversions = []
-        for c in range(C):
-            diffs = lut_weights[c][1:] - lut_weights[c][:-1]
-            inv_count = np.sum(diffs < 0)
-            inversions.append(inv_count)
-        ax4.bar(channel_names, inversions, color=colors, alpha=0.7)
-        ax4.set_ylabel('Inversion Count', fontsize=11)
-        ax4.set_title('Monotonicity Check', fontsize=12, fontweight='bold')
-        ax4.grid(True, alpha=0.3, axis='y')
-        for i, v in enumerate(inversions):
-            ax4.text(i, v + 0.5, f'{int(v)}', ha='center', va='bottom', fontsize=9)
-        
-        # 5. Channel correlations (heatmap)
-        ax5 = fig.add_subplot(gs[2, 1])
+            ax_curves.plot(x, curves[c], color=color, label=name, linewidth=1.6, alpha=0.85)
+        ax_curves.set_xlabel("Token index")
+        ax_curves.set_ylabel("Embedding value" if D == 1 else "Embedding L2 norm")
+        ax_curves.grid(True, alpha=0.2)
+        ax_curves.legend(loc="best")
+
+        # 2) Error summary bars
+        ax_error = axes[0, 1]
+        width = 0.35
+        idx = np.arange(C)
+        ax_error.bar(idx - width / 2, mean_abs, width, color=colors, alpha=0.8, label="mean |Δ|")
+        ax_error.bar(idx + width / 2, max_abs, width, color=colors, alpha=0.4, label="max |Δ|")
+        ax_error.set_xticks(idx)
+        ax_error.set_xticklabels(channel_names)
+        ax_error.set_ylabel("Deviation")
+        ax_error.set_title("Deviation from baseline")
+        ax_error.grid(True, axis="y", alpha=0.2)
+        ax_error.legend()
+
+        # 3) Monotonicity & correlation heatmap
+        ax_inv = axes[1, 0]
+        ax_inv.bar(channel_names, inv_frac, color=colors, alpha=0.8)
+        ax_inv.set_ylabel("Inversion fraction")
+        ax_inv.set_ylim(0.0, max(0.1, inv_frac.max() + 0.02))
+        ax_inv.set_title("Monotonicity violations")
+        ax_inv.grid(True, axis="y", alpha=0.2)
+
+        ax_corr = axes[1, 1]
         if C > 1:
-            corr_matrix = np.corrcoef(lut_weights)
-            im = ax5.imshow(corr_matrix, cmap='RdYlGn_r', vmin=0.95, vmax=1.0, aspect='auto')
-            ax5.set_xticks(range(C))
-            ax5.set_yticks(range(C))
-            ax5.set_xticklabels(channel_names)
-            ax5.set_yticklabels(channel_names)
-            ax5.set_title('Channel Correlation', fontsize=12, fontweight='bold')
-            # Add correlation values
+            corr = np.corrcoef(curves)
+            im = ax_corr.imshow(corr, cmap="RdYlGn_r", vmin=0.9, vmax=1.0)
+            ax_corr.set_xticks(range(C))
+            ax_corr.set_yticks(range(C))
+            ax_corr.set_xticklabels(channel_names)
+            ax_corr.set_yticklabels(channel_names)
+            ax_corr.set_title("Channel correlation")
             for i in range(C):
                 for j in range(C):
-                    text = ax5.text(j, i, f'{corr_matrix[i, j]:.4f}',
-                                   ha='center', va='center', color='black', fontsize=9)
-            plt.colorbar(im, ax=ax5, fraction=0.046, pad=0.04)
+                    ax_corr.text(j, i, f"{corr[i, j]:.3f}", ha="center", va="center", fontsize=9)
+            plt.colorbar(im, ax=ax_corr, fraction=0.046, pad=0.04)
         else:
-            ax5.text(0.5, 0.5, 'Single Channel', ha='center', va='center', fontsize=12)
-            ax5.set_xticks([])
-            ax5.set_yticks([])
-        
-        # 6. Health summary
-        ax6 = fig.add_subplot(gs[2, 2])
-        ax6.axis('off')
-        health_text = f"Epoch {epoch}\n\n"
-        health_text += "Health Status:\n"
-        all_good = True
-        for c, name in enumerate(channel_names):
-            emb = lut_weights[c]
-            diffs = emb[1:] - emb[:-1]
-            inv_count = np.sum(diffs < 0)
-            inv_ratio = inv_count / (V - 1)
-            std_val = np.std(emb)
-            
-            issues = []
-            if inv_ratio > 0.06:
-                issues.append(f"inv>{int(inv_ratio*100)}%")
-                all_good = False
-            if std_val > 2.0:
-                issues.append(f"std>{std_val:.1f}")
-                all_good = False
-            if std_val < 0.2:
-                issues.append(f"std<{std_val:.2f}")
-                all_good = False
-            if emb[0] > emb[-1]:
-                issues.append("flipped")
-                all_good = False
-            
-            if issues:
-                health_text += f"  {name}: ⚠ {', '.join(issues)}\n"
-            else:
-                health_text += f"  {name}: ✓\n"
-        
-        if all_good:
-            health_text += "\n[OK] All checks passed"
-        
-        ax6.text(0.1, 0.9, health_text, transform=ax6.transAxes,
-                fontsize=10, verticalalignment='top', family='monospace',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-        
-        # Save and log
-        plt.suptitle(f'LUT Diagnostics - Epoch {epoch}', fontsize=16, fontweight='bold', y=0.98)
-        
-        # Save to file
-        save_dir = getattr(args, 'output_dir', './output_dir')
-        import os
+            ax_corr.axis("off")
+            ax_corr.text(0.5, 0.5, "Single channel", ha="center", va="center")
+
+        # Text summary overlay (reuse top-right area if single channel)
+        summary_lines = ["Summary:"]
+        for idx_c, name in enumerate(channel_names):
+            summary_lines.append(
+                f"  {name}: |Δ|_mean={mean_abs[idx_c]:.4f}, max={max_abs[idx_c]:.4f}, inv={inv_frac[idx_c]*100:.2f}%"
+            )
+        summary_lines.append("")
+        summary_lines.append("  Norms: " + ", ".join(f"{n:.2f}" for n in norms))
+        summary_text = "\n".join(summary_lines)
+        axes[0, 1].text(
+            1.02,
+            0.5,
+            summary_text,
+            transform=axes[0, 1].transAxes,
+            fontsize=10,
+            verticalalignment="center",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+
+        plt.tight_layout(rect=(0, 0, 1, 0.96))
+
+        # Save + log
+        save_dir = getattr(args, "output_dir", "./output_dir")
         os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f'lut_diagnostics_epoch_{epoch:04d}.png')
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        save_path = os.path.join(save_dir, f"lut_diagnostics_epoch_{epoch:04d}.png")
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
         logger.info(f"LUT diagnostics visualization saved to {save_path}")
-        
-        # Log to wandb if available
+
         wandb_logger = _resolve_wandb_module(args)
         if wandb_logger is not None:
             try:
@@ -2142,7 +2096,7 @@ def _log_lut_diagnostics(path: MetricInducedGibbsProbPath, epoch: int, logger: l
                     logger.info(f"LUT diagnostics uploaded to wandb (run: {run_name})")
                 else:
                     logger.info("wandb not initialized, image saved locally only")
-            except Exception as e:
-                logger.info(f"wandb upload skipped ({type(e).__name__}), image saved locally")
-        
+            except Exception as exc:
+                logger.info(f"wandb upload skipped ({type(exc).__name__}), image saved locally")
+
         plt.close(fig)
