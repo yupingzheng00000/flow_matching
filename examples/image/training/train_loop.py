@@ -1991,31 +1991,22 @@ def train_one_epoch(
                             from pyecharts.charts import Line  # type: ignore
                             from pyecharts import options as opts  # type: ignore
 
-                            x_values = [float(t) for t in t_vals]
+                            x_labels = [f"{float(t):.3f}" for t in t_vals]
                             y_values = [float(ce) for ce in ce_vals]
-                            xy_pairs = [[x, y] for x, y in zip(x_values, y_values)]
                             line = (
                                 Line()
-                                .add_xaxis([])
+                                .add_xaxis(x_labels)
                                 .add_yaxis(
                                     "cross_entropy",
-                                    xy_pairs,
+                                    y_values,
                                     is_smooth=True,
                                     symbol_size=4,
                                     label_opts=opts.LabelOpts(is_show=False),
                                 )
                                 .set_global_opts(
                                     title_opts=opts.TitleOpts(title="Cross Entropy vs Time"),
-                                    xaxis_opts=opts.AxisOpts(
-                                        type_="value",
-                                        name="t",
-                                        min_=0.0,
-                                        max_=1.0,
-                                        boundary_gap=False,
-                                        axislabel_opts=opts.LabelOpts(formatter="{value:.2f}"),
-                                    ),
+                                    xaxis_opts=opts.AxisOpts(name="t"),
                                     yaxis_opts=opts.AxisOpts(
-                                        type_="value",
                                         name="cross_entropy",
                                         axislabel_opts=opts.LabelOpts(formatter="{value:.2f}"),
                                     ),
@@ -2024,7 +2015,7 @@ def train_one_epoch(
                                         opts.DataZoomOpts(type_="slider"),
                                     ],
                                     tooltip_opts=opts.TooltipOpts(trigger="axis"),
-                                    grid_opts=opts.GridOpts(left="10%", right="8%", top="12%", bottom="15%"),
+                                    grid_opts=opts.GridOpts(left="10%", right="8%", top="12%", bottom="18%"),
                                 )
                             )
                             ce_payload["train/ce_vs_t_chart"] = line
