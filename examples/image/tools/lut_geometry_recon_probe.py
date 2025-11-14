@@ -55,9 +55,19 @@ def _save_metrics_json(
     metrics: Dict[str, float],
     metadata: Dict[str, int],
 ) -> None:
+    def _convert_meta_value(value):
+        # Preserve non-numeric metadata (e.g., embed_range="pm1") as-is.
+        try:
+            # Torch / NumPy integer-like values are converted to plain int
+            if isinstance(value, (int,)):
+                return int(value)
+            return value
+        except Exception:
+            return value
+
     payload = {
         "metrics": metrics,
-        "meta": {name: int(value) for name, value in metadata.items()},
+        "meta": {name: _convert_meta_value(value) for name, value in metadata.items()},
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
@@ -438,4 +448,3 @@ def main(argv: Optional[Tuple[str, ...]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
