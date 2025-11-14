@@ -174,6 +174,7 @@ def load_lut_from_checkpoint(path: Path, lut_key: str) -> Tuple[torch.Tensor, Di
 
     path_state = checkpoint.get("path", {})
     if isinstance(path_state, dict) and path_state:
+        # Common case: flattened keys like "learnable_lut.weight"
         lut_state = {
             key[len("learnable_lut.") :]: value
             for key, value in path_state.items()
@@ -181,6 +182,11 @@ def load_lut_from_checkpoint(path: Path, lut_key: str) -> Tuple[torch.Tensor, Di
         }
         if lut_state:
             weight, meta = _instantiate_lut_from_state(lut_state, embed_range)
+            return weight, meta
+        # Fallback: nested state dict stored directly under "learnable_lut"
+        nested = path_state.get("learnable_lut")
+        if isinstance(nested, dict):
+            weight, meta = _instantiate_lut_from_state(nested, embed_range)
             return weight, meta
 
     extra = checkpoint.get("extra_modules")
