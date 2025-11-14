@@ -565,6 +565,26 @@ def _compute_embedding_collapse_metrics(
         for idx in range(top_k):
             stats[f"lut/var_smallest_{idx + 1}"] = float(var_sorted[idx].item())
 
+        # Global random-pair cosine (anisotropy) diagnostic
+        try:
+            n_rows, n_dims = centered.shape
+            if n_rows >= 2 and n_dims > 0:
+                # Limit the number of sampled pairs for efficiency.
+                # For very small matrices, fall back to all possible pairs.
+                max_pairs = 10_000
+                total_pairs = n_rows * (n_rows - 1)
+                num_pairs = int(min(max_pairs, total_pairs))
+                if num_pairs > 0:
+                    idx_i = torch.randint(0, n_rows, (num_pairs,), device=centered.device)
+                    idx_j = torch.randint(0, n_rows, (num_pairs,), device=centered.device)
+                    ei = F.normalize(centered[idx_i], dim=-1, eps=1e-12)
+                    ej = F.normalize(centered[idx_j], dim=-1, eps=1e-12)
+                    cos_vals = (ei * ej).sum(dim=-1)
+                    stats["lut/global_avg_cos"] = float(cos_vals.mean().item())
+        except Exception:
+            # Keep collapse metrics robust even if cosine diagnostics fail.
+            pass
+
         # Singular values from Gram matrix (size D x D)
         gram = torch.matmul(centered.transpose(0, 1), centered)
         eigvals = torch.linalg.eigvalsh(gram)
