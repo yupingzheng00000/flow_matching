@@ -24,8 +24,8 @@ if [[ ! -f "${EXPERIMENTS_FILE}" ]]; then
 fi
 
 if [[ ! -f "${LEDGER_FILE}" ]]; then
-    # Include per-experiment lut_recon_sample_frac column for provenance
-    echo -e "timestamp\tphase\tgamma\tlambda\tlut_recon_sample_frac\trun_name\toutput_dir\tgit_commit\tnote\tstatus" > "${LEDGER_FILE}"
+    # Include per-experiment lut_recon_weight column for provenance
+    echo -e "timestamp\tphase\tgamma\tlambda\tlut_recon_weight\trun_name\toutput_dir\tgit_commit\tnote\tstatus" > "${LEDGER_FILE}"
 fi
 
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
@@ -74,10 +74,9 @@ COMMON_ARGS=(
     "--t_weight_mode=linear_t"
     "--t_weight_normalize"
     "--bf16"
-    "--lut_recon_weight=0.5"
 )
 
-# Default per-experiment value for lut_recon_sample_frac (can be overridden in experiments.tsv)
+# Fixed per-experiment value for lut_recon_sample_frac (sampling budget)
 DEFAULT_LUT_RECON_SAMPLE_FRAC=0.25
 
 print_command_to_file() {
@@ -144,7 +143,7 @@ wait_for_existing_job() {
 run_experiment() {
     local gamma="$1"
     local lambda="$2"
-    local lut_recon_sample_frac="$3"
+    local lut_recon_weight="$3"
     local note="$4"
 
     if [[ -z "${gamma}" || "${gamma}" == "gamma" ]]; then
@@ -155,16 +154,16 @@ run_experiment() {
     lambda="${lambda//$'\r'/}"
     note="${note//$'\r'/}"
 
-    # Resolve lut_recon_sample_frac: use provided per-experiment value or default
-    if [[ -z "${lut_recon_sample_frac}" ]]; then
-        lut_recon_sample_frac="${DEFAULT_LUT_RECON_SAMPLE_FRAC}"
+    # Resolve lut_recon_weight: use provided per-experiment value or default
+    if [[ -z "${lut_recon_weight}" ]]; then
+        lut_recon_weight="0.0"
     fi
 
-    # Build run name and output dir; include lut_recon_sample_frac suffix for provenance
+    # Build run name and output dir; include lut_recon_weight suffix for provenance
     local run_name_base
     run_name_base=$(printf "learned_emb_16d_ga%s_la%s" "${gamma}" "${lambda}")
     local run_name
-    run_name=$(printf "%s_sr%s" "${run_name_base}" "${lut_recon_sample_frac}")
+    run_name=$(printf "%s_rw%s" "${run_name_base}" "${lut_recon_weight}")
     local output_dir="./output_dir/${run_name}"
     local log_file="${LOG_DIR}/${run_name}.log"
     local args_file="${output_dir}/args.txt"
@@ -183,11 +182,12 @@ run_experiment() {
     cmd+=("--wandb_run_name=${run_name}")
     cmd+=("--t_bias_gamma=${gamma}")
     cmd+=("--t_weight_lambda=${lambda}")
-    cmd+=("--lut_recon_sample_frac=${lut_recon_sample_frac}")
+    cmd+=("--lut_recon_weight=${lut_recon_weight}")
+    cmd+=("--lut_recon_sample_frac=${DEFAULT_LUT_RECON_SAMPLE_FRAC}")
 
     local start_time
     start_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    echo -e "${start_time}\tSTART\t${gamma}\t${lambda}\t${lut_recon_sample_frac}\t${run_name}\t${output_dir}\t${GIT_COMMIT}\t${note}\t-" >> "${LEDGER_FILE}"
+    echo -e "${start_time}\tSTART\t${gamma}\t${lambda}\t${lut_recon_weight}\t${run_name}\t${output_dir}\t${GIT_COMMIT}\t${note}\t-" >> "${LEDGER_FILE}"
     printf ">>> [%s] Starting gamma=%s lambda=%s (%s)\n" "${start_time}" "${gamma}" "${lambda}" "${note}" | tee -a "${log_file}"
 
     print_command_to_file "${args_file}" "${group_name}" "${cmd[@]}"
@@ -203,7 +203,7 @@ run_experiment() {
     if [[ "${exit_code}" -ne 0 ]]; then
         status="FAIL(${exit_code})"
     fi
-    echo -e "${end_time}\tEND\t${gamma}\t${lambda}\t${lut_recon_sample_frac}\t${run_name}\t${output_dir}\t${GIT_COMMIT}\t${note}\t${status}" >> "${LEDGER_FILE}"
+    echo -e "${end_time}\tEND\t${gamma}\t${lambda}\t${lut_recon_weight}\t${run_name}\t${output_dir}\t${GIT_COMMIT}\t${note}\t${status}" >> "${LEDGER_FILE}"
     printf "<<< [%s] Finished gamma=%s lambda=%s status=%s\n" "${end_time}" "${gamma}" "${lambda}" "${status}" | tee -a "${log_file}"
 
     if [[ "${exit_code}" -ne 0 ]]; then
@@ -226,18 +226,18 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     gamma="${parts[0]:-}"
     lambda="${parts[1]:-}"
     if [ "${#parts[@]}" -ge 4 ]; then
-        lut_recon_sample_frac="${parts[2]}"
+        lut_recon_weight="${parts[2]}"
         note="${parts[3]}"
     elif [ "${#parts[@]}" -eq 3 ]; then
         # Legacy 3-column format: gamma, lambda, note
-        lut_recon_sample_frac=""
+        lut_recon_weight=""
         note="${parts[2]}"
     else
-        lut_recon_sample_frac=""
+        lut_recon_weight=""
         note=""
     fi
 
-    run_experiment "${gamma}" "${lambda}" "${lut_recon_sample_frac}" "${note:-}"
+    run_experiment "${gamma}" "${lambda}" "${lut_recon_weight}" "${note:-}"
 done < "${EXPERIMENTS_FILE}"
 
 echo "All experiments from ${EXPERIMENTS_FILE} have been processed."
