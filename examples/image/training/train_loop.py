@@ -11,6 +11,17 @@ import math
 import os
 from collections import deque, defaultdict
 from typing import Dict, Iterable, Optional, Tuple
+import sys
+from pathlib import Path
+
+# Add project root to sys.path to import local modules like models, training
+_this_file = Path(__file__).resolve()
+_project_root = _this_file.parents[3]  # .../flow_matching
+_examples_root = _this_file.parents[2]  # .../flow_matching/examples
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+if str(_examples_root) not in sys.path:
+    sys.path.insert(0, str(_examples_root))
 
 import torch
 import torch.distributed as dist
@@ -27,12 +38,12 @@ from flow_matching.path import (
 )
 from flow_matching.path.beta_schedules import ExpMonotoneRQSSchedule
 from flow_matching.path.scheduler import PolynomialConvexScheduler
-from models.ema import EMA
+from examples.image.models.ema import EMA
 from torch.nn.parallel import DistributedDataParallel
 
 from torchmetrics.aggregation import MeanMetric
-from training.grad_scaler import NativeScalerWithGradNormCount
-from training import distributed_mode
+from examples.image.training.grad_scaler import NativeScalerWithGradNormCount
+from examples.image.training import distributed_mode
 
 logger = logging.getLogger(__name__)
 
@@ -553,26 +564,6 @@ def _compute_embedding_collapse_metrics(
         top_k = int(min(max(smallest_k, 1), var_sorted.numel()))
         for idx in range(top_k):
             stats[f"lut/var_smallest_{idx + 1}"] = float(var_sorted[idx].item())
-
-        # Global random-pair cosine (anisotropy) diagnostic
-        try:
-            n_rows, n_dims = centered.shape
-            if n_rows >= 2 and n_dims > 0:
-                # Limit the number of sampled pairs for efficiency.
-                # For very small matrices, fall back to all possible pairs.
-                max_pairs = 10_000
-                total_pairs = n_rows * (n_rows - 1)
-                num_pairs = int(min(max_pairs, total_pairs))
-                if num_pairs > 0:
-                    idx_i = torch.randint(0, n_rows, (num_pairs,), device=centered.device)
-                    idx_j = torch.randint(0, n_rows, (num_pairs,), device=centered.device)
-                    ei = F.normalize(centered[idx_i], dim=-1, eps=1e-12)
-                    ej = F.normalize(centered[idx_j], dim=-1, eps=1e-12)
-                    cos_vals = (ei * ej).sum(dim=-1)
-                    stats["lut/global_avg_cos"] = float(cos_vals.mean().item())
-        except Exception:
-            # Keep collapse metrics robust even if cosine diagnostics fail.
-            pass
 
         # Singular values from Gram matrix (size D x D)
         gram = torch.matmul(centered.transpose(0, 1), centered)
@@ -1969,7 +1960,7 @@ def train_one_epoch(
     want_diag = (
         isinstance(path, MetricInducedGibbsProbPath)
         and getattr(args, "ko_metric_induced", False)
-        and epoch_one % 1 == 0
+        and epoch_one % 20 == 0
     )
     # All ranks enter two barriers so non-main ranks don't run ahead to DDP collectives
     if dist.is_available() and dist.is_initialized():

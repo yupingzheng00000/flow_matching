@@ -1,5 +1,6 @@
-gamma	lambda	note
-1.0	0.0	baseline
-1.5	0.0	gamma_only
-1.5	1.0	gamma_plus_weight
-2.0	1.0	strong_gamma_plus_weight
+# gamma	lambda	lut_recon_sample_frac	note
+1.0	0.0	0.0	test-run
+1.0	0.0	0.25 baseline
+1.0	1.5	0.25 lamda_only
+1.5	0.0	0.25 gamma_only
+1.5	1.5	0.25 gamma+lambda

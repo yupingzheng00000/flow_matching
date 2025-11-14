@@ -6,14 +6,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 
-from pathlib import Path as _Path
-import sys as _sys
-_this_dir = _Path(__file__).resolve().parent
-# Go up three levels: .../flow_matching/examples/image -> .../flow_matching
-_pkg_root = _this_dir.parents[1]
-if str(_pkg_root) not in _sys.path:
-    _sys.path.insert(0, str(_pkg_root))
-
 import datetime
 import json
 import logging
