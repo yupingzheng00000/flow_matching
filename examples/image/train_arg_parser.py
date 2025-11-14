@@ -632,6 +632,15 @@ def get_args_parser():
         help="Enable detailed LUT geometry logging/diagnostics during training.",
     )
     parser.add_argument(
+        "--reset_lut_after_resume",
+        action="store_true",
+        help=(
+            "After loading a checkpoint via --resume, reset learnable LUT parameters to the "
+            "current initialization (e.g., small_noise_qr) instead of reusing the checkpoint LUT. "
+            "Useful when starting from a 1D baseline and upgrading to higher-dimensional LUT geometry."
+        ),
+    )
+    parser.add_argument(
         "--lut_recon_weight",
         default=0.3,
         type=float,

@@ -879,6 +879,23 @@ def main(args):
         path=metric_path,
         extra_modules=extra_modules,
     )
+    # Optionally reset LUT parameters after resuming from a checkpoint.
+    # This keeps UNet and scheduler weights from the checkpoint but re-initializes
+    # the learnable LUT according to the current configuration (e.g., small_noise_qr).
+    if (
+        getattr(args, "reset_lut_after_resume", False)
+        and getattr(args, "mi_learnable_lut", False)
+        and metric_path is not None
+        and getattr(metric_path, "learnable_lut", None) is not None
+    ):
+        logger.info(
+            "Resetting learnable LUT parameters after resume to current init method "
+            "(--mi_lut_init_method=%s, --mi_lut_init_noise_scale=%s).",
+            getattr(args, "mi_lut_init_method", "linear"),
+            getattr(args, "mi_lut_init_noise_scale", 0.01),
+        )
+        metric_path.learnable_lut.reset_parameters()
+        metric_path.clear_lut_cache()
     if (
         getattr(args, "mi_lut_force_warm_start", False)
         and getattr(args, "mi_learnable_lut", False)
