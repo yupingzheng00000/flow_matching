@@ -580,7 +580,7 @@ def _compute_embedding_collapse_metrics(
                     ei = F.normalize(centered[idx_i], dim=-1, eps=1e-12)
                     ej = F.normalize(centered[idx_j], dim=-1, eps=1e-12)
                     cos_vals = (ei * ej).sum(dim=-1)
-                    stats["lut/global_avg_cos"] = float(cos_vals.mean().item())
+                    stats["lut/global_avg_cos"] = float(cos_vals.abs().mean().item())
         except Exception:
             # Keep collapse metrics robust even if cosine diagnostics fail.
             pass
