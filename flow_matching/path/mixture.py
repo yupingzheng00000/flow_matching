@@ -162,7 +162,10 @@ class LearnableScalarLUT(nn.Module):
             emb_dim=self.emb_dim,
             embed_range=self.embed_range,
         )
-        noise = torch.randn_like(weight) * 1e-3
+        noise_scale = float(self.init_noise_scale)
+        if noise_scale <= 0.0:
+            return weight
+        noise = torch.randn_like(weight) * noise_scale
         return weight + noise
 
     def _linear_init_base(self) -> Tensor:
@@ -286,6 +289,14 @@ class LearnableScalarLUT(nn.Module):
         # Broadcasting: [C, 1, 1] * [C, V, D] -> [C, V, D]
         return self.weight * scale.view(-1, 1, 1)
 
+    def scalar_trajectories(self, weight: Optional[Tensor] = None) -> Tensor:
+        """Return per-channel scalar trajectories for diagnostics."""
+
+        if weight is None:
+            weight = self()
+        # Average across embedding dimensions to recover the scalar path.
+        return weight.mean(dim=-1)
+
     def extra_repr(self) -> str:
         return (
             f"num_channels={self.num_channels}, vocab_size={self.vocab_size}, "
@@ -364,16 +375,20 @@ class _Line2DLUTParam(nn.Module):
 
     def forward(self) -> Tensor:
         direction = self._normalized_direction()  # [C, D]
-        delta = F.softplus(self.delta_raw) + self.min_step  # [C, V-1]
-        cumulative = torch.cumsum(delta, dim=-1)
-        tail = self.start.unsqueeze(-1) + cumulative
-        tau = torch.cat([self.start.unsqueeze(-1), tail], dim=-1)  # [C, V]
+        tau = self.scalar_trajectory()  # [C, V]
         emb = direction.unsqueeze(1) * tau.unsqueeze(-1)  # [C, V, D]
         return emb
 
     def _normalized_direction(self) -> Tensor:
         direction = self.direction_raw
         return direction / (direction.norm(dim=-1, keepdim=True) + 1e-12)
+
+    def scalar_trajectory(self) -> Tensor:
+        delta = F.softplus(self.delta_raw) + self.min_step  # [C, V-1]
+        cumulative = torch.cumsum(delta, dim=-1)
+        tail = self.start.unsqueeze(-1) + cumulative
+        tau = torch.cat([self.start.unsqueeze(-1), tail], dim=-1)
+        return tau
 
     @torch.no_grad()
     def initialize_from_weight(self, weight: Tensor) -> None:
@@ -446,11 +461,7 @@ class _Arc2DLUTParam(nn.Module):
 
     def forward(self) -> Tensor:
         basis = self._orthonormal_basis()  # [C, D, 2]
-        delta = F.softplus(self.delta_raw) + self.min_step  # [C, V-1]
-        theta = self.theta_start.unsqueeze(-1) + torch.cumsum(delta, dim=-1)
-        theta = torch.cat(
-            [self.theta_start.unsqueeze(-1), theta], dim=-1
-        )  # prepend start
+        theta = self.scalar_trajectory()
         cos_t = torch.cos(theta)
         sin_t = torch.sin(theta)
         coords = torch.stack([cos_t, sin_t], dim=-1)  # [C, V, 2]
@@ -461,6 +472,14 @@ class _Arc2DLUTParam(nn.Module):
     def _orthonormal_basis(self) -> Tensor:
         q, _ = torch.linalg.qr(self.basis_raw, mode="reduced")
         return q
+
+    def scalar_trajectory(self) -> Tensor:
+        delta = F.softplus(self.delta_raw) + self.min_step  # [C, V-1]
+        theta = self.theta_start.unsqueeze(-1) + torch.cumsum(delta, dim=-1)
+        theta = torch.cat(
+            [self.theta_start.unsqueeze(-1), theta], dim=-1
+        )
+        return theta
 
     @torch.no_grad()
     def initialize_from_weight(self, weight: Tensor) -> None:
@@ -602,6 +621,13 @@ class LearnableParametricLUT(nn.Module):
         current = torch.linalg.vector_norm(weight, dim=(1, 2))
         scale = target / (current + self.renorm_eps)
         return weight * scale.view(-1, 1, 1)
+
+    def scalar_trajectories(self, weight: Optional[Tensor] = None) -> Tensor:
+        if hasattr(self.param, "scalar_trajectory"):
+            return self.param.scalar_trajectory()
+        if weight is None:
+            weight = self.forward()
+        return weight.mean(dim=-1)
 
     def initialize_from_weight(self, weight: Tensor) -> None:
         self.param.initialize_from_weight(weight)

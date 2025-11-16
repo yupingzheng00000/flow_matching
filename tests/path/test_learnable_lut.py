@@ -25,16 +25,19 @@ class TestLearnableScalarLUT(unittest.TestCase):
             embed_range="pm1",
             device=None,
             dtype=torch.float32,
+            init_noise_scale=0.0,
         )
         self.assertEqual(lut.num_channels, 3)
         self.assertEqual(lut.vocab_size, 256)
         self.assertEqual(lut.embed_range, "pm1")
-    self.assertEqual(lut.weight.shape, (3, 256, 1))
+        self.assertEqual(lut.weight.shape, (3, 256, 1))
 
-    # Check linear initialization bounds
-    self.assertAlmostEqual(lut.weight[0, 0, 0].item(), -1.0, places=6)
-    self.assertAlmostEqual(lut.weight[0, -1, 0].item(), 1.0, places=6)
-    self.assertTrue(torch.allclose(lut.weight[0], lut.weight[1]))  # All channels identical initially
+        # Check linear initialization bounds
+        self.assertAlmostEqual(lut.weight[0, 0, 0].item(), -1.0, places=6)
+        self.assertAlmostEqual(lut.weight[0, -1, 0].item(), 1.0, places=6)
+        self.assertTrue(
+            torch.allclose(lut.weight[0], lut.weight[1])
+        )  # All channels identical initially
         
     def test_init_unit_range(self):
         """Test initialization with [0, 1] range."""
@@ -44,10 +47,11 @@ class TestLearnableScalarLUT(unittest.TestCase):
             embed_range="unit",
             device=None,
             dtype=torch.float32,
+            init_noise_scale=0.0,
         )
         self.assertEqual(lut.embed_range, "unit")
-    self.assertAlmostEqual(lut.weight[0, 0, 0].item(), 0.0, places=6)
-    self.assertAlmostEqual(lut.weight[0, -1, 0].item(), 1.0, places=6)
+        self.assertAlmostEqual(lut.weight[0, 0, 0].item(), 0.0, places=6)
+        self.assertAlmostEqual(lut.weight[0, -1, 0].item(), 1.0, places=6)
         
     def test_invalid_params(self):
         """Test validation of constructor arguments."""
@@ -68,6 +72,7 @@ class TestLearnableScalarLUT(unittest.TestCase):
             embed_range="pm1",
             device=None,
             dtype=torch.float32,
+            init_noise_scale=0.0,
         )
         original_weight = lut.weight.clone()
         
@@ -77,7 +82,7 @@ class TestLearnableScalarLUT(unittest.TestCase):
         
         # Reset
         lut.reset_parameters()
-    self.assertTrue(torch.allclose(lut.weight, original_weight, atol=1e-6))
+        self.assertTrue(torch.allclose(lut.weight, original_weight, atol=1e-6))
     
     def test_device_dtype(self):
         """Test device and dtype propagation."""
@@ -143,6 +148,35 @@ class TestLearnableScalarLUT(unittest.TestCase):
         self.assertIsNotNone(lut.weight.grad)
         self.assertGreater(lut.weight.grad.abs().sum().item(), 0.0)
 
+    def test_linear_init_respects_noise_scale(self):
+        """Linear initialization should honor the configured noise scale."""
+
+        lut_deterministic = LearnableScalarLUT(
+            num_channels=2,
+            vocab_size=16,
+            emb_dim=3,
+            embed_range="pm1",
+            device=None,
+            dtype=torch.float32,
+            init_method="linear",
+            init_noise_scale=0.0,
+        )
+        baseline = lut_deterministic._linear_init_base()
+        self.assertTrue(torch.allclose(lut_deterministic.weight, baseline, atol=1e-7))
+
+        lut_noisy = LearnableScalarLUT(
+            num_channels=2,
+            vocab_size=16,
+            emb_dim=3,
+            embed_range="pm1",
+            device=None,
+            dtype=torch.float32,
+            init_method="linear",
+            init_noise_scale=0.02,
+        )
+        diff = (lut_noisy.weight - lut_noisy._linear_init_base()).abs()
+        self.assertGreater(diff.max().item(), 0.0)
+
 
 class TestMetricInducedPathWithLUT(unittest.TestCase):
     """Test MetricInducedGibbsProbPath integration with learnable LUT."""
@@ -190,14 +224,23 @@ class TestMetricInducedPathWithLUT(unittest.TestCase):
                 learnable_metric_dim=8,  # Conflict
             )
     
-    def test_lut_requires_lp_metric(self):
-        """Test that LUT requires 'lp' or 'euclidean' metric."""
-        with self.assertRaisesRegex(ValueError, "learnable_lut currently supports only 'lp' or 'euclidean'"):
+    def test_lut_requires_supported_metric(self):
+        """Test that LUT initialization rejects unsupported metrics."""
+        with self.assertRaisesRegex(ValueError, "learnable_lut supports metrics"):
             MetricInducedGibbsProbPath(
                 vocab_size=256,
-                metric="cosine",  # Incompatible
+                metric="manhattan",
                 learnable_lut=True,
             )
+
+        # Cosine metric is supported.
+        path = MetricInducedGibbsProbPath(
+            vocab_size=64,
+            metric="cosine",
+            learnable_lut=True,
+            lut_num_channels=2,
+        )
+        self.assertIsNotNone(path.learnable_lut)
     
     def test_lut_parameters_iterator(self):
         """Test lut_parameters() yields correct parameters."""
@@ -210,7 +253,7 @@ class TestMetricInducedPathWithLUT(unittest.TestCase):
         
         lut_params = list(path.lut_parameters())
         self.assertEqual(len(lut_params), 1)
-    self.assertEqual(lut_params[0].shape, (3, 128, 1))
+        self.assertEqual(lut_params[0].shape, (3, 128, 1))
         self.assertTrue(lut_params[0].requires_grad)
     
     def test_lut_parameters_empty_when_disabled(self):
@@ -326,8 +369,8 @@ class TestMetricInducedPathWithLUT(unittest.TestCase):
         # Channel 0: [0, 1, 2, 3]
         # Channel 1: [0, 10, 20, 30]
         with torch.no_grad():
-            path.learnable_lut.weight[0] = torch.tensor([0.0, 1.0, 2.0, 3.0])
-            path.learnable_lut.weight[1] = torch.tensor([0.0, 10.0, 20.0, 30.0])
+            path.learnable_lut.weight[0] = torch.tensor([0.0, 1.0, 2.0, 3.0]).view(vocab_size, 1)
+            path.learnable_lut.weight[1] = torch.tensor([0.0, 10.0, 20.0, 30.0]).view(vocab_size, 1)
         
         device = torch.device("cpu")
         dtype = torch.float32
